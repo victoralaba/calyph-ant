@@ -1,0 +1,72 @@
+# ── API framework ─────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+
+# ── Database drivers ──────────────────────────────────────────────────────────
+asyncpg
+psycopg[async]
+psycopg2-binary
+
+# ── ORM + migrations ──────────────────────────────────────────────────────────
+sqlalchemy[asyncio]
+alembic
+
+# ── Schema diff ───────────────────────────────────────────────────────────────
+migra
+
+# ── SQL parsing ───────────────────────────────────────────────────────────────
+sqlparse
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]
+argon2-cffi
+cryptography
+
+# ── Config + validation ───────────────────────────────────────────────────────
+pydantic
+pydantic-settings
+
+# ── Redis + task queue ────────────────────────────────────────────────────────
+redis[hiredis]
+celery[redis]
+
+# ── Cron scheduling ───────────────────────────────────────────────────────────
+croniter
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+httpx
+tenacity
+urllib3<2.3.0
+
+# ── Cloud storage ─────────────────────────────────────────────────────────────
+boto3
+botocore
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+slowapi
+
+# ── Logging + observability ───────────────────────────────────────────────────
+loguru
+sentry-sdk[fastapi,sqlalchemy,redis,loguru]
+prometheus-client
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
+posthog
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+brevo-python
+
+# ── AI providers ──────────────────────────────────────────────────────────────
+anthropic
+google-genai
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+typer[all]
+rich
+
+# ── Data import (Feature 21) ──────────────────────────────────────────────────
+openpyxl
+chardet<6.0.0
+pandas

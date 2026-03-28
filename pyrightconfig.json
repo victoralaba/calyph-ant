@@ -1,0 +1,11 @@
+{
+    "venvPath": "/home/victor-myrath/Desktop/Calyphant-api",
+    "venv": ".venv",
+    "pythonVersion": "3.12",
+    "executionEnvironments": [
+        {
+            "root": "/home/victor-myrath/Desktop/Calyphant-api",
+            "extraPaths": ["/home/victor-myrath/Desktop/Calyphant-api"]
+        }
+    ]
+}

@@ -1,0 +1,95 @@
+[project]
+name = "calyphant"
+version = "0.1.0"
+dependencies = [
+    # API
+    "fastapi",
+    "uvicorn[standard]",
+    "gunicorn",
+
+    # Database
+    "asyncpg",
+    "psycopg[async]",
+    "sqlalchemy[asyncio]",
+    "alembic",
+
+    # Schema tooling
+    "migra",
+
+    # SQL parsing — structured diff change classification (Gap 9-3)
+    "sqlparse",
+
+    # Auth
+    "python-jose[cryptography]",
+    "argon2-cffi",
+    "cryptography",
+
+    # Config
+    "pydantic[email]",
+    "pydantic-settings",
+
+    # Redis + Celery
+    "redis[hiredis]",
+    "celery[redis]",
+
+    # Cron expression parsing — backup scheduling (Gap 10-4)
+    "croniter",
+
+    # HTTP client
+    "httpx",
+    "tenacity",
+
+    # Storage
+    "boto3",
+    "botocore",
+
+    # Rate limiting
+    "slowapi",
+
+    # Logging + observability
+    "loguru",
+    "sentry-sdk[fastapi,sqlalchemy,redis,loguru]",
+    "prometheus-client",
+
+    # Analytics
+    "posthog",
+
+    # Email
+    "brevo-python",
+
+    # AI
+    "anthropic",
+    "google-genai",
+
+    # CLI
+    "typer[all]",
+    "rich",
+
+    # Utilities
+    "python-multipart",
+    "openpyxl",
+    "chardet",
+    "pandas",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "httpx",
+    "factory-boy",
+    "faker",
+    "ruff",
+    "mypy",
+    "pre-commit",
+]
+
+[project.scripts]
+calyphant = "cli:app"
+
+[tool.setuptools]
+py-modules = ["cli", "main"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "shared*", "worker*", "domains*", "alembic*"]
