@@ -122,6 +122,35 @@ async def write_audit(
         logger.error(f"Audit log write failed for action '{action}': {exc}")
 
 
+async def write_audit_batch(
+    db: AsyncSession,
+    entries: list[dict[str, Any]]
+) -> None:
+    """
+    Batch write audit logs for high-volume operations (bulk update/delete).
+    Prevents connection pool exhaustion by writing all events in a single transaction.
+    """
+    if not entries:
+        return
+    try:
+        logs = [
+            AuditLog(
+                user_id=e.get("user_id"),
+                workspace_id=e.get("workspace_id"),
+                action=e["action"],
+                resource_type=e.get("resource_type"),
+                resource_id=str(e["resource_id"]) if e.get("resource_id") else None,
+                diff=e.get("diff", {}),
+                meta=e.get("meta", {}),
+            )
+            for e in entries
+        ]
+        db.add_all(logs)
+        await db.commit()
+    except Exception as exc:
+        logger.error(f"Batch audit write failed ({len(entries)} entries): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Admin service functions
 # ---------------------------------------------------------------------------

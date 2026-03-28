@@ -45,10 +45,11 @@ not hold a session while waiting on a WebSocket message).
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Any
 from uuid import UUID
 
 import asyncpg
+from asyncpg.pool import PoolConnectionProxy
 import redis.asyncio as aioredis
 from cryptography.fernet import Fernet
 from loguru import logger
@@ -69,6 +70,7 @@ from core.config import settings
 _pool: asyncpg.Pool | None = None
 _async_engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_sync_engine: Any | None = None
 
 # Two Redis clients: one for general use, one exclusively for pub/sub
 _redis: aioredis.Redis | None = None
@@ -175,7 +177,7 @@ async def init_redis() -> None:
 
 async def close_db() -> None:
     """Graceful shutdown — close pool, engine, and Redis clients."""
-    global _pool, _async_engine, _redis, _redis_pubsub
+    global _pool, _async_engine, _sync_engine, _redis, _redis_pubsub
 
     if _pool:
         await _pool.close()
@@ -184,6 +186,10 @@ async def close_db() -> None:
     if _async_engine:
         await _async_engine.dispose()
         logger.info("DB: SQLAlchemy engine disposed")
+
+    if _sync_engine:
+        _sync_engine.dispose()
+        logger.info("DB: Sync SQLAlchemy engine disposed")
 
     if _redis:
         await _redis.aclose()
@@ -247,7 +253,7 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-async def get_raw_conn() -> AsyncGenerator[asyncpg.Connection, None]:
+async def get_raw_conn() -> AsyncGenerator[asyncpg.Connection | PoolConnectionProxy, None]:
     """
     FastAPI dependency — yields a raw asyncpg connection.
 
@@ -351,13 +357,18 @@ def get_sync_engine():
     Never call this in async request handlers.
 
     Uses NullPool so each call gets a fresh connection that is closed
-    immediately — no pool contention when multiple threads introspect
-    concurrently against the same external database.
+    immediately. The engine instance itself is cached to eliminate 
+    dialect initialization CPU overhead.
     """
+    global _sync_engine
+    if _sync_engine is not None:
+        return _sync_engine
+
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
-    return create_engine(
+    _sync_engine = create_engine(
         settings.get_sync_url(),
         poolclass=NullPool,
     )
+    return _sync_engine

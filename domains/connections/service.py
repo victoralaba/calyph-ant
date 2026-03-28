@@ -306,7 +306,7 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
     wait=wait_exponential(multiplier=1, min=1, max=8),
     reraise=True,
 )
-async def _connect_raw(url: str, timeout: float = 10.0) -> asyncpg.Connection:
+async def _connect_raw(url: str, timeout: int = 10) -> asyncpg.Connection:
     """Attempt a raw asyncpg connection with retries for transient failures."""
     return await asyncpg.connect(dsn=url, timeout=timeout)
 
@@ -329,12 +329,12 @@ async def test_connection(url: str) -> ConnectionTestResult:
     conn: asyncpg.Connection | None = None
     try:
         # Allow a longer timeout for providers that may need to wake
-        timeout = 20.0 if is_sleeping_provider else 10.0
+        timeout = 20 if is_sleeping_provider else 10
         conn = await _connect_raw(url, timeout=timeout)
 
         # Collect version info
-        version_str: str = await conn.fetchval("SELECT version()")
-        version_num: int = await conn.fetchval("SHOW server_version_num")
+        version_str: str = str(await conn.fetchval("SELECT version()"))
+        version_num: int = int(await conn.fetchval("SHOW server_version_num") or 0)
 
         # Collect installed extensions
         ext_rows = await conn.fetch(
@@ -390,7 +390,8 @@ async def test_connection(url: str) -> ConnectionTestResult:
         )
     except (OSError, asyncpg.PostgresConnectionError, TimeoutError) as exc:
         error_msg = str(exc)
-        was_sleeping = is_sleeping_provider and _looks_like_sleep_error(error_msg)
+        # Pass the raw exception object down, not the stringified message
+        was_sleeping = is_sleeping_provider and _looks_like_sleep_error(exc)
         return ConnectionTestResult(
             success=False,
             error=f"Could not reach database: {error_msg}",
@@ -409,8 +410,29 @@ async def test_connection(url: str) -> ConnectionTestResult:
             await conn.close()
 
 
-def _looks_like_sleep_error(error: str) -> bool:
-    """Heuristic: does this error message suggest the DB is sleeping?"""
+def _looks_like_sleep_error(exc: Exception) -> bool:
+    """
+    Precision check: does this exception indicate the DB compute is asleep/waking?
+    Evaluates native Postgres SQLStates and OS-level socket errors rather than
+    relying solely on fragile string matching.
+    """
+    # 1. OS-level network timeouts and refusals (Compute node offline)
+    if isinstance(exc, (TimeoutError, ConnectionRefusedError)):
+        return True
+
+    # 2. Native Postgres SQLStates (Proxy is up, but compute is starting/routing)
+    if isinstance(exc, asyncpg.PostgresError):
+        sqlstate = getattr(exc, "sqlstate", None)
+        if sqlstate in (
+            "57P03",  # cannot_connect_now (Server is starting up/waking)
+            "08006",  # connection_failure
+            "08001",  # sqlclient_unable_to_establish_sqlconnection
+            "08004",  # sqlserver_rejected_establishment_of_sqlconnection
+        ):
+            return True
+
+    # 3. Fallback heuristic for generic asyncpg/proxy text errors
+    error_str = str(exc).lower()
     sleep_hints = [
         "connection refused",
         "connection timed out",
@@ -418,9 +440,9 @@ def _looks_like_sleep_error(error: str) -> bool:
         "eof detected",
         "connection reset",
         "no route to host",
+        "the database system is starting up",
     ]
-    lower = error.lower()
-    return any(hint in lower for hint in sleep_hints)
+    return any(hint in error_str for hint in sleep_hints)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +456,7 @@ async def ping_connection(url: str) -> bool:
     """
     conn = None
     try:
-        conn = await asyncpg.connect(dsn=url, timeout=15.0)
+        conn = await asyncpg.connect(dsn=url, timeout=15)
         await conn.fetchval("SELECT 1")
         return True
     except Exception as exc:
@@ -595,7 +617,7 @@ async def delete_connection(
         .values(is_active=False)
     )
     await db.commit()
-    return result.rowcount > 0
+    return result.rowcount > 0 # type: ignore
 
 
 async def mark_connection_status(

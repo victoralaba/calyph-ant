@@ -274,18 +274,8 @@ async def stream_query(
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Stream large query results via server-side cursor.
-
-    STREAM-1: Enforces execution_timeout_seconds via PostgreSQL's
-    statement_timeout so the backend process is actually cancelled by
-    the server rather than leaving a zombie query running.
-
-    STREAM-2: Yields a metadata event as the first item containing the
-    backend PID so the client can cancel via POST /cancel if needed.
-
-    Yields dicts:
-      {"type": "meta",  "pid": int}                      — first item
-      {"type": "chunk", "chunk": int, "rows": [...], "count": int}
-      {"type": "error", "error": str}                    — on failure
+    Passes execution_timeout down to the core streamer to avoid nested
+    transaction isolation crashes.
     """
     timeout_seconds = min(execution_timeout_seconds, MAX_STREAM_TIMEOUT)
     timeout_ms = int(timeout_seconds * 1000)
@@ -295,12 +285,16 @@ async def stream_query(
     pid: int = int(raw_pid) if raw_pid is not None else 0 
     yield {"type": "meta", "pid": pid}
 
-    # Set statement_timeout so PostgreSQL cancels the backend on timeout
-    await pg_conn.execute(f"SET statement_timeout = {timeout_ms}")
-
     try:
-        async for chunk in stream_query_result(pg_conn, sql, chunk_size=chunk_size):
+        # NO transaction block here. Just pass timeout_ms down.
+        async for chunk in stream_query_result(
+            pg_conn, 
+            sql, 
+            chunk_size=chunk_size, 
+            timeout_ms=timeout_ms
+        ):
             yield {"type": "chunk", **chunk}
+                
     except asyncpg.QueryCanceledError:
         yield {
             "type": "error",
@@ -311,12 +305,6 @@ async def stream_query(
         }
     except Exception as exc:
         yield {"type": "error", "error": str(exc)}
-    finally:
-        # Reset statement_timeout to session default after streaming
-        try:
-            await pg_conn.execute("SET statement_timeout = 0")
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

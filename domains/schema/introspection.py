@@ -24,6 +24,7 @@ SQLAlchemy-specific leaks out of this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from loguru import logger
@@ -133,15 +134,14 @@ class SchemaSnapshot:
 # Engine factory (sync — Inspector requires sync engine)
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=128)
 def _make_sync_engine(url: str) -> Engine:
     """
     Build a short-lived sync SQLAlchemy engine for introspection.
     Converts asyncpg DSN to psycopg3-compatible if needed.
 
-    Uses NullPool so each introspection call gets a fresh connection
-    that is closed immediately on engine.dispose(). This avoids pool
-    exhaustion when multiple introspection calls run concurrently
-    against the same external database (e.g. Neon, Supabase).
+    Cached via LRU to prevent dialect setup overhead on repeated calls.
+    Uses NullPool so connections are never held open across the cache.
     """
     from sqlalchemy import create_engine
 
@@ -170,48 +170,42 @@ def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapsh
         SchemaSnapshot with complete structural metadata
     """
     engine = _make_sync_engine(url)
-    try:
-        with engine.connect() as conn:
-            inspector: Inspector = inspect(engine)
+    with engine.connect() as conn:
+        inspector: Inspector = inspect(engine)
 
-            pg_version = conn.execute(text("SELECT version()")).scalar()
-            database = conn.execute(text("SELECT current_database()")).scalar()
+        pg_version = conn.execute(text("SELECT version()")).scalar()
+        database = conn.execute(text("SELECT current_database()")).scalar()
 
-            schemas = [
-                s for s in inspector.get_schema_names()
-                if s not in ("pg_catalog", "information_schema", "pg_toast")
-            ]
+        schemas = [
+            s for s in inspector.get_schema_names()
+            if s not in ("pg_catalog", "information_schema", "pg_toast")
+        ]
 
-            tables = _introspect_tables(inspector, conn, target_schema)
-            enums = _introspect_enums(conn, target_schema)
-            sequences = _introspect_sequences(conn, target_schema)
-            extensions = _introspect_extensions(conn)
+        tables = _introspect_tables(inspector, conn, target_schema)
+        enums = _introspect_enums(conn, target_schema)
+        sequences = _introspect_sequences(conn, target_schema)
+        extensions = _introspect_extensions(conn)
 
-        return SchemaSnapshot(
-            database=str(database or "unknown"),
-            pg_version=str(pg_version or "").split(",")[0].strip(),
-            schemas=schemas,
-            tables=tables,
-            enums=enums,
-            sequences=sequences,
-            extensions=extensions,
-        )
-    finally:
-        engine.dispose()
+    return SchemaSnapshot(
+        database=str(database or "unknown"),
+        pg_version=str(pg_version or "").split(",")[0].strip(),
+        schemas=schemas,
+        tables=tables,
+        enums=enums,
+        sequences=sequences,
+        extensions=extensions,
+    )
 
 
 def introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
     """Introspect a single table. Faster than full snapshot for targeted ops."""
     engine = _make_sync_engine(url)
-    try:
-        with engine.connect() as conn:
-            inspector = inspect(engine)
-            tables = _introspect_tables(inspector, conn, schema, only=[table_name])
-            if not tables:
-                raise ValueError(f"Table '{schema}.{table_name}' not found.")
-            return tables[0]
-    finally:
-        engine.dispose()
+    with engine.connect() as conn:
+        inspector = inspect(engine)
+        tables = _introspect_tables(inspector, conn, schema, only=[table_name])
+        if not tables:
+            raise ValueError(f"Table '{schema}.{table_name}' not found.")
+        return tables[0]
 
 
 # ---------------------------------------------------------------------------

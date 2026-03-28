@@ -54,7 +54,7 @@ import decimal
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, AsyncGenerator, cast
 from uuid import UUID
 
@@ -198,40 +198,53 @@ class FKViolationError(Exception):
 def _values_equal(actual: Any, expected: Any) -> bool:
     """
     Compare a live database value against a client-supplied snapshot value.
-    Handles all common Postgres → Python mappings to avoid false conflicts.
+    Handles all common Postgres → Python mappings robustly to avoid false 
+    StaleRowErrors (optimistic locking false positives).
     """
     if actual is None and expected is None:
         return True
     if actual is None or expected is None:
         return False
 
-    # bool — must precede int because bool is a subclass of int
+    # bool — must precede int because bool is a subclass of int in Python
     if isinstance(actual, bool):
         if isinstance(expected, bool):
             return actual == expected
         if isinstance(expected, str):
-            return actual == (expected.lower() in ("true", "1", "yes", "t", "y"))
+            return expected.lower() in ("true", "1", "yes", "t", "y")
         if isinstance(expected, int):
             return actual == bool(expected)
         return False
 
-    # numeric
+    # numeric (Decimal, int, float)
     if isinstance(actual, (int, float, decimal.Decimal)):
         try:
-            return decimal.Decimal(str(actual)) == decimal.Decimal(str(expected))
+            # Normalize strips trailing zeros (e.g., 10.50 == 10.5)
+            return decimal.Decimal(str(actual)).normalize() == decimal.Decimal(str(expected)).normalize()
         except (decimal.InvalidOperation, TypeError):
             return str(actual) == str(expected)
 
-    # datetime (subclass of date — must come first)
+    # datetime (MUST precede date, as datetime is a subclass of date)
     if isinstance(actual, datetime):
         if isinstance(expected, datetime):
-            return actual == expected
-        if isinstance(expected, str):
+            exp_dt = expected
+        elif isinstance(expected, str):
             try:
-                return actual == datetime.fromisoformat(expected)
+                # Normalize JS ISO strings (e.g., '...Z' to '+00:00')
+                clean_str = expected.replace("Z", "+00:00")
+                exp_dt = datetime.fromisoformat(clean_str)
             except ValueError:
                 return False
-        return False
+        else:
+            return False
+
+        # Align timezone awareness before comparing
+        if actual.tzinfo is not None and exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        elif actual.tzinfo is None and exp_dt.tzinfo is not None:
+            exp_dt = exp_dt.replace(tzinfo=None)
+            
+        return actual == exp_dt
 
     # date
     if isinstance(actual, date):
@@ -239,7 +252,8 @@ def _values_equal(actual: Any, expected: Any) -> bool:
             return actual == expected
         if isinstance(expected, str):
             try:
-                return actual == date.fromisoformat(expected)
+                # Svelte might send a full ISO datetime for a date column; slice the YYYY-MM-DD
+                return actual == date.fromisoformat(expected[:10])
             except ValueError:
                 return False
         return False
@@ -250,7 +264,19 @@ def _values_equal(actual: Any, expected: Any) -> bool:
             return actual == expected
         if isinstance(expected, str):
             try:
-                return actual == time.fromisoformat(expected)
+                clean_str = expected.replace("Z", "+00:00")
+                # If the client sent a full ISO datetime for a time column, isolate the time
+                if "T" in clean_str:
+                    clean_str = clean_str.split("T")[1]
+                exp_t = time.fromisoformat(clean_str)
+                
+                # Align timezone awareness
+                if actual.tzinfo is not None and exp_t.tzinfo is None:
+                    exp_t = exp_t.replace(tzinfo=timezone.utc)
+                elif actual.tzinfo is None and exp_t.tzinfo is not None:
+                    exp_t = exp_t.replace(tzinfo=None)
+                    
+                return actual == exp_t
             except ValueError:
                 return False
         return False
@@ -279,16 +305,17 @@ def _values_equal(actual: Any, expected: Any) -> bool:
 
     # dict / list (JSONB)
     if isinstance(actual, (dict, list)):
+        exp_obj = expected
         if isinstance(expected, str):
             try:
-                return actual == json.loads(expected)
+                exp_obj = json.loads(expected)
             except (json.JSONDecodeError, TypeError):
                 return False
-        return actual == expected
+        # Python handles deep structural equality natively
+        return actual == exp_obj
 
     # safe fallback
     return str(actual) == str(expected)
-
 
 # ---------------------------------------------------------------------------
 # Audit helper  (SAFETY-6)
@@ -561,16 +588,15 @@ async def insert_row(
     # Cast tells Pylance to treat this strictly as dict[str, Any]
     result = cast(dict[str, Any], dict(row))
 
-    asyncio.create_task(
-        _write_audit_entry(
-            operation="insert",
-            table=table,
-            schema=schema,
-            pk_column="(new)",
-            pk_value=None,
-            before=None,
-            after=result,
-        )
+    # REPLACE asyncio.create_task(...) WITH:
+    await _write_audit_entry(
+        operation="insert",
+        table=table,
+        schema=schema,
+        pk_column="(new)",
+        pk_value=None,
+        before=None,
+        after=result,
     )
 
     return result
@@ -584,6 +610,7 @@ async def update_row(
     schema: str = "public",
     row_version: dict[str, Any] | None = None,
     connection_id: UUID | str | None = None,
+    audit_entries: list[dict] | None = None,
 ) -> dict[str, Any] | None:
     """
     Update a single row by primary key.
@@ -613,17 +640,23 @@ async def update_row(
         if row is None:
             return None
         result = dict(row)
-        asyncio.create_task(
-            _write_audit_entry(
-                operation="update",
-                table=table,
-                schema=schema,
-                pk_column=pk_column,
-                pk_value=pk_value,
-                before=None,
-                after=result,
-            )
-        )
+        live: dict = {}
+        audit_payload = {
+            "operation": "update",
+            "table": table,
+            "schema": schema,
+            "pk_column": pk_column,
+            "pk_value": pk_value,
+            "before": live if row_version is None and not live else live, # Use live for optimistic, None for blind
+            "after": result,
+        }
+
+        if audit_entries is not None:
+            # Defer writing; aggregate for batch processing
+            audit_entries.append(audit_payload)
+        else:
+            # Await immediately for single-row updates
+            await _write_audit_entry(**audit_payload)
         return result
 
     # Optimistic concurrency path
@@ -694,17 +727,22 @@ async def update_row(
             return None
         result = dict(row)
 
-    asyncio.create_task(
-        _write_audit_entry(
-            operation="update",
-            table=table,
-            schema=schema,
-            pk_column=pk_column,
-            pk_value=pk_value,
-            before=live,
-            after=result,
-        )
-    )
+    audit_payload = {
+        "operation": "update",
+        "table": table,
+        "schema": schema,
+        "pk_column": pk_column,
+        "pk_value": pk_value,
+        "before": live if row_version is None and not live else live, # Use live for optimistic, None for blind
+        "after": result,
+    }
+
+    if audit_entries is not None:
+        # Defer writing; aggregate for batch processing
+        audit_entries.append(audit_payload)
+    else:
+        # Await immediately for single-row updates
+        await _write_audit_entry(**audit_payload)
     return result
 
 
@@ -773,16 +811,15 @@ async def delete_row(
 
     row_dict = dict(deleted_row)
 
-    asyncio.create_task(
-        _write_audit_entry(
-            operation="delete",
-            table=table,
-            schema=schema,
-            pk_column=pk_column,
-            pk_value=pk_value,
-            before=row_dict,
-            after=None,
-        )
+    # REPLACE asyncio.create_task(...) WITH:
+    await _write_audit_entry(
+        operation="delete",
+        table=table,
+        schema=schema,
+        pk_column=pk_column,
+        pk_value=pk_value,
+        before=row_dict,
+        after=None,
     )
 
     return {"confirmed": True, "deleted": True, "row": row_dict}
@@ -876,16 +913,15 @@ async def undo_row_update(
             "and cannot be restored. The row may have been deleted."
         )
 
-    asyncio.create_task(
-        _write_audit_entry(
-            operation="undo",
-            table=table,
-            schema=schema,
-            pk_column=pk_column,
-            pk_value=pk_value,
-            before=None,
-            after=_serialise_for_audit(result_row),
-        )
+    # REPLACE asyncio.create_task(...) WITH:
+    await _write_audit_entry(
+        operation="undo",
+        table=table,
+        schema=schema,
+        pk_column=pk_column,
+        pk_value=pk_value,
+        before=None,
+        after=_serialise_for_audit(result_row),
     )
 
     return result_row
@@ -981,53 +1017,69 @@ async def _preview_bulk_update(
     what would change, including lock conflicts and stale-row issues.
 
     Runs under REPEATABLE READ so all row reads see a consistent snapshot.
-    Nothing is written.
-
-    Returns:
-    {
-        "confirmed": False,
-        "preview": [
-            {
-                "pk": <value>,
-                "status": "would_update" | "not_found" | "locked" | "stale",
-                "current": {...} | None,        # current DB row
-                "proposed": {...},              # columns being changed
-                "changes": {                    # only when row_version given
-                    "column": {"from": old, "to": new}
-                },
-                "lock_holder": {...} | None,    # when status=="locked"
-                "stale_conflicts": [...]        # when status=="stale"
-            }
-        ],
-        "summary": {
-            "would_update": N,
-            "not_found": N,
-            "locked": N,
-            "stale": N
-        }
-    }
+    Nothing is written. Both PostgreSQL and Redis I/O are batched/concurrent
+    to prevent N+1 latency spikes.
     """
+    import asyncio # Ensure asyncio is imported if not already at the top
+    
     preview: list[dict[str, Any]] = []
     summary = {"would_update": 0, "not_found": 0, "locked": 0, "stale": 0}
 
+    # Extract all PKs to build our batch fetch
+    pk_values = [row.get(pk_column) for row in rows if row.get(pk_column) is not None]
+    if not pk_values:
+        return {"confirmed": False, "preview": [], "summary": summary}
+
+    current_map: dict[str, dict[str, Any]] = {}
+    lock_holders: dict[str, dict] = {}
+
+    # 1. Sweep Redis concurrently for all presence locks
+    if connection_id is not None:
+        try:
+            from domains.tables.presence import get_row_lock
+            async def fetch_lock(pk):
+                holder = await get_row_lock(
+                    connection_id=connection_id,
+                    schema=schema,
+                    table=table,
+                    pk_value=pk
+                )
+                if holder:
+                    lock_holders[str(pk)] = holder
+            
+            # Fire all presence checks in parallel
+            await asyncio.gather(*(fetch_lock(pk) for pk in pk_values), return_exceptions=True)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch batch presence locks: {exc}")
+
+    # 2. Sweep PostgreSQL in a single query
     async with conn.transaction(isolation="repeatable_read", readonly=True):
+        # We cast both sides to text to safely handle mismatched types (e.g. uuid vs string)
+        str_values = [str(v) for v in pk_values]
+        sql = f'SELECT * FROM "{schema}"."{table}" WHERE "{pk_column}"::text = ANY($1::text[])'
+        
+        raw_current_rows = await conn.fetch(sql, str_values)
+        for r in raw_current_rows:
+            # Map by stringified PK so we can reliably cross-reference the JSON payload
+            current_map[str(r[pk_column])] = dict(r)
+
+        # 3. Process the results entirely in Python memory (No DB I/O in this loop)
         for raw_row in rows:
             row = dict(raw_row)
             pk_value = row.get(pk_column)
             if pk_value is None:
                 continue
+                
+            str_pk = str(pk_value)
             row_version = row.get("__version__")
             proposed = {
                 k: v for k, v in row.items()
                 if k != pk_column and k != "__version__"
             }
 
-            current_row = await conn.fetchrow(
-                f'SELECT * FROM "{schema}"."{table}" WHERE "{pk_column}" = $1',
-                pk_value,
-            )
+            current_dict = current_map.get(str_pk)
 
-            if current_row is None:
+            if current_dict is None:
                 summary["not_found"] += 1
                 preview.append({
                     "pk": pk_value,
@@ -1040,21 +1092,7 @@ async def _preview_bulk_update(
                 })
                 continue
 
-            current_dict = dict(current_row)
-
-            lock_holder: dict | None = None
-            if connection_id is not None:
-                try:
-                    from domains.tables.presence import get_row_lock
-                    lock_holder = await get_row_lock(
-                        connection_id=connection_id,
-                        schema=schema,
-                        table=table,
-                        pk_value=pk_value,
-                    )
-                except Exception:
-                    pass
-
+            lock_holder = lock_holders.get(str_pk)
             if lock_holder:
                 summary["locked"] += 1
                 preview.append({
@@ -1178,6 +1216,7 @@ async def bulk_update(
 
     results = []
     updated = 0
+    updated_rows_for_audit = []
 
     async with conn.transaction():
         for raw_row in rows:
@@ -1198,6 +1237,7 @@ async def bulk_update(
                 schema,
                 row_version=row_version,
                 connection_id=connection_id,
+                audit_entries=updated_rows_for_audit,
             )
 
             if result:
@@ -1205,6 +1245,34 @@ async def bulk_update(
                 results.append({"pk": pk_value, "status": "updated"})
             else:
                 results.append({"pk": pk_value, "status": "not_found"})
+
+    if updated_rows_for_audit:
+        from core.db import _session_factory
+        from domains.admin.service import write_audit_batch
+        
+        if _session_factory:
+            try:
+                async with _session_factory() as system_db:
+                    batch_entries = [
+                        {
+                            "action": f"table_row.{e['operation']}",
+                            "resource_type": "table_row",
+                            "resource_id": f"{e['schema']}.{e['table']}:{e['pk_value']}",
+                            "diff": {
+                                "before": _serialise_for_audit(e.get('before')),
+                                "after": _serialise_for_audit(e.get('after')),
+                            },
+                            "meta": {
+                                "table": e['table'],
+                                "schema": e['schema'],
+                                "pk_column": e['pk_column'],
+                            }
+                        }
+                        for e in updated_rows_for_audit
+                    ]
+                    await write_audit_batch(system_db, batch_entries)
+            except Exception as exc:
+                logger.error(f"Failed to execute batch audit write for bulk_update: {exc}")
 
     return {"updated": updated, "results": results}
 
@@ -1247,6 +1315,7 @@ async def stream_query_result(
     sql: str,
     args: list[Any] | None = None,
     chunk_size: int = STREAM_CHUNK_SIZE,
+    timeout_ms: int | None = None,  # <--- Added parameter
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Stream results of an arbitrary SELECT query via server-side cursor.
@@ -1259,7 +1328,13 @@ async def stream_query_result(
     chunk_index = 0
     columns: list[str] | None = None
 
+    # This is the ONLY transaction block that should exist for this flow.
     async with conn.transaction(isolation="repeatable_read", readonly=True):
+        
+        # Apply the timeout locally to this specific transaction
+        if timeout_ms is not None:
+            await conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+            
         cursor = await conn.cursor(sql, *args)
         while True:
             rows = await cursor.fetch(chunk_size)
