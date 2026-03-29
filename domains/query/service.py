@@ -172,6 +172,27 @@ MAX_STREAM_TIMEOUT = 600.0       # 10 minutes absolute max for streams
 # Execution
 # ---------------------------------------------------------------------------
 
+async def get_workspace_pool(url: str, application_name: str = "calyphant-engine") -> asyncpg.Pool:
+    """
+    Creates a strictly isolated, temporary connection pool for user queries.
+    Enforces protocol-level timeouts to prevent runaway queries from locking up the worker.
+    """
+    return await asyncpg.create_pool(
+        dsn=url,
+        min_size=1,
+        max_size=3, # Keep small to avoid exhausting the target DB's connection limits
+        server_settings={
+            "application_name": application_name,
+            # THE KILL SWITCH: Force target DB to terminate queries after 15 seconds
+            "statement_timeout": "15000",
+            # Prevent users from trying to lock tables indefinitely
+            "lock_timeout": "5000",
+            # Ensure deterministic time logic
+            "TimeZone": "UTC"
+        }
+    )
+
+
 async def execute_query(
     pg_conn: asyncpg.Connection,
     db: AsyncSession,

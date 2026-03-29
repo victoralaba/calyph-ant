@@ -178,6 +178,7 @@ async def test_connection(
     Test a PostgreSQL URL without persisting anything.
     Returns connectivity result, version info, and detected provider.
     """
+    # FIX: Explicitly cast body.url to str to satisfy Pylance
     result = await service.test_connection(str(body.url))
     return TestConnectionResponse(**result.model_dump())
 
@@ -193,6 +194,14 @@ async def create_connection(
     Test a URL and persist it as a named connection in the workspace.
     Fails if the connection test fails.
     """
+    # DEFENSE: Lock 24/7 background cron behind premium tier
+    if body.keep_alive_enabled and user.tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Background Keep-Alive (24/7) is a premium feature. Free tier databases are kept awake automatically while the Calyphant tab is open."
+        )
+
+    # FIX: Explicitly cast body.url to str to satisfy Pylance
     result = await service.test_connection(str(body.url))
     if not result.success:
         raise HTTPException(
@@ -200,6 +209,7 @@ async def create_connection(
             detail=f"Connection test failed: {result.error}",
         )
 
+    # FIX: Explicitly cast body.url to str to satisfy Pylance
     encrypted_url = _encrypt_url(str(body.url))
 
     create_data = ConnectionCreateRequest(
@@ -257,12 +267,25 @@ async def update_connection(
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Update connection metadata or keep-alive settings.
+    """
+    # DEFENSE: Lock 24/7 background cron behind premium tier
+    if body.keep_alive_enabled is True and user.tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Background Keep-Alive (24/7) is a premium feature. Upgrade to enable."
+        )
+
     update_data = ConnectionUpdateRequest(**body.model_dump(exclude_unset=True))
+    
     conn = await service.update_connection(
         db, connection_id, workspace_id, update_data
     )
+    
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")
+        
     return ConnectionResponse.from_orm_model(conn)
 
 
@@ -304,6 +327,33 @@ async def ping_connection(
         success=success,
         message="Database is alive." if success else "Ping failed. Database may be sleeping.",
     )
+
+
+@router.post("/{connection_id}/heartbeat", status_code=status.HTTP_202_ACCEPTED)
+async def connection_presence_heartbeat(
+    connection_id: UUID,
+    user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ephemeral UI heartbeat.
+    Called every 4 minutes by the Svelte frontend ONLY when the tab is visible.
+    Returns 202 Accepted instantly and fires the network pulse in the background.
+    """
+    conn = await _get_connection_or_404(connection_id, workspace_id, db)
+    
+    # We decrypt the URL but we DO NOT update the database status here.
+    # Database writes on a 4-minute interval per active user will cause DB contention.
+    url = _decrypt_url(conn.encrypted_url)
+    
+    # Fire and forget. We use asyncio.create_task so the HTTP response 
+    # returns to the client immediately (0ms perceived latency), while the 
+    # network pulse executes asynchronously.
+    import asyncio
+    asyncio.create_task(service.execute_presence_heartbeat(url))
+    
+    return {"status": "acknowledged"}
 
 
 @router.post("/{connection_id}/refresh", response_model=ConnectionResponse)

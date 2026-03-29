@@ -466,6 +466,31 @@ async def ping_connection(url: str) -> bool:
             await conn.close()
 
 
+async def execute_presence_heartbeat(url: str) -> None:
+    """
+    A brutally fast, silent network pulse triggered by the frontend visibility API.
+    Fails silently. Strict 3-second timeout. No database writes.
+    Designed exclusively to reset the idle-timer on serverless DB proxies.
+    """
+    conn = None
+    try:
+        # 3-second timeout: If it takes longer than 3 seconds to connect, 
+        # it is either already asleep or unreachable. Don't block the worker.
+        conn = await asyncpg.connect(
+            dsn=url, 
+            timeout=3,
+            server_settings={"application_name": "calyphant-ui-heartbeat"}
+        )
+        await conn.fetchval("SELECT 1")
+    except Exception as exc:
+        # We explicitly swallow exceptions here. Heartbeats are ephemeral.
+        # If the DB is down, the actual query/schema routers will catch it.
+        logger.debug(f"Presence heartbeat dropped: {exc}")
+    finally:
+        if conn:
+            await conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Privilege helpers — used by other domains
 # ---------------------------------------------------------------------------
@@ -606,17 +631,25 @@ async def delete_connection(
     connection_id: UUID,
     workspace_id: UUID,
 ) -> bool:
-    """Soft delete."""
+    """Soft delete, but strictly scrub the cryptographic payload to prevent credential hoarding."""
+    from core.db import encrypt_secret
+    
+    # Overwrite the actual credentials with a dead payload
+    scrubbed_payload = encrypt_secret("SCRUBBED_ON_DELETE")
+    
     result = await db.execute(
         update(Connection)
         .where(
             Connection.id == connection_id,
             Connection.workspace_id == workspace_id,
         )
-        .values(is_active=False)
+        .values(
+            is_active=False,
+            encrypted_url=scrubbed_payload
+        )
     )
     await db.commit()
-    return result.rowcount > 0 # type: ignore
+    return result.rowcount > 0 #type: ignore
 
 
 async def mark_connection_status(
