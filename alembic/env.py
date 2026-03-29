@@ -54,7 +54,7 @@ from domains.teams.service import (  # noqa
 )
 
 # Connection models — FK to Workspace, User
-from domains.connections.models import Connection  # noqa
+from domains.connections.models import Connection as DomainConnection  # noqa
 
 # Migration records — FK to Connection
 from domains.migrations.service import MigrationRecord  # noqa

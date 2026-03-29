@@ -228,8 +228,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     from fastapi.exceptions import HTTPException as FastAPIHTTPException
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
-    app.add_exception_handler(CalyphantError, calyphant_error_handler)
-    app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(CalyphantError, calyphant_error_handler) # type: ignore
+    app.add_exception_handler(RequestValidationError, validation_error_handler) # type: ignore
     app.add_exception_handler(FastAPIHTTPException, http_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)

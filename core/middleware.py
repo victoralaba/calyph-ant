@@ -8,7 +8,7 @@ Applied in order (outermost first):
   3. Request timing — adds X-Process-Time header
   4. CORS — configured from settings.CORS_ORIGINS
   5. Rate limiting — slowapi, per-user or per-IP, Redis-backed
-
+ 
 Middleware is registered in main.py. This module only defines the
 handlers and provides the limiter instance.
 """
@@ -64,7 +64,7 @@ def _make_limiter() -> Limiter:
     Uses Redis when available; falls back to in-memory storage so the app
     boots cleanly even if Redis is not running (dev mode).
     """
-    default_limits = [settings.RATE_LIMIT_DEFAULT] if settings.RATE_LIMIT_ENABLED else []
+    default_limits: list = [settings.RATE_LIMIT_DEFAULT] if settings.RATE_LIMIT_ENABLED else []
     storage_uri = settings.REDIS_URL if settings.RATE_LIMIT_ENABLED else "memory://"
 
     if storage_uri.startswith("redis"):
@@ -204,6 +204,6 @@ def register_middleware(app: FastAPI) -> None:
 
     # Rate limiting
     app.add_middleware(SlowAPIMiddleware)
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore
 
     logger.info("Middleware: registered (CORS, CorrelationID, Timing, RateLimit)")
