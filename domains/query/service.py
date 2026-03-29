@@ -172,10 +172,6 @@ MAX_STREAM_TIMEOUT = 600.0       # 10 minutes absolute max for streams
 # Execution
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Execution
-# ---------------------------------------------------------------------------
-
 async def execute_query(
     pg_conn: asyncpg.Connection,
     db: AsyncSession,
@@ -188,7 +184,7 @@ async def execute_query(
 ) -> dict[str, Any]:
     """
     Execute a SQL query and return results.
-    Non-streaming — caps at max_rows. Use stream_query for large results.
+    Non-streaming — strictly caps memory intake at max_rows using server-side cursors.
     Records execution in query history.
 
     STREAM-4 (FIXED): Uses an explicit transaction block to enforce SET LOCAL 
@@ -212,18 +208,29 @@ async def execute_query(
             await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
 
             stmt = await pg_conn.prepare(sql)
-            # asyncpg timeout acts as a secondary socket fail-safe
-            raw_rows = await stmt.fetch(timeout=timeout + 1.0) 
+            
+            # Open a server-side cursor to strictly bound memory intake.
+            # This prevents Python from attempting to load millions of rows into RAM.
+            cursor = await stmt.cursor()
+            
+            # Fetch EXACTLY max_rows + 1. 
+            # If we get max_rows + 1, we know the data bleeds past our limit.
+            # asyncpg timeout acts as a secondary socket fail-safe.
+            raw_rows = await cursor.fetch(max_rows + 1, timeout=timeout + 1.0) 
             
             columns = list(raw_rows[0].keys()) if raw_rows else []
-            row_count = len(raw_rows)
+            row_count_fetched = len(raw_rows)
 
-            if row_count > max_rows:
+            if row_count_fetched > max_rows:
+                # Truncate the overflow row
                 rows = [dict(r) for r in raw_rows[:max_rows]]
                 truncated = True
+                # We forfeit the theoretical total count to guarantee memory safety.
+                row_count = max_rows
             else:
                 rows = [dict(r) for r in raw_rows]
                 truncated = False
+                row_count = row_count_fetched
 
     except asyncpg.QueryCanceledError:
         error = (
@@ -385,10 +392,6 @@ async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
 # EXPLAIN
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# EXPLAIN
-# ---------------------------------------------------------------------------
-
 async def explain_query(
     pg_conn: asyncpg.Connection,
     sql: str,
@@ -401,7 +404,8 @@ async def explain_query(
     Returns both the raw text plan and a parsed JSON plan.
     
     Protects against runaway EXPLAIN ANALYZE executions and explicitly
-    rolls back the transaction so EXPLAIN ANALYZE UPDATE doesn't mutate data.
+    rolls back the transaction natively so EXPLAIN ANALYZE UPDATE doesn't 
+    mutate data and the asyncpg state machine remains uncorrupted.
     """
     options = ["FORMAT JSON"]
     if analyze:
@@ -413,20 +417,23 @@ async def explain_query(
     explain_sql = f"EXPLAIN ({opts}) {sql}"
     timeout_ms = int(min(timeout, MAX_TIMEOUT) * 1000)
 
+    # We give json_plan a starting value here so Pylance knows it exists!
+    json_plan = None
+
     try:
         # EXPLAIN ANALYZE actually executes the query. 
-        # We must protect the backend from hanging, and we roll back 
+        # We must protect the backend from hanging, and we roll back natively 
         # so profiling an UPDATE doesn't accidentally mutate data.
         async with pg_conn.transaction():
             await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
             
             rows = await pg_conn.fetch(explain_sql, timeout=timeout + 1.0)
             json_plan = rows[0][0] if rows else []
-            
-            # If analyze=True, rollback the transaction immediately to prevent side-effects
             if analyze:
-                await pg_conn.execute("ROLLBACK")
+                raise _RollbackSentinel()
                 
+    except _RollbackSentinel:
+        pass
     except asyncpg.QueryCanceledError:
         return {"error": "EXPLAIN ANALYZE exceeded execution timeout.", "plan": None}
     except Exception as exc:

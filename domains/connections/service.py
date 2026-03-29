@@ -181,13 +181,10 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
     """
     Run a battery of lightweight privilege checks against the connected role.
 
-    All queries are read-only and complete in < 5 ms on any Postgres version.
+    All queries are read-only, O(1), and complete in < 5 ms on any Postgres version.
     Never raises — on any error returns a conservative report (is_read_only=True)
     so the caller can still surface the connection as restricted rather than
     crashing.
-    
-    (FIXED) Uses native Postgres privilege functions to correctly evaluate 
-    inherited and PUBLIC group permissions, preventing false-positive lockouts.
     """
     report = PrivilegeReport()
 
@@ -212,32 +209,16 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
             "SELECT has_database_privilege(current_user, current_database(), 'CREATE')"
         ) or False
 
-        # Check INSERT/UPDATE/DELETE on the public schema — proxy for write access.
+        # Check INSERT/UPDATE/DELETE on the public schema — O(1) proxy for write access.
         can_write_schema: bool = await conn.fetchval(
             "SELECT has_schema_privilege(current_user, 'public', 'CREATE')"
         ) or False
 
-        # Check if the user can do DML on any table in public using native role resolution.
-        # This correctly evaluates group inheritance and PUBLIC grants.
-        can_insert: bool = False
-        try:
-            result = await conn.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = 'public' 
-                      AND c.relkind IN ('r', 'p') -- tables and partitioned tables
-                      AND has_table_privilege(current_user, c.oid, 'INSERT')
-                )
-                """
-            )
-            can_insert = result or False
-        except Exception:
-            # If the check itself fails, fall back to schema-level check
-            can_insert = can_write_schema
-
-        report.is_read_only = not (can_write_schema or can_insert)
+        # Architectural Decision: We DO NOT scan pg_class with has_table_privilege here.
+        # It causes O(N) timeouts on databases with massive table counts. 
+        # We assume read-only if they cannot create in the public schema. 
+        # Granular table-level write failures will be safely caught at execution time.
+        report.is_read_only = not can_write_schema
 
         # pg_monitor role grants access to monitoring views without superuser
         has_pg_monitor: bool = await conn.fetchval(
@@ -260,8 +241,9 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
         if report.is_read_only:
             report.missing_roles.append("write access on public schema")
             report.privilege_warnings.append(
-                f"Role '{report.current_role}' has read-only access. "
-                "Schema changes, migrations, and data imports are disabled."
+                f"Role '{report.current_role}' lacks schema creation privileges. "
+                "Assuming read-only access. Schema changes, migrations, and "
+                "data imports are disabled."
             )
 
         if not report.can_create_schema:

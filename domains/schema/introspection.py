@@ -208,10 +208,6 @@ def introspect_table(url: str, table_name: str, schema: str = "public") -> Table
         return tables[0]
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _introspect_tables(
     inspector: Inspector,
     conn: Any,
@@ -232,25 +228,39 @@ def _introspect_tables(
         )
     }
 
-    # Fetch view definitions in one query — keyed by name
+    # Fetch view definitions safely bound by the 'only' filter
     view_definitions: dict[str, str] = {}
     try:
-        rows = conn.execute(
-            text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema"),
-            {"schema": schema},
-        )
+        if only:
+            rows = conn.execute(
+                text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema AND viewname = ANY(:only_names)"),
+                {"schema": schema, "only_names": only},
+            )
+        else:
+            rows = conn.execute(
+                text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema"),
+                {"schema": schema},
+            )
+            
         for row in rows:
             view_definitions[row[0]] = (row[1] or "").strip()
     except Exception as exc:
         logger.warning(f"Could not fetch view definitions for schema '{schema}': {exc}")
 
-    # Fetch materialized view definitions in one query — keyed by name
+    # Fetch materialized view definitions safely bound by the 'only' filter
     matview_definitions: dict[str, str] = {}
     try:
-        rows = conn.execute(
-            text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema"),
-            {"schema": schema},
-        )
+        if only:
+            rows = conn.execute(
+                text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema AND matviewname = ANY(:only_names)"),
+                {"schema": schema, "only_names": only},
+            )
+        else:
+            rows = conn.execute(
+                text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema"),
+                {"schema": schema},
+            )
+            
         for row in rows:
             matview_definitions[row[0]] = (row[1] or "").strip()
     except Exception as exc:
@@ -355,8 +365,6 @@ def _introspect_tables(
     return tables
 
 
-# Make sure to import Any at the top of your file if it isn't already!
-from typing import Any 
 
 def _build_table_info(
     name: str,
