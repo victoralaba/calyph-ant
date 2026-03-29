@@ -76,6 +76,16 @@ from shared.types import (
     PaginatedResponse,
 )
 
+# ---------------------------------------------------------------------------
+# Concurrency Management
+# ---------------------------------------------------------------------------
+# Limits concurrent connection attempts to the SAME external database host.
+# Protects the worker's async event loop from "thunderous herd" connection spikes.
+import asyncio
+from collections import defaultdict
+
+_host_semaphores: dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(5))
+
 
 # ---------------------------------------------------------------------------
 # Provider detection — hostname pattern matching
@@ -305,9 +315,13 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
     wait=wait_exponential(multiplier=1, min=1, max=8),
     reraise=True,
 )
-async def _connect_raw(url: str, timeout: int = 10) -> asyncpg.Connection:
-    """Attempt a raw asyncpg connection with retries for transient failures."""
-    return await asyncpg.connect(dsn=url, timeout=timeout)
+async def _connect_raw(url: str, timeout: int = 10, host: str | None = None) -> asyncpg.Connection:
+    """Attempt a raw asyncpg connection with retries for transient failures and concurrency limits."""
+    sem_key = host or "unknown_host"
+    
+    # Strictly limit parallel handshake attempts to the same host
+    async with _host_semaphores[sem_key]:
+        return await asyncpg.connect(dsn=url, timeout=timeout)
 
 
 async def test_connection(url: str) -> ConnectionTestResult:
@@ -329,7 +343,9 @@ async def test_connection(url: str) -> ConnectionTestResult:
     try:
         # Allow a longer timeout for providers that may need to wake
         timeout = 20 if is_sleeping_provider else 10
-        conn = await _connect_raw(url, timeout=timeout)
+        
+        # Pass the extracted host to trigger the concurrency limit semaphore
+        conn = await _connect_raw(url, timeout=timeout, host=components["host"])
 
         # Collect version info
         version_str: str = str(await conn.fetchval("SELECT version()"))
@@ -389,7 +405,6 @@ async def test_connection(url: str) -> ConnectionTestResult:
         )
     except (OSError, asyncpg.PostgresConnectionError, TimeoutError) as exc:
         error_msg = str(exc)
-        # Pass the raw exception object down, not the stringified message
         was_sleeping = is_sleeping_provider and _looks_like_sleep_error(exc)
         return ConnectionTestResult(
             success=False,
@@ -453,11 +468,17 @@ async def ping_connection(url: str) -> bool:
     Fire a cheap query to keep a cloud database awake.
     Returns True if successful. Does not raise.
     """
+    try:
+        host = urlparse(url).hostname or "unknown"
+    except Exception:
+        host = "unknown"
+
     conn = None
     try:
-        conn = await asyncpg.connect(dsn=url, timeout=15)
-        await conn.fetchval("SELECT 1")
-        return True
+        async with _host_semaphores[host]:
+            conn = await asyncpg.connect(dsn=url, timeout=15)
+            await conn.fetchval("SELECT 1")
+            return True
     except Exception as exc:
         logger.warning(f"Keep-alive ping failed: {exc}")
         return False
@@ -472,19 +493,25 @@ async def execute_presence_heartbeat(url: str) -> None:
     Fails silently. Strict 3-second timeout. No database writes.
     Designed exclusively to reset the idle-timer on serverless DB proxies.
     """
+    try:
+        host = urlparse(url).hostname or "unknown"
+    except Exception:
+        host = "unknown"
+
     conn = None
     try:
-        # 3-second timeout: If it takes longer than 3 seconds to connect, 
-        # it is either already asleep or unreachable. Don't block the worker.
-        conn = await asyncpg.connect(
-            dsn=url, 
-            timeout=3,
-            server_settings={"application_name": "calyphant-ui-heartbeat"}
-        )
-        await conn.fetchval("SELECT 1")
+        # Prevent heartbeat spam from overwhelming the event loop
+        async with _host_semaphores[host]:
+            # 3-second timeout: If it takes longer than 3 seconds to connect, 
+            # it is either already asleep or unreachable. Don't block the worker.
+            conn = await asyncpg.connect(
+                dsn=url, 
+                timeout=3,
+                server_settings={"application_name": "calyphant-ui-heartbeat"}
+            )
+            await conn.fetchval("SELECT 1")
     except Exception as exc:
         # We explicitly swallow exceptions here. Heartbeats are ephemeral.
-        # If the DB is down, the actual query/schema routers will catch it.
         logger.debug(f"Presence heartbeat dropped: {exc}")
     finally:
         if conn:

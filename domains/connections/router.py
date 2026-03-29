@@ -25,7 +25,7 @@ from pydantic.networks import PostgresDsn
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
-from core.db import get_db, encrypt_secret, decrypt_secret
+from core.db import get_db, encrypt_secret, decrypt_secret, get_db_context, get_redis
 from domains.connections.models import CloudProvider, Connection, ConnectionStatus
 from domains.connections import service
 from shared.types import (
@@ -188,7 +188,6 @@ async def create_connection(
     body: CreateConnectionRequest,
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Test a URL and persist it as a named connection in the workspace.
@@ -201,7 +200,7 @@ async def create_connection(
             detail="Background Keep-Alive (24/7) is a premium feature. Free tier databases are kept awake automatically while the Calyphant tab is open."
         )
 
-    # FIX: Explicitly cast body.url to str to satisfy Pylance
+    # 1. NETWORK IO: Execute long-running test before touching the DB
     result = await service.test_connection(str(body.url))
     if not result.success:
         raise HTTPException(
@@ -209,7 +208,6 @@ async def create_connection(
             detail=f"Connection test failed: {result.error}",
         )
 
-    # FIX: Explicitly cast body.url to str to satisfy Pylance
     encrypted_url = _encrypt_url(str(body.url))
 
     create_data = ConnectionCreateRequest(
@@ -218,15 +216,17 @@ async def create_connection(
         keep_alive_interval_seconds=body.keep_alive_interval_seconds,
     )
 
-    conn = await service.create_connection(
-        db=db,
-        workspace_id=workspace_id,
-        user_id=user.id,
-        data=create_data,
-        encrypted_url=encrypted_url,
-        test_result=result,
-    )
-    return ConnectionResponse.from_orm_model(conn)
+    # 2. DB WRITE: Open short-lived session to save
+    async with get_db_context() as db:
+        conn = await service.create_connection(
+            db=db,
+            workspace_id=workspace_id,
+            user_id=user.id,
+            data=create_data,
+            encrypted_url=encrypted_url,
+            test_result=result,
+        )
+        return ConnectionResponse.from_orm_model(conn)
 
 
 @router.get("", response_model=PaginatedResponse[ConnectionResponse])
@@ -334,22 +334,33 @@ async def connection_presence_heartbeat(
     connection_id: UUID,
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Ephemeral UI heartbeat.
-    Called every 4 minutes by the Svelte frontend ONLY when the tab is visible.
+    Reads from Redis cache to avoid heavy Fernet decryption on every pulse.
     Returns 202 Accepted instantly and fires the network pulse in the background.
     """
-    conn = await _get_connection_or_404(connection_id, workspace_id, db)
+    redis = await get_redis()
+    cache_key = f"calyphant:conn_url:{connection_id}"
     
-    # We decrypt the URL but we DO NOT update the database status here.
-    # Database writes on a 4-minute interval per active user will cause DB contention.
-    url = _decrypt_url(conn.encrypted_url)
+    url = await redis.get(cache_key)
     
-    # Fire and forget. We use asyncio.create_task so the HTTP response 
-    # returns to the client immediately (0ms perceived latency), while the 
-    # network pulse executes asynchronously.
+    if not url:
+        # Cache miss: Fallback to short-lived DB fetch and Fernet decryption
+        async with get_db_context() as db:
+            conn = await _get_connection_or_404(connection_id, workspace_id, db)
+            encrypted_url = conn.encrypted_url
+            
+        url = _decrypt_url(encrypted_url)
+        
+        # Cache the plaintext DSN for 5 minutes (300 seconds)
+        # This perfectly covers the 4-minute frontend polling cycle.
+        await redis.setex(cache_key, 300, url)
+    else:
+        # Redis returns bytes if decode_responses=False
+        url = url.decode("utf-8") if isinstance(url, bytes) else url
+
+    # Fire and forget
     import asyncio
     asyncio.create_task(service.execute_presence_heartbeat(url))
     
@@ -361,38 +372,47 @@ async def refresh_connection(
     connection_id: UUID,
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Re-test the connection and update stored metadata (version, capabilities, provider).
     Useful after enabling extensions or upgrading the database.
+    Split into discrete DB transactions to protect the connection pool.
     """
-    conn = await _get_connection_or_404(connection_id, workspace_id, db)
-    url = _decrypt_url(conn.encrypted_url)
+    # 1. DB READ: Fetch encrypted URL instantly
+    async with get_db_context() as db:
+        conn = await _get_connection_or_404(connection_id, workspace_id, db)
+        encrypted_url = conn.encrypted_url
+
+    # 2. NETWORK IO: Decrypt and test (Pool is NOT held here)
+    url = _decrypt_url(encrypted_url)
     result = await service.test_connection(url)
 
-    update_data = ConnectionUpdateRequest()
-    updated = await service.update_connection(
-        db, connection_id, workspace_id, update_data
-    )
-
-    # Manually patch metadata fields not covered by UpdateConnectionRequest
-    if result.success:
-        conn.pg_version = result.pg_version
-        conn.pg_version_num = result.pg_version_num
-        conn.capabilities = result.capabilities or {}
-        conn.status = ConnectionStatus.active
-        if result.cloud_provider:
-            # If it's plain text, convert it to the official CloudProvider badge
-            if isinstance(result.cloud_provider, str):
-                conn.cloud_provider = CloudProvider(result.cloud_provider)
-            else:
-                conn.cloud_provider = result.cloud_provider
-        await db.commit()
-        await db.refresh(conn)
-    else:
-        await service.mark_connection_status(
-            db, connection_id, ConnectionStatus.unreachable, error=result.error
+    # 3. DB WRITE: Re-open session to apply updates instantly
+    async with get_db_context() as db:
+        conn = await _get_connection_or_404(connection_id, workspace_id, db)
+        
+        update_data = ConnectionUpdateRequest()
+        updated = await service.update_connection(
+            db, connection_id, workspace_id, update_data
         )
 
-    return ConnectionResponse.from_orm_model(conn)
+        # Manually patch metadata fields not covered by UpdateConnectionRequest
+        if result.success:
+            conn.pg_version = result.pg_version
+            conn.pg_version_num = result.pg_version_num
+            conn.capabilities = result.capabilities or {}
+            conn.status = ConnectionStatus.active
+            if result.cloud_provider:
+                # If it's plain text, convert it to the official CloudProvider badge
+                if isinstance(result.cloud_provider, str):
+                    conn.cloud_provider = CloudProvider(result.cloud_provider)
+                else:
+                    conn.cloud_provider = result.cloud_provider
+            await db.commit()
+            await db.refresh(conn)
+        else:
+            await service.mark_connection_status(
+                db, connection_id, ConnectionStatus.unreachable, error=result.error
+            )
+
+        return ConnectionResponse.from_orm_model(conn)
