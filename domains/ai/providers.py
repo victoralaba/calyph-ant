@@ -149,29 +149,32 @@ class AnthropicProvider(LLMProvider):
         prompt: str,
         max_tokens: int = 2048,
     ) -> AsyncGenerator[str, None]:
-        async with self._client.stream(
-            "POST",
-            "/v1/messages",
-            json={
-                "model": self.model,
-                "max_tokens": max_tokens,
-                "system": system,
-                "stream": True,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    raw = line[5:].strip()
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(raw)
-                        if event.get("type") == "content_block_delta":
-                            yield event["delta"].get("text", "")
-                    except json.JSONDecodeError:
-                        continue
+        async def _gen() -> AsyncGenerator[str, None]:
+            async with self._client.stream(
+                "POST",
+                "/v1/messages",
+                json={
+                    "model": self.model,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        raw = line[5:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(raw)
+                            if event.get("type") == "content_block_delta":
+                                yield event["delta"].get("text", "")
+                        except json.JSONDecodeError:
+                            continue
+
+        return _gen()
 
 
 # ---------------------------------------------------------------------------
@@ -222,31 +225,35 @@ class GoogleGenAIProvider(LLMProvider):
         max_tokens: int = 2048,
     ) -> AsyncGenerator[str, None]:
         full_prompt = f"{system}\n\n{prompt}"
-        async with self._client.stream(
-            "POST",
-            f"/v1/models/{self.model}:streamGenerateContent",
-            params={"key": self.api_key, "alt": "sse"},
-            json={
-                "contents": [{"parts": [{"text": full_prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens},
-            },
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    raw = line[5:].strip()
-                    try:
-                        event = json.loads(raw)
-                        text = (
-                            event.get("candidates", [{}])[0]
-                            .get("content", {})
-                            .get("parts", [{}])[0]
-                            .get("text", "")
-                        )
-                        if text:
-                            yield text
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        continue
+
+        async def _gen() -> AsyncGenerator[str, None]:
+            async with self._client.stream(
+                "POST",
+                f"/v1/models/{self.model}:streamGenerateContent",
+                params={"key": self.api_key, "alt": "sse"},
+                json={
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {"maxOutputTokens": max_tokens},
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        raw = line[5:].strip()
+                        try:
+                            event = json.loads(raw)
+                            text = (
+                                event.get("candidates", [{}])[0]
+                                .get("content", {})
+                                .get("parts", [{}])[0]
+                                .get("text", "")
+                            )
+                            if text:
+                                yield text
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            continue
+
+        return _gen()
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +265,7 @@ def _configured_providers() -> dict[ProviderName, dict[str, str]]:
     Return metadata for every provider that has a key configured.
     Used by GET /ai/providers.
     """
-    providers: dict[ProviderName, dict[str, str]] = {}
+    providers: dict[ProviderName, dict[str, Any]] = {}
 
     if settings.ANTHROPIC_API_KEY:
         providers["anthropic"] = {
@@ -550,7 +557,7 @@ async def _get_target_pg(
     if not url:
         raise HTTPException(status_code=404, detail="Connection not found.")
     try:
-        return await asyncpg.connect(dsn=url, timeout=15.0)
+        return await asyncpg.connect(dsn=url, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
@@ -584,6 +591,13 @@ async def get_quota_status(user: CurrentUser):
     return await _get_ai_quota_status(user.id, user.tier)
 
 
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
+
+
 @router.post("/{connection_id}/sql")
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def natural_language_to_sql(
@@ -591,6 +605,7 @@ async def natural_language_to_sql(
     connection_id: UUID,
     body: NlToSqlRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -607,7 +622,7 @@ async def natural_language_to_sql(
     schema_ctx = body.schema_context
     if not schema_ctx:
         try:
-            pg_conn = await _get_target_pg(connection_id, user.workspace_id, db)
+            pg_conn = await _get_target_pg(connection_id, workspace_id, db)
             tables = await pg_conn.fetch(
                 """
                 SELECT t.table_name,

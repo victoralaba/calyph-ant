@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from sqlalchemy import DateTime, String, Text, Boolean
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -292,7 +293,9 @@ async def mark_read(db: AsyncSession, notification_id: UUID, user_id: UUID) -> b
         .values(read=True)
     )
     await db.commit()
-    return result.rowcount > 0
+    # Tell Pylance this is a CursorResult
+    cursor_result = cast(CursorResult, result)
+    return cursor_result.rowcount > 0
 
 
 async def mark_all_read(db: AsyncSession, user_id: UUID) -> int:
@@ -302,7 +305,9 @@ async def mark_all_read(db: AsyncSession, user_id: UUID) -> int:
         .values(read=True)
     )
     await db.commit()
-    return result.rowcount
+    # Tell Pylance this is a CursorResult
+    cursor_result = cast(CursorResult, result)
+    return cursor_result.rowcount
 
 
 async def delete_notification(db: AsyncSession, notification_id: UUID, user_id: UUID) -> bool:

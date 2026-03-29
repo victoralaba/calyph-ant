@@ -114,8 +114,10 @@ def _dispatch_enrichment(slug: str) -> None:
     Best-effort — never raises.
     """
     try:
-        from celery import current_app as celery_app
-        celery_app.send_task(
+        from celery import current_app
+        
+        app: Any = current_app
+        app.send_task(
             "platform.catalogue.enrich_extension_async",
             args=[slug],
             queue="maintenance",
@@ -127,6 +129,11 @@ def _dispatch_enrichment(slug: str) -> None:
             f"Could not dispatch enrichment task for '{slug}': {exc}"
         )
 
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
 
 # ---------------------------------------------------------------------------
 # Service functions
@@ -325,7 +332,7 @@ async def _pg(
     if not url:
         raise HTTPException(status_code=404, detail="Connection not found.")
     try:
-        return await asyncpg.connect(dsn=url, timeout=15.0)
+        return await asyncpg.connect(dsn=url, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
@@ -334,6 +341,7 @@ async def _pg(
 async def list_all_extensions(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -343,7 +351,7 @@ async def list_all_extensions(
     Extensions not yet in our catalogue are returned with minimal metadata
     and enriched in the background for subsequent requests.
     """
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         return await list_extensions(pg_conn, db)
     finally:
@@ -353,11 +361,11 @@ async def list_all_extensions(
 @router.get("/{connection_id}/installed")
 async def list_installed(
     connection_id: UUID,
-    user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """List only the extensions currently installed on this connection."""
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         data = await list_extensions(pg_conn, db)
         installed = [e for e in data["extensions"] if e["installed"]]
@@ -371,6 +379,7 @@ async def get_extension(
     connection_id: UUID,
     extension_name: str,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -379,7 +388,7 @@ async def get_extension(
     Performs inline enrichment if the catalogue entry is missing or stale,
     so the response always has the freshest available metadata.
     """
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         return await get_extension_detail(pg_conn, db, extension_name)
     except ValueError as exc:
@@ -393,10 +402,11 @@ async def enable(
     connection_id: UUID,
     body: EnableRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """Install an extension on this connection's database."""
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         return await enable_extension(pg_conn, db, body.name, body.schema_name)
     except ValueError as exc:
@@ -411,10 +421,11 @@ async def disable(
     extension_name: str,
     body: DisableRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """Uninstall an extension from this connection's database."""
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         await disable_extension(pg_conn, extension_name, cascade=body.cascade)
         return {"message": f"Extension '{extension_name}' removed."}

@@ -164,7 +164,7 @@ def create_app() -> FastAPI:
         overall = "ok"
 
         try:
-            conn = await asyncpg.connect(dsn=settings.DATABASE_URL, timeout=3.0)
+            conn = await asyncpg.connect(dsn=settings.DATABASE_URL, timeout=3)
             await conn.fetchval("SELECT 1")
             await conn.close()
             checks["database"] = "ok"

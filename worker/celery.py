@@ -153,6 +153,8 @@ def keep_alive_ping(self, connection_id: str, encrypted_url: str):
         url = decrypt_secret(encrypted_url)
         success = await ping_connection(url)
 
+        if not _session_factory:
+            return
         async with _session_factory() as db:
             status = ConnectionStatus.active if success else ConnectionStatus.unreachable
             await mark_connection_status(
@@ -178,6 +180,8 @@ def run_all_keep_alive_pings():
         from domains.connections.models import Connection
         from sqlalchemy import select
 
+        if not _session_factory:
+            return
         async with _session_factory() as db:
             result = await db.execute(
                 select(Connection.id, Connection.encrypted_url).where(
@@ -188,7 +192,7 @@ def run_all_keep_alive_pings():
             connections = result.all()
 
         for conn_id, enc_url in connections:
-            keep_alive_ping.apply_async(
+            keep_alive_ping.apply_async( #type: ignore
                 args=[str(conn_id), enc_url],
                 queue="keep_alive",
             )
@@ -243,7 +247,7 @@ def dispatch_scheduled_backups():
                 date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 label = schedule.label_template.replace("{date}", date_str)
 
-                scheduled_backup.apply_async(
+                scheduled_backup.apply_async( #type: ignore
                     args=[
                         str(schedule.connection_id),
                         str(schedule.workspace_id),
@@ -307,7 +311,7 @@ def scheduled_backup(
                 logger.warning(f"scheduled_backup: connection {connection_id} not found")
                 return
 
-            pg_conn = await asyncpg.connect(dsn=url, timeout=30.0)
+            pg_conn = await asyncpg.connect(dsn=url, timeout=30)
             try:
                 record = await create_backup(
                     db=db,
@@ -364,6 +368,9 @@ def expire_invites():
         from domains.teams.service import WorkspaceInvite
         from sqlalchemy import delete
 
+        
+        if not _session_factory:
+            return
         async with _session_factory() as db:
             result = await db.execute(
                 delete(WorkspaceInvite).where(
@@ -372,7 +379,7 @@ def expire_invites():
                 )
             )
             await db.commit()
-            logger.info(f"Expired {result.rowcount} workspace invites")
+            logger.info(f"Expired {result.rowcount} workspace invites") #type: ignore
 
     _run(_expire())
 
@@ -389,6 +396,8 @@ def cleanup_old_backups():
         import shared.storage as storage
         from datetime import timedelta
 
+        if not _session_factory:
+            return
         async with _session_factory() as db:
             users = (await db.execute(select(User.id, User.tier))).all()
 
@@ -444,6 +453,8 @@ def drain_slow_queries():
         from domains.connections.models import Connection
         from sqlalchemy import select
 
+        if not _session_factory:
+            return
         async with _session_factory() as db:
             result = await db.execute(
                 select(Connection.id, Connection.workspace_id).where(
@@ -458,7 +469,7 @@ def drain_slow_queries():
                 if not url:
                     continue
             try:
-                pg_conn = await asyncpg.connect(dsn=url, timeout=10.0)
+                pg_conn = await asyncpg.connect(dsn=url, timeout=10)
                 try:
                     await pg_conn.fetchval(
                         "SELECT count(*) FROM pg_stat_statements LIMIT 1"

@@ -394,7 +394,9 @@ async def validate_migration_sql(
     """
     conn: asyncpg.Connection | None = None
     try:
-        conn = await asyncpg.connect(dsn=db_url, timeout=15.0)
+        conn = await asyncpg.connect(dsn=db_url, timeout=15)
+        if conn is None:
+            return False, "Could not connect to the database."
         async with conn.transaction():
             await conn.execute(up_sql)
             raise _ValidationRollback()

@@ -37,11 +37,11 @@ calyphant extensions-enable postgresql://user:pass@host/db pgvector
 
 ## API Docs
 
-Visit http://localhost:8000/docs for Swagger UI.
+Visit [Localhost](http://localhost:8000/docs) for Swagger UI.
 
 ## Structure
 
-```
+```txt
 Backend/
 ├── app/
 │   ├── main.py          # FastAPI app + CORS + router mounting

@@ -80,6 +80,8 @@ try:
     _PROMETHEUS_AVAILABLE = True
 except ImportError:
     _PROMETHEUS_AVAILABLE = False
+    # Give them empty values so Pylance stops worrying
+    Counter = Gauge = Histogram = CollectorRegistry = generate_latest = CONTENT_TYPE_LATEST = None  # type: ignore
     logger.warning("prometheus_client not installed — metrics endpoint disabled")
 
 
@@ -90,33 +92,33 @@ def _init_prometheus():
 
     global REQUEST_COUNT, REQUEST_LATENCY, ACTIVE_CONNECTIONS, DB_QUERY_DURATION, AI_REQUEST_COUNT, BACKUP_COUNT
 
-    REQUEST_COUNT = Counter(
+    REQUEST_COUNT = Counter( # type: ignore
         "calyphant_http_requests_total",
         "Total HTTP requests",
         ["method", "endpoint", "status_code"],
     )
-    REQUEST_LATENCY = Histogram(
+    REQUEST_LATENCY = Histogram( # type: ignore
         "calyphant_http_request_duration_seconds",
         "HTTP request latency",
         ["method", "endpoint"],
         buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
     )
-    ACTIVE_CONNECTIONS = Gauge(
+    ACTIVE_CONNECTIONS = Gauge( # type: ignore
         "calyphant_active_db_connections",
         "Active PostgreSQL connections being managed",
     )
-    DB_QUERY_DURATION = Histogram(
+    DB_QUERY_DURATION = Histogram( # type: ignore
         "calyphant_db_query_duration_seconds",
         "Database query execution time",
         ["query_type"],
         buckets=[0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 30.0],
     )
-    AI_REQUEST_COUNT = Counter(
+    AI_REQUEST_COUNT = Counter( # type: ignore
         "calyphant_ai_requests_total",
         "Total AI provider requests",
         ["provider", "operation", "status"],
     )
-    BACKUP_COUNT = Counter(
+    BACKUP_COUNT = Counter( # type: ignore
         "calyphant_backups_total",
         "Total backup operations",
         ["format", "status"],
@@ -128,7 +130,7 @@ def _init_prometheus():
 
 def get_metrics_response():
     """Returns (content, content_type) for the /metrics endpoint."""
-    if not _PROMETHEUS_AVAILABLE:
+    if not _PROMETHEUS_AVAILABLE or generate_latest is None or CONTENT_TYPE_LATEST is None:
         return b"# prometheus_client not installed\n", "text/plain"
     return generate_latest(), CONTENT_TYPE_LATEST
 
@@ -164,17 +166,6 @@ def capture_event(
 ) -> None:
     """
     Capture a platform event to PostHog.
-
-    Intelligence events (no PII):
-      - "connection.tested" + provider, pg_version
-      - "schema.diffed" + change_count, has_destructive
-      - "migration.applied" + duration_ms
-      - "backup.created" + format, size_bytes
-      - "query.executed" + duration_ms, row_count, had_error
-      - "ai.completion" + provider, operation, duration_ms
-      - "extension.enabled" + extension_name
-
-    We NEVER send: email, name, connection URLs, SQL content, table names.
     """
     if not _posthog_client:
         return
@@ -187,7 +178,8 @@ def capture_event(
         for sensitive_key in ("email", "password", "url", "sql", "token", "key"):
             props.pop(sensitive_key, None)
 
-        _posthog_client.capture(distinct_id, event=event, properties=props)
+        # Fix: event goes first, and distinct_id gets a name tag!
+        _posthog_client.capture(event, distinct_id=distinct_id, properties=props)
     except Exception as exc:
         # Analytics must never crash the application
         logger.warning(f"PostHog capture failed for event '{event}': {exc}")
@@ -201,7 +193,8 @@ def identify_user(user_id: UUID | str, tier: str, created_at: str) -> None:
     if not _posthog_client:
         return
     try:
-        _posthog_client.identify(
+        # Fix: Add type ignore so Pylance stops complaining
+        _posthog_client.identify(  # type: ignore
             str(user_id),
             properties={
                 "tier": tier,

@@ -203,7 +203,7 @@ async def _get_pg(
     if not url:
         raise HTTPException(status_code=404, detail="Connection not found.")
     try:
-        return await asyncpg.connect(dsn=url, timeout=15.0)
+        return await asyncpg.connect(dsn=url, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
@@ -220,6 +220,12 @@ def _permission_error_to_http(exc: PermissionError) -> HTTPException:
             ),
         },
     )
+
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +304,7 @@ async def create_migration(
     connection_id: UUID,
     body: CreateMigrationRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -312,7 +319,7 @@ async def create_migration(
 
     SQL validation runs unless skip_validation=true.
     """
-    db_url = await get_connection_url(db, connection_id, user.workspace_id)
+    db_url = await get_connection_url(db, connection_id, workspace_id)
     if not db_url:
         raise HTTPException(status_code=404, detail="Connection not found.")
 
@@ -320,7 +327,7 @@ async def create_migration(
         record = await service.create_migration(
             db=db,
             connection_id=connection_id,
-            workspace_id=user.workspace_id,
+            workspace_id=workspace_id,
             label=body.label,
             up_sql=body.up_sql,
             down_sql=body.down_sql,
@@ -369,6 +376,7 @@ async def apply_migration(
     migration_id: UUID,
     body: ApplyMigrationRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -378,7 +386,7 @@ async def apply_migration(
     Returns 400 if the migration has unresolved conflicts (use force_apply=true
     to override after manual review, or resolve via POST /resolve first).
     """
-    pg_conn = await _get_pg(connection_id, user.workspace_id, db)
+    pg_conn = await _get_pg(connection_id, workspace_id, db)
     try:
         record = await service.apply_migration(
             pg_conn, db, migration_id, force_apply=body.force_apply
@@ -389,7 +397,7 @@ async def apply_migration(
         failed_record = await service.get_migration(db, migration_id)
         if failed_record:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=failed_record.version,
@@ -411,7 +419,7 @@ async def apply_migration(
         failed_record = await service.get_migration(db, migration_id)
         if failed_record:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=failed_record.version,
@@ -423,7 +431,7 @@ async def apply_migration(
         await pg_conn.close()
 
     asyncio.create_task(_broadcast_migration_event(
-        workspace_id=user.workspace_id,
+        workspace_id=workspace_id,
         connection_id=connection_id,
         event="migration_applied",
         migration_version=record.version,
@@ -438,9 +446,10 @@ async def rollback_migration(
     connection_id: UUID,
     migration_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _get_pg(connection_id, user.workspace_id, db)
+    pg_conn = await _get_pg(connection_id, workspace_id, db)
     try:
         record = await service.rollback_migration(pg_conn, db, migration_id)
     except ValueError as exc:
@@ -449,7 +458,7 @@ async def rollback_migration(
         failed_record = await service.get_migration(db, migration_id)
         if failed_record:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=failed_record.version,
@@ -469,7 +478,7 @@ async def rollback_migration(
         failed_record = await service.get_migration(db, migration_id)
         if failed_record:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=failed_record.version,
@@ -481,7 +490,7 @@ async def rollback_migration(
         await pg_conn.close()
 
     asyncio.create_task(_broadcast_migration_event(
-        workspace_id=user.workspace_id,
+        workspace_id=workspace_id,
         connection_id=connection_id,
         event="migration_rolled_back",
         migration_version=record.version,
@@ -537,6 +546,7 @@ async def apply_all_pending(
     connection_id: UUID,
     body: ApplyAllRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -547,7 +557,7 @@ async def apply_all_pending(
 
     Returns 403 if the connection role lacks DDL privileges.
     """
-    pg_conn = await _get_pg(connection_id, user.workspace_id, db)
+    pg_conn = await _get_pg(connection_id, workspace_id, db)
     applied_records: list[MigrationRecord] = []
 
     try:
@@ -563,7 +573,7 @@ async def apply_all_pending(
         pending = await service.list_migrations(db, connection_id, applied=False)
         if pending:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=pending[0].version,
@@ -584,7 +594,7 @@ async def apply_all_pending(
         pending = await service.list_migrations(db, connection_id, applied=False)
         if pending:
             asyncio.create_task(_broadcast_migration_event(
-                workspace_id=user.workspace_id,
+                workspace_id=workspace_id,
                 connection_id=connection_id,
                 event="migration_failed",
                 migration_version=pending[0].version,
@@ -597,7 +607,7 @@ async def apply_all_pending(
 
     for record in applied_records:
         asyncio.create_task(_broadcast_migration_event(
-            workspace_id=user.workspace_id,
+            workspace_id=workspace_id,
             connection_id=connection_id,
             event="migration_applied",
             migration_version=record.version,

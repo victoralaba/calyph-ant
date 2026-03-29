@@ -209,7 +209,7 @@ def diff(
     from domains.schema.diff import diff_schemas
 
     console.print("[dim]Computing schema diff...[/dim]")
-    result = _run(diff_schemas(source_url, target_url, schema_name=schema_name))
+    result = _run(diff_schemas(source_url, target_url, schema=schema_name))
 
     if result.error:
         err_console.print(f"Diff failed: {result.error}")
@@ -260,16 +260,16 @@ def backup(
 ):
     """Create a database backup and write it locally."""
     import asyncpg
-    from domains.backups.engine import _build_calyph, pg_dump_sql
+    from domains.backups.engine import _build_calyph_chunked, pg_dump_sql
 
     target_url = _get_url(url)
     console.print(f"[dim]Creating {fmt} backup...[/dim]")
 
     async def _do_backup():
         if fmt == "calyph":
-            pg_conn = await asyncpg.connect(dsn=target_url, timeout=30.0)
+            pg_conn = await asyncpg.connect(dsn=target_url, timeout=30)
             try:
-                return await _build_calyph(
+                parts = await _build_calyph_chunked(
                     pg_conn=pg_conn,
                     label=label,
                     schema_only=schema_only,
@@ -277,6 +277,9 @@ def backup(
                     # from the CLI without a DB session or connection_id.
                     db_url=target_url,
                 )
+                # CLI writes only the first part. Multi-part backups are an
+                # R2 concern; locally a single-table-set backup is the norm.
+                return parts[0]
             finally:
                 await pg_conn.close()
         else:
@@ -305,19 +308,31 @@ def extensions_list(
 ):
     """List available (or installed) extensions."""
     import asyncpg
-    from domains.extensions.registry import list_extensions
 
     target_url = _get_url(url)
 
     async def _list():
-        conn = await asyncpg.connect(dsn=target_url, timeout=10.0)
+        conn = await asyncpg.connect(dsn=target_url, timeout=10)
         try:
-            return await list_extensions(conn)
+            rows = await conn.fetch(
+                "SELECT name, default_version, installed_version, comment "
+                "FROM pg_available_extensions ORDER BY name"
+            )
+            return [
+                {
+                    "display_name": r["name"],
+                    "name": r["name"],
+                    "category": "—",
+                    "default_version": r["default_version"],
+                    "installed_version": r["installed_version"],
+                    "installed": r["installed_version"] is not None,
+                }
+                for r in rows
+            ]
         finally:
             await conn.close()
 
-    data = _run(_list())
-    exts = data["extensions"]
+    exts = _run(_list())
     if installed_only:
         exts = [e for e in exts if e["installed"]]
 
@@ -343,25 +358,44 @@ def extensions_enable(
     schema_name: str = typer.Option("public", "--schema", "-s"),
 ):
     """Enable a PostgreSQL extension."""
+    import re
     import asyncpg
-    from domains.extensions.registry import enable_extension
+
+    if not re.match(r"^[\w\-]+$", name):
+        err_console.print(f"Invalid extension name: {name}")
+        raise typer.Exit(1)
 
     target_url = _get_url(url)
 
     async def _enable():
-        conn = await asyncpg.connect(dsn=target_url, timeout=10.0)
+        conn = await asyncpg.connect(dsn=target_url, timeout=10)
         try:
-            return await enable_extension(conn, name, schema_name)
+            await conn.execute(
+                f'CREATE EXTENSION IF NOT EXISTS "{name}" WITH SCHEMA "{schema_name}"'
+            )
+            row = await conn.fetchrow(
+                "SELECT name, installed_version FROM pg_available_extensions WHERE name = $1",
+                name,
+            )
+            return row
         finally:
             await conn.close()
 
     try:
         result = _run(_enable())
-        console.print(
-            f"[green]Extension '{result['display_name']}' enabled "
-            f"(v{result['installed_version']})[/green]"
-        )
-    except ValueError as exc:
+        if result:
+            console.print(
+                f"[green]Extension '{name}' enabled (v{result['installed_version']})[/green]"
+            )
+        else:
+            console.print(f"[green]Extension '{name}' enabled.[/green]")
+    except asyncpg.InsufficientPrivilegeError:
+        err_console.print(f"Insufficient privileges to install '{name}'.")
+        raise typer.Exit(1)
+    except asyncpg.UndefinedObjectError:
+        err_console.print(f"Extension '{name}' is not available on this server.")
+        raise typer.Exit(1)
+    except Exception as exc:
         err_console.print(str(exc))
         raise typer.Exit(1)
 

@@ -73,6 +73,12 @@ def _ok(data: Any) -> dict[str, Any]:
         "required_role": None,
     }
 
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
+
 
 # ---------------------------------------------------------------------------
 # Collectors
@@ -592,7 +598,7 @@ async def _pg(connection_id: UUID, workspace_id: UUID, db: AsyncSession) -> asyn
     if not url:
         raise HTTPException(status_code=404, detail="Connection not found.")
     try:
-        return await asyncpg.connect(dsn=url, timeout=15.0)
+        return await asyncpg.connect(dsn=url, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
@@ -601,9 +607,10 @@ async def _pg(connection_id: UUID, workspace_id: UUID, db: AsyncSession) -> asyn
 async def overview(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         return await get_overview(pg_conn)
     finally:
@@ -614,10 +621,11 @@ async def overview(
 async def table_sizes(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_table_sizes(pg_conn, schema_name)
         # Backwards-compatible: unwrap for clients that expect {"tables": [...]}
@@ -632,10 +640,11 @@ async def table_sizes(
 async def index_stats(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_index_stats(pg_conn, schema_name)
         if not result.get("restricted"):
@@ -649,11 +658,12 @@ async def index_stats(
 async def slow_queries(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     min_ms: float = Query(100.0),
     limit: int = Query(20, le=100),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_slow_queries(pg_conn, min_ms, limit)
         if not result.get("restricted"):
@@ -667,9 +677,10 @@ async def slow_queries(
 async def active_locks(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_active_locks(pg_conn)
         if not result.get("restricted"):
@@ -683,9 +694,11 @@ async def active_locks(
 async def connection_stats(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
+
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_connection_stats(pg_conn)
         if not result.get("restricted"):
@@ -699,9 +712,10 @@ async def connection_stats(
 async def cache_stats(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_cache_stats(pg_conn)
         if not result.get("restricted"):
@@ -715,10 +729,11 @@ async def cache_stats(
 async def bloat_estimates(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         result = await get_bloat_estimates(pg_conn, schema_name)
         if not result.get("restricted"):
@@ -732,11 +747,12 @@ async def bloat_estimates(
 async def get_index_recommendations(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
     min_ms: float = Query(100.0),
 ):
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
+    pg_conn = await _pg(connection_id, workspace_id, db)
     try:
         recommendations = await generate_index_recommendations(
             pg_conn, schema=schema_name, slow_query_threshold_ms=min_ms
@@ -765,11 +781,12 @@ async def apply_recommendation(
     connection_id: UUID,
     body: ApplyRecommendationRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     from domains.migrations.service import create_migration, apply_migration
 
-    db_url = await get_connection_url(db, connection_id, user.workspace_id)
+    db_url = await get_connection_url(db, connection_id, workspace_id)
     if not db_url:
         raise HTTPException(status_code=404, detail="Connection not found.")
 
@@ -777,7 +794,7 @@ async def apply_recommendation(
         record = await create_migration(
             db=db,
             connection_id=connection_id,
-            workspace_id=user.workspace_id,
+            workspace_id=workspace_id,
             label=body.label,
             up_sql=body.sql,
             down_sql=None,
@@ -810,7 +827,7 @@ async def apply_recommendation(
     apply_error: str | None = None
 
     if body.apply_immediately:
-        pg_conn = await _pg(connection_id, user.workspace_id, db)
+        pg_conn = await _pg(connection_id, workspace_id, db)
         try:
             await apply_migration(pg_conn, db, record.id)
             applied = True

@@ -138,6 +138,12 @@ class PingResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
+
 def _encrypt_url(url: str) -> str:
     """Fernet-encrypt a connection URL before persisting it."""
     return encrypt_secret(url)
@@ -183,6 +189,7 @@ async def test_connection(
 async def create_connection(
     body: CreateConnectionRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -206,7 +213,7 @@ async def create_connection(
 
     conn = await service.create_connection(
         db=db,
-        workspace_id=user.workspace_id,
+        workspace_id=workspace_id,
         user_id=user.id,
         data=create_data,
         encrypted_url=encrypted_url,
@@ -218,12 +225,13 @@ async def create_connection(
 @router.get("", response_model=PaginatedResponse[ConnectionResponse])
 async def list_connections(
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
     limit: int = 50,
     offset: int = 0,
 ):
     page = await service.list_connections(
-        db, user.workspace_id, limit=limit, offset=offset
+        db, workspace_id, limit=limit, offset=offset
     )
     return PaginatedResponse(
         items=[ConnectionResponse.from_orm_model(c) for c in page.items],
@@ -237,9 +245,10 @@ async def list_connections(
 async def get_connection(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    conn = await _get_connection_or_404(connection_id, user.workspace_id, db)
+    conn = await _get_connection_or_404(connection_id, workspace_id, db)
     return ConnectionResponse.from_orm_model(conn)
 
 
@@ -248,11 +257,12 @@ async def update_connection(
     connection_id: UUID,
     body: UpdateConnectionRequest,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     update_data = ConnectionUpdateRequest(**body.model_dump(exclude_unset=True))
     conn = await service.update_connection(
-        db, connection_id, user.workspace_id, update_data
+        db, connection_id, workspace_id, update_data
     )
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")
@@ -263,9 +273,10 @@ async def update_connection(
 async def delete_connection(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    deleted = await service.delete_connection(db, connection_id, user.workspace_id)
+    deleted = await service.delete_connection(db, connection_id, workspace_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Connection not found.")
 
@@ -274,12 +285,13 @@ async def delete_connection(
 async def ping_connection(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Manual keep-alive ping. Decrypts the URL, fires SELECT 1, updates status.
     """
-    conn = await _get_connection_or_404(connection_id, user.workspace_id, db)
+    conn = await _get_connection_or_404(connection_id, workspace_id, db)
     url = _decrypt_url(conn.encrypted_url)
     success = await service.ping_connection(url)
 
@@ -301,19 +313,20 @@ async def ping_connection(
 async def refresh_connection(
     connection_id: UUID,
     user: CurrentUser,
+    workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Re-test the connection and update stored metadata (version, capabilities, provider).
     Useful after enabling extensions or upgrading the database.
     """
-    conn = await _get_connection_or_404(connection_id, user.workspace_id, db)
+    conn = await _get_connection_or_404(connection_id, workspace_id, db)
     url = _decrypt_url(conn.encrypted_url)
     result = await service.test_connection(url)
 
     update_data = ConnectionUpdateRequest()
     updated = await service.update_connection(
-        db, connection_id, user.workspace_id, update_data
+        db, connection_id, workspace_id, update_data
     )
 
     # Manually patch metadata fields not covered by UpdateConnectionRequest
@@ -322,7 +335,12 @@ async def refresh_connection(
         conn.pg_version_num = result.pg_version_num
         conn.capabilities = result.capabilities or {}
         conn.status = ConnectionStatus.active
-        conn.cloud_provider = result.cloud_provider or conn.cloud_provider
+        if result.cloud_provider:
+            # If it's plain text, convert it to the official CloudProvider badge
+            if isinstance(result.cloud_provider, str):
+                conn.cloud_provider = CloudProvider(result.cloud_provider)
+            else:
+                conn.cloud_provider = result.cloud_provider
         await db.commit()
         await db.refresh(conn)
     else:
