@@ -172,6 +172,10 @@ MAX_STREAM_TIMEOUT = 600.0       # 10 minutes absolute max for streams
 # Execution
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
 async def execute_query(
     pg_conn: asyncpg.Connection,
     db: AsyncSession,
@@ -187,12 +191,11 @@ async def execute_query(
     Non-streaming — caps at max_rows. Use stream_query for large results.
     Records execution in query history.
 
-    STREAM-4: Uses SET LOCAL statement_timeout so PostgreSQL cancels the
-    backend process on timeout rather than just dropping the client socket.
-    This prevents zombie backend processes from consuming server resources.
+    STREAM-4 (FIXED): Uses an explicit transaction block to enforce SET LOCAL 
+    statement_timeout. Allows DML/DDL but correctly rejects commands that 
+    cannot run inside transactions (e.g., VACUUM).
     """
     timeout = min(timeout, MAX_TIMEOUT)
-    # Convert seconds to milliseconds for PostgreSQL statement_timeout
     timeout_ms = int(timeout * 1000)
 
     start = time.monotonic()
@@ -203,26 +206,34 @@ async def execute_query(
     truncated: bool = False
 
     try:
-        # Set statement_timeout at the transaction level so Postgres itself
-        # cancels the backend query, not just the client socket.
-        await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+        # Enforce transaction block to validate SET LOCAL statement_timeout.
+        # Omit readonly=True so DML commands (INSERT/UPDATE) execute successfully.
+        async with pg_conn.transaction():
+            await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
 
-        stmt = await pg_conn.prepare(sql)
-        raw_rows = await stmt.fetch(timeout=timeout)
-        columns = list(raw_rows[0].keys()) if raw_rows else []
-        row_count = len(raw_rows)
+            stmt = await pg_conn.prepare(sql)
+            # asyncpg timeout acts as a secondary socket fail-safe
+            raw_rows = await stmt.fetch(timeout=timeout + 1.0) 
+            
+            columns = list(raw_rows[0].keys()) if raw_rows else []
+            row_count = len(raw_rows)
 
-        if row_count > max_rows:
-            rows = [dict(r) for r in raw_rows[:max_rows]]
-            truncated = True
-        else:
-            rows = [dict(r) for r in raw_rows]
-            truncated = False
+            if row_count > max_rows:
+                rows = [dict(r) for r in raw_rows[:max_rows]]
+                truncated = True
+            else:
+                rows = [dict(r) for r in raw_rows]
+                truncated = False
 
     except asyncpg.QueryCanceledError:
         error = (
             f"Query exceeded the {timeout}s timeout and was cancelled by the server. "
             "Reduce query complexity or increase the timeout limit."
+        )
+    except asyncpg.exceptions.ActiveSQLTransactionError:
+        error = (
+            "This command cannot be run inside a transaction block "
+            "(e.g., VACUUM, CREATE DATABASE). Please execute it via external tools."
         )
     except asyncpg.PostgresSyntaxError as exc:
         error = f"Syntax error: {exc.args[0]}"
@@ -232,6 +243,8 @@ async def execute_query(
         error = f"Column not found: {exc.args[0]}"
     except asyncpg.InsufficientPrivilegeError:
         error = "Insufficient privileges to execute this query."
+    except asyncpg.PostgresError as exc:
+        error = f"Database error: {exc.args[0]}"
     except Exception as exc:
         error = str(exc)
 
@@ -372,15 +385,23 @@ async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
 # EXPLAIN
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# EXPLAIN
+# ---------------------------------------------------------------------------
+
 async def explain_query(
     pg_conn: asyncpg.Connection,
     sql: str,
     analyze: bool = False,
     buffers: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """
     Run EXPLAIN (or EXPLAIN ANALYZE) on a query.
     Returns both the raw text plan and a parsed JSON plan.
+    
+    Protects against runaway EXPLAIN ANALYZE executions and explicitly
+    rolls back the transaction so EXPLAIN ANALYZE UPDATE doesn't mutate data.
     """
     options = ["FORMAT JSON"]
     if analyze:
@@ -390,14 +411,28 @@ async def explain_query(
 
     opts = ", ".join(options)
     explain_sql = f"EXPLAIN ({opts}) {sql}"
+    timeout_ms = int(min(timeout, MAX_TIMEOUT) * 1000)
 
     try:
-        rows = await pg_conn.fetch(explain_sql)
-        json_plan = rows[0][0] if rows else []
+        # EXPLAIN ANALYZE actually executes the query. 
+        # We must protect the backend from hanging, and we roll back 
+        # so profiling an UPDATE doesn't accidentally mutate data.
+        async with pg_conn.transaction():
+            await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+            
+            rows = await pg_conn.fetch(explain_sql, timeout=timeout + 1.0)
+            json_plan = rows[0][0] if rows else []
+            
+            # If analyze=True, rollback the transaction immediately to prevent side-effects
+            if analyze:
+                await pg_conn.execute("ROLLBACK")
+                
+    except asyncpg.QueryCanceledError:
+        return {"error": "EXPLAIN ANALYZE exceeded execution timeout.", "plan": None}
     except Exception as exc:
         return {"error": str(exc), "plan": None}
 
-    # Also fetch the human-readable text plan
+    # Also fetch the human-readable text plan (Fast, no execution needed)
     text_sql = f"EXPLAIN {sql}"
     try:
         text_rows = await pg_conn.fetch(text_sql)

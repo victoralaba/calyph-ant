@@ -185,6 +185,9 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
     Never raises — on any error returns a conservative report (is_read_only=True)
     so the caller can still surface the connection as restricted rather than
     crashing.
+    
+    (FIXED) Uses native Postgres privilege functions to correctly evaluate 
+    inherited and PUBLIC group permissions, preventing false-positive lockouts.
     """
     report = PrivilegeReport()
 
@@ -210,24 +213,22 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
         ) or False
 
         # Check INSERT/UPDATE/DELETE on the public schema — proxy for write access.
-        # We check pg_namespace privilege rather than a specific table so it works
-        # on empty databases too.
         can_write_schema: bool = await conn.fetchval(
             "SELECT has_schema_privilege(current_user, 'public', 'CREATE')"
         ) or False
 
-        # Also check if the user can do DML on any table in public.
-        # A user might have schema CREATE but still be read-only via RLS or grants.
+        # Check if the user can do DML on any table in public using native role resolution.
+        # This correctly evaluates group inheritance and PUBLIC grants.
         can_insert: bool = False
         try:
-            # Check if ANY table in public grants INSERT to this user
             result = await conn.fetchval(
                 """
                 SELECT EXISTS (
-                    SELECT 1 FROM information_schema.role_table_grants
-                    WHERE grantee = current_user
-                      AND table_schema = 'public'
-                      AND privilege_type = 'INSERT'
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' 
+                      AND c.relkind IN ('r', 'p') -- tables and partitioned tables
+                      AND has_table_privilege(current_user, c.oid, 'INSERT')
                 )
                 """
             )

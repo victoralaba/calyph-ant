@@ -227,9 +227,7 @@ def _introspect_tables(
     mat_views = {
         row[0]
         for row in conn.execute(
-            text(
-                "SELECT matviewname FROM pg_matviews WHERE schemaname = :schema"
-            ),
+            text("SELECT matviewname FROM pg_matviews WHERE schemaname = :schema"),
             {"schema": schema},
         )
     }
@@ -238,11 +236,7 @@ def _introspect_tables(
     view_definitions: dict[str, str] = {}
     try:
         rows = conn.execute(
-            text(
-                "SELECT viewname, definition "
-                "FROM pg_views "
-                "WHERE schemaname = :schema"
-            ),
+            text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema"),
             {"schema": schema},
         )
         for row in rows:
@@ -254,11 +248,7 @@ def _introspect_tables(
     matview_definitions: dict[str, str] = {}
     try:
         rows = conn.execute(
-            text(
-                "SELECT matviewname, definition "
-                "FROM pg_matviews "
-                "WHERE schemaname = :schema"
-            ),
+            text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema"),
             {"schema": schema},
         )
         for row in rows:
@@ -279,15 +269,85 @@ def _introspect_tables(
     if only:
         all_names = [n for n in all_names if n in only]
 
+    if not all_names:
+        return []
+
+    # 1. Bulk fetch custom row estimates (safely bound)
+    if only:
+        est_sql = text("""
+            SELECT c.relname, c.reltuples::bigint 
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace 
+            WHERE n.nspname = :schema AND c.relname = ANY(:only_names)
+        """)
+        est_rows = conn.execute(est_sql, {"schema": schema, "only_names": all_names})
+    else:
+        est_sql = text("""
+            SELECT c.relname, c.reltuples::bigint 
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace 
+            WHERE n.nspname = :schema
+        """)
+        est_rows = conn.execute(est_sql, {"schema": schema})
+        
+    row_estimates = {row[0]: row[1] for row in est_rows}
+
+    # 2. Extract I/O strategy: Bulk vs Single
+    is_bulk = only is None or len(only) > 1
+
+    multi_cols = {}
+    multi_pks = {}
+    multi_fks = {}
+    multi_idxs = {}
+    multi_checks = {}
+    multi_uniques = {}
+
+    if is_bulk:
+        multi_cols = inspector.get_multi_columns(schema=schema)
+        multi_pks = inspector.get_multi_pk_constraint(schema=schema)
+        multi_fks = inspector.get_multi_foreign_keys(schema=schema)
+        multi_idxs = inspector.get_multi_indexes(schema=schema)
+        multi_checks = inspector.get_multi_check_constraints(schema=schema)
+        multi_uniques = inspector.get_multi_unique_constraints(schema=schema)
+
     for name in all_names:
         k = kind_of(name)
         try:
-            table_info = _build_table_info(inspector, conn, name, schema, k)
+            if is_bulk:
+                # Use a two-part key here!
+                table_key = (schema, name)
+                
+                cols_raw = multi_cols.get(table_key, [])
+                pk_raw = multi_pks.get(table_key, {})
+                fks_raw = multi_fks.get(table_key, [])
+                idxs_raw = multi_idxs.get(table_key, [])
+                checks_raw = multi_checks.get(table_key, [])
+                uniques_raw = multi_uniques.get(table_key, [])
+            else:
+                cols_raw = inspector.get_columns(name, schema=schema)
+                pk_raw = inspector.get_pk_constraint(name, schema=schema)
+                fks_raw = inspector.get_foreign_keys(name, schema=schema)
+                idxs_raw = inspector.get_indexes(name, schema=schema)
+                checks_raw = inspector.get_check_constraints(name, schema=schema)
+                uniques_raw = inspector.get_unique_constraints(name, schema=schema)
+
+            table_info = _build_table_info(
+                name=name,
+                schema=schema,
+                kind=k,
+                cols_raw=cols_raw,
+                pk_raw=pk_raw,
+                fks_raw=fks_raw,
+                idxs_raw=idxs_raw,
+                checks_raw=checks_raw,
+                uniques_raw=uniques_raw,
+                row_est=row_estimates.get(name)
+            )
+
             # Attach the view definition so the export can emit real SQL
             if k == "view":
                 table_info.view_definition = view_definitions.get(name)
             elif k == "materialized_view":
                 table_info.view_definition = matview_definitions.get(name)
+                
             tables.append(table_info)
         except Exception as exc:
             logger.warning(f"Could not introspect {schema}.{name}: {exc}")
@@ -295,19 +355,30 @@ def _introspect_tables(
     return tables
 
 
+# Make sure to import Any at the top of your file if it isn't already!
+from typing import Any 
+
 def _build_table_info(
-    inspector: Inspector,
-    conn: Any,
     name: str,
     schema: str,
     kind: str,
+    cols_raw: Any,    
+    pk_raw: Any,      
+    fks_raw: Any,     
+    idxs_raw: Any,    
+    checks_raw: Any,  
+    uniques_raw: Any, 
+    row_est: int | None
 ) -> TableInfo:
-    raw_columns = inspector.get_columns(name, schema=schema)
-    pk_info = inspector.get_pk_constraint(name, schema=schema)
-    pk_cols = set(pk_info.get("constrained_columns", []))
+    # ... keep the rest of your function the exact same!
+    """
+    Pure synchronous mapping function. 
+    ZERO database I/O is performed in this logic.
+    """
+    pk_cols = set(pk_raw.get("constrained_columns", []))
 
     columns = []
-    for col in raw_columns:
+    for col in cols_raw:
         col_type = str(col["type"])
         is_array = col_type.endswith("[]") or col_type.upper().startswith("ARRAY")
         columns.append(
@@ -324,7 +395,7 @@ def _build_table_info(
         )
 
     fks = []
-    for fk in inspector.get_foreign_keys(name, schema=schema):
+    for fk in fks_raw:
         fks.append(
             ForeignKeyInfo(
                 name=fk.get("name"),
@@ -336,7 +407,7 @@ def _build_table_info(
         )
 
     indexes = []
-    for idx in inspector.get_indexes(name, schema=schema):
+    for idx in idxs_raw:
         raw_cols = idx.get("column_names") or []
         indexes.append(
             IndexInfo(
@@ -353,20 +424,8 @@ def _build_table_info(
             name=str(c.get("name") or ""), 
             sqltext=str(c.get("sqltext") or "")
         )
-        for c in inspector.get_check_constraints(name, schema=schema)
+        for c in checks_raw
     ]
-
-    unique_constraints = inspector.get_unique_constraints(name, schema=schema)
-
-    # Estimated row count from pg_class (fast, not exact)
-    row_est = conn.execute(
-        text(
-            "SELECT reltuples::bigint FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE c.relname = :name AND n.nspname = :schema"
-        ),
-        {"name": name, "schema": schema},
-    ).scalar()
 
     return TableInfo(
         name=name,
@@ -376,7 +435,7 @@ def _build_table_info(
         primary_key=list(pk_cols),
         foreign_keys=fks,
         indexes=indexes,
-        unique_constraints=unique_constraints,
+        unique_constraints=uniques_raw,
         check_constraints=check_constraints,
         row_count_estimate=row_est,
     )

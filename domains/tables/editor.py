@@ -618,7 +618,7 @@ async def update_row(
     SAFETY-1 — Optimistic concurrency when row_version is supplied.
     SAFETY-9 — Type-aware version comparison.
     SAFETY-10 — RowLockConflict enriched with presence identity.
-    SAFETY-6 — Audit trail.
+    SAFETY-6 (FIXED) — Guarantees a valid 'before' state for blind updates to support Undo.
 
     Returns updated row dict or None if the row does not exist.
     Raises RowLockConflict, StaleRowError, ValueError.
@@ -626,43 +626,10 @@ async def update_row(
     if not data:
         raise ValueError("No fields to update.")
 
-    if row_version is None:
-        # Blind update path
-        set_parts = [f'"{k}" = ${i + 1}' for i, k in enumerate(data.keys())]
-        pk_idx = len(data) + 1
-        sql = (
-            f'UPDATE "{schema}"."{table}" '
-            f"SET {', '.join(set_parts)} "
-            f'WHERE "{pk_column}" = ${pk_idx} '
-            f"RETURNING *"
-        )
-        row = await conn.fetchrow(sql, *data.values(), pk_value)
-        if row is None:
-            return None
-        result = dict(row)
-        live: dict = {}
-        audit_payload = {
-            "operation": "update",
-            "table": table,
-            "schema": schema,
-            "pk_column": pk_column,
-            "pk_value": pk_value,
-            "before": live if row_version is None and not live else live, # Use live for optimistic, None for blind
-            "after": result,
-        }
-
-        if audit_entries is not None:
-            # Defer writing; aggregate for batch processing
-            audit_entries.append(audit_payload)
-        else:
-            # Await immediately for single-row updates
-            await _write_audit_entry(**audit_payload)
-        return result
-
-    # Optimistic concurrency path
     live: dict = {}
     result: dict = {}
 
+    # Unified transaction: Always fetch state first to guarantee audit integrity
     async with conn.transaction():
         lock_sql = (
             f'SELECT * FROM "{schema}"."{table}" '
@@ -672,13 +639,13 @@ async def update_row(
         locked_row = await conn.fetchrow(lock_sql, pk_value)
 
         if locked_row is None:
+            # Row might be locked by another process or simply missing
             exists = await conn.fetchval(
                 f'SELECT 1 FROM "{schema}"."{table}" '
                 f'WHERE "{pk_column}" = $1',
                 pk_value,
             )
             if exists:
-                # Row is locked — enrich with presence (SAFETY-10)
                 holder: dict | None = None
                 if connection_id is not None:
                     try:
@@ -698,22 +665,26 @@ async def update_row(
             return None
 
         live = dict(locked_row)
-        conflicts: list[dict] = []
-        for col, expected in row_version.items():
-            if col == pk_column:
-                continue
-            if col not in live:
-                continue
-            if not _values_equal(live[col], expected):
-                conflicts.append({
-                    "column": col,
-                    "expected": expected,
-                    "actual": live[col],
-                })
 
-        if conflicts:
-            raise StaleRowError(table, pk_column, pk_value, conflicts)
+        # Conditionally apply optimistic concurrency rules
+        if row_version is not None:
+            conflicts: list[dict] = []
+            for col, expected in row_version.items():
+                if col == pk_column:
+                    continue
+                if col not in live:
+                    continue
+                if not _values_equal(live[col], expected):
+                    conflicts.append({
+                        "column": col,
+                        "expected": expected,
+                        "actual": live[col],
+                    })
 
+            if conflicts:
+                raise StaleRowError(table, pk_column, pk_value, conflicts)
+
+        # Apply the mutation
         set_parts = [f'"{k}" = ${i + 1}' for i, k in enumerate(data.keys())]
         pk_idx = len(data) + 1
         update_sql = (
@@ -733,16 +704,15 @@ async def update_row(
         "schema": schema,
         "pk_column": pk_column,
         "pk_value": pk_value,
-        "before": live if row_version is None and not live else live, # Use live for optimistic, None for blind
+        "before": live,  # Now guaranteed to be populated
         "after": result,
     }
 
     if audit_entries is not None:
-        # Defer writing; aggregate for batch processing
         audit_entries.append(audit_payload)
     else:
-        # Await immediately for single-row updates
         await _write_audit_entry(**audit_payload)
+        
     return result
 
 
@@ -945,11 +915,8 @@ async def bulk_delete(
 
     SAFETY-2 — Two-phase confirmation gate.
     Hard capped at MAX_BULK_DELETE rows.
-    CASCADE-1 — cascade=False raises FKViolationError if any FK constraint
-      blocks the delete. cascade=True lets the DB handle cascading.
-
-    confirmed=False: dry-run — counts matching rows, returns sample PKs.
-    confirmed=True: executes DELETE.
+    CASCADE-1 — cascade=False raises FKViolationError if any FK constraint blocks.
+    SAFETY-6 (FIXED) — Emits batch audit logs for bulk deletions.
     """
     if len(pk_values) > MAX_BULK_DELETE:
         raise ValueError(
@@ -982,10 +949,11 @@ async def bulk_delete(
             ),
         }
 
+    # RETURNING * ensures we capture the data before it is destroyed
     delete_sql = (
         f'DELETE FROM "{schema}"."{table}" '
         f'WHERE "{pk_column}" = ANY($1::text[]) '
-        f"RETURNING 1"
+        f"RETURNING *"
     )
 
     try:
@@ -1001,7 +969,38 @@ async def bulk_delete(
             ) from exc
         raise
 
-    return {"confirmed": True, "deleted": len(rows)}
+    deleted_count = len(rows)
+
+    # Execute batch audit write for destroyed records
+    if deleted_count > 0:
+        from core.db import _session_factory
+        from domains.admin.service import write_audit_batch
+        
+        if _session_factory:
+            try:
+                async with _session_factory() as system_db:
+                    batch_entries = [
+                        {
+                            "action": "table_row.delete",
+                            "resource_type": "table_row",
+                            "resource_id": f"{schema}.{table}:{r[pk_column]}",
+                            "diff": {
+                                "before": _serialise_for_audit(dict(r)),
+                                "after": {},
+                            },
+                            "meta": {
+                                "table": table,
+                                "schema": schema,
+                                "pk_column": pk_column,
+                            }
+                        }
+                        for r in rows
+                    ]
+                    await write_audit_batch(system_db, batch_entries)
+            except Exception as exc:
+                logger.error(f"Failed to execute batch audit write for bulk_delete: {exc}")
+
+    return {"confirmed": True, "deleted": deleted_count}
 
 
 async def _preview_bulk_update(
@@ -1017,11 +1016,9 @@ async def _preview_bulk_update(
     what would change, including lock conflicts and stale-row issues.
 
     Runs under REPEATABLE READ so all row reads see a consistent snapshot.
-    Nothing is written. Both PostgreSQL and Redis I/O are batched/concurrent
-    to prevent N+1 latency spikes.
+    Nothing is written. Both PostgreSQL and Redis I/O are strictly batched
+    to prevent N+1 latency spikes and connection storms.
     """
-    import asyncio # Ensure asyncio is imported if not already at the top
-    
     preview: list[dict[str, Any]] = []
     summary = {"would_update": 0, "not_found": 0, "locked": 0, "stale": 0}
 
@@ -1033,22 +1030,29 @@ async def _preview_bulk_update(
     current_map: dict[str, dict[str, Any]] = {}
     lock_holders: dict[str, dict] = {}
 
-    # 1. Sweep Redis concurrently for all presence locks
+    # 1. Sweep Redis in a SINGLE batch operation
     if connection_id is not None:
         try:
-            from domains.tables.presence import get_row_lock
-            async def fetch_lock(pk):
-                holder = await get_row_lock(
-                    connection_id=connection_id,
-                    schema=schema,
-                    table=table,
-                    pk_value=pk
-                )
-                if holder:
-                    lock_holders[str(pk)] = holder
+            from domains.tables.presence import get_row_locks_batch
             
-            # Fire all presence checks in parallel
-            await asyncio.gather(*(fetch_lock(pk) for pk in pk_values), return_exceptions=True)
+            # Fire a single O(1) network request to Redis
+            locks = await get_row_locks_batch(
+                connection_id=connection_id,
+                schema=schema,
+                table=table,
+                pk_values=pk_values
+            )
+            if locks:
+                # Ensure keys are stringified for dictionary matching
+                lock_holders = {str(k): v for k, v in locks.items() if v}
+                
+        except ImportError:
+            # Architect's safety net: If the presence module hasn't been updated to 
+            # support batching yet, fail open rather than DDoSing Redis with gather().
+            logger.warning(
+                "get_row_locks_batch not implemented in presence domain. "
+                "Skipping presence preview to prevent Redis connection storm."
+            )
         except Exception as exc:
             logger.warning(f"Failed to fetch batch presence locks: {exc}")
 

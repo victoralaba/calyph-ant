@@ -359,6 +359,52 @@ async def get_row_lock(
         return None
 
 
+async def get_row_locks_batch(
+    connection_id: str | UUID,
+    schema: str,
+    table: str,
+    pk_values: list[Any],
+) -> dict[str, dict]:
+    """
+    Batch fetches presence locks for multiple rows using a single Redis MGET.
+    Eliminates N+1 Redis connection storms during bulk preview operations.
+    """
+    if not pk_values:
+        return {}
+
+    # 1. Grab the Redis tool first!
+    redis = await _get_redis()
+    
+    # If the tool is broken or missing, just return an empty dictionary
+    if redis is None:
+        return {}
+
+    str_pks = [str(pk) for pk in pk_values]
+    
+    # 2. Make the keys using your handy helper function
+    keys = [_lock_key(connection_id, schema, table, pk) for pk in str_pks]
+
+    # 3. Use 'redis' to get all the keys at once
+    try:
+        raw_results = await redis.mget(keys)
+    except Exception as exc:
+        logger.warning(f"Batch MGET failed for presence locks: {exc}")
+        return {}
+
+    # 4. Put the results together
+    import json
+    lock_holders: dict[str, dict] = {}
+    
+    for pk, raw_data in zip(str_pks, raw_results):
+        if raw_data is not None:
+            try:
+                lock_holders[pk] = json.loads(raw_data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return lock_holders
+
+
 async def list_table_locks(
     connection_id: UUID | str,
     schema: str,
