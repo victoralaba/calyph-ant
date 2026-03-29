@@ -49,10 +49,13 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID
 
+import ipaddress
+import socket
 import asyncpg
 from loguru import logger
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -60,6 +63,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from core.config import settings
 from domains.connections.models import (
     CloudProvider,
     Connection,
@@ -108,36 +112,48 @@ def detect_provider(host: str) -> CloudProvider:
 # URL validation
 # ---------------------------------------------------------------------------
 
-def parse_and_validate_url(url: str) -> dict[str, Any]:
+async def parse_and_validate_url(url: str) -> dict[str, Any]:
     """
-    Parse a PostgreSQL connection URL and return its components.
-    Raises ValueError with a human-readable message on failure.
+    Parse a PostgreSQL connection URL and resolve its DNS asynchronously.
+    Enforces SSRF protection by blocking internal/private IPs in production.
     """
     try:
         parsed = urlparse(url)
     except Exception as exc:
         raise ValueError(f"Could not parse URL: {exc}") from exc
 
-    if parsed.scheme not in ("postgres", "postgresql", "postgresql+asyncpg"):
-        raise ValueError(
-            f"Unsupported scheme '{parsed.scheme}'. "
-            "Expected postgres:// or postgresql://"
-        )
-
     host = parsed.hostname
     if not host:
         raise ValueError("No host found in connection URL.")
 
-    port = parsed.port or 5432
-    database = (parsed.path or "").lstrip("/") or "postgres"
+    # ---------------------------------------------------------
+    # DEFENSE: Async DNS Resolution & SSRF Protection
+    # ---------------------------------------------------------
+    loop = asyncio.get_running_loop()
+    try:
+        # Resolve host asynchronously to prevent event-loop blocking
+        # Returns a list of (family, type, proto, canonname, sockaddr)
+        addr_info = await loop.getaddrinfo(host, parsed.port or 5432, family=socket.AF_UNSPEC)
+        
+        # Extract the first resolved IP address
+        resolved_ip = addr_info[0][4][0]
+        ip_obj = ipaddress.ip_address(resolved_ip)
 
-    if not parsed.username:
-        raise ValueError("Connection URL must include a username.")
+        # Block private, loopback, and link-local routing
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+            if not settings.is_development:
+                raise ValueError(
+                    f"Security Exception: Host '{host}' resolves to an internal IP "
+                    f"({resolved_ip}). Targeting internal networks is forbidden."
+                )
+    except socket.gaierror:
+        raise ValueError(f"Could not resolve hostname: {host}")
+    # ---------------------------------------------------------
 
     return {
         "host": host,
-        "port": port,
-        "database": database,
+        "port": parsed.port or 5432,
+        "database": (parsed.path or "").lstrip("/") or "postgres",
         "username": parsed.username,
         "password": parsed.password or "",
         "provider": detect_provider(host),
@@ -305,7 +321,7 @@ async def test_connection(url: str) -> ConnectionTestResult:
     never fails the overall connection test — it just leaves privileges
     absent from capabilities.
     """
-    components = parse_and_validate_url(url)
+    components = await parse_and_validate_url(url)
     provider = components["provider"]
     is_sleeping_provider = provider in _SLEEPING_PROVIDERS
 
@@ -635,3 +651,48 @@ def _slugify(name: str) -> str:
     slug = re.sub(r"[^\w\s-]", "", slug)
     slug = re.sub(r"[\s_-]+", "-", slug)
     return slug[:120]
+
+
+async def rotate_workspace_keys(db: AsyncSession) -> dict[str, int]:
+    """
+    Cryptographic sweep: Decrypts all active connections and re-encrypts 
+    them using the current Primary Key (the first key in the ENCRYPTION_KEYS array).
+    
+    Returns a telemetry dict of scanned, rotated, and failed counts.
+    """
+    from core.db import encrypt_secret, decrypt_secret
+    
+    # Fetch all active connections
+    result = await db.execute(
+        select(Connection).where(Connection.is_active == True)
+    )
+    connections = result.scalars().all()
+
+    rotated_count = 0
+    failed_count = 0
+
+    for conn in connections:
+        try:
+            # MultiFernet seamlessly decrypts using whichever legacy key matches
+            plaintext_url = decrypt_secret(conn.encrypted_url)
+            
+            # Encrypts using the NEW Primary Key
+            new_ciphertext = encrypt_secret(plaintext_url)
+            
+            # Only flag as modified if the ciphertext actually changed
+            if new_ciphertext != conn.encrypted_url:
+                conn.encrypted_url = new_ciphertext
+                rotated_count += 1
+                
+        except Exception as exc:
+            logger.error(f"Key rotation failed for connection {conn.id}: {exc}")
+            failed_count += 1
+
+    if rotated_count > 0:
+        await db.commit()
+        
+    return {
+        "scanned": len(connections),
+        "rotated": rotated_count,
+        "failed": failed_count
+    }

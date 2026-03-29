@@ -104,17 +104,30 @@ class Settings(BaseSettings):
     ARGON2_MEMORY_COST: int = 65536
     ARGON2_PARALLELISM: int = 2
 
+# ------------------------------------------------------------------
+    # Encryption (Multi-Key Rotation Strategy for URLs and Snapshots)
     # ------------------------------------------------------------------
-    # Encryption (for stored connection URLs and Redis snapshots)
-    # ------------------------------------------------------------------
-    ENCRYPTION_KEY: str = Field(
+    ENCRYPTION_KEYS: str = Field(
         ...,
         description=(
-            "Fernet key (base64, 32 bytes). Generate with: "
-            "python -c \"from cryptography.fernet import Fernet; "
-            "print(Fernet.generate_key().decode())\""
+            "Comma-separated list of Fernet keys (base64, 32 bytes each). "
+            "The first key is Primary (used for all new encryption). "
+            "All subsequent keys are Secondary (used as fallbacks for decryption). "
+            "Generate keys with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
         ),
     )
+
+    @field_validator("ENCRYPTION_KEYS", mode="after")
+    @classmethod
+    def validate_encryption_keys(cls, v: str) -> list[str]:
+        keys = [k.strip() for k in v.split(",") if k.strip()]
+        if not keys:
+            raise ValueError("At least one ENCRYPTION_KEY must be provided.")
+        for key in keys:
+            if len(key) < 32:
+                raise ValueError("Each Fernet key must be a valid 32-byte base64 string.")
+        return keys
+
 
     # ------------------------------------------------------------------
     # Cloudflare R2
@@ -246,7 +259,7 @@ def get_settings() -> Settings:
     Cached settings — .env is read once per process.
     Always use: from core.config import settings
     """
-    return Settings()
+    return Settings() #type: ignore
 
 
 settings: Settings = get_settings()

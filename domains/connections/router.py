@@ -21,6 +21,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
+from pydantic.networks import PostgresDsn
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
@@ -42,15 +43,14 @@ router = APIRouter(prefix="/connections", tags=["connections"])
 # ---------------------------------------------------------------------------
 
 class TestConnectionRequest(BaseModel):
-    url: str = Field(..., description="PostgreSQL connection URL")
+    # Using Pydantic's native PostgresDsn ensures strict RFC-3986 compliance.
+    # We cast it back to a string for seamless downstream usage.
+    url: Annotated[PostgresDsn, Field(description="PostgreSQL connection URL")]
 
-    @field_validator("url")
+    @field_validator("url", mode="after")
     @classmethod
-    def must_be_postgres(cls, v: str) -> str:
-        v = v.strip()
-        if not v.startswith(("postgres://", "postgresql://", "postgresql+asyncpg://")):
-            raise ValueError("Must be a valid PostgreSQL URL.")
-        return v
+    def cast_url_to_string(cls, v: PostgresDsn) -> str:
+        return str(v)
 
 
 class TestConnectionResponse(BaseModel):
@@ -67,18 +67,15 @@ class TestConnectionResponse(BaseModel):
 
 
 class CreateConnectionRequest(BaseModel):
-    url: str = Field(..., description="PostgreSQL connection URL")
+    url: Annotated[PostgresDsn, Field(description="PostgreSQL connection URL")]
     name: str = Field(..., min_length=1, max_length=120)
     keep_alive_enabled: bool = False
     keep_alive_interval_seconds: int = Field(300, ge=60, le=3600)
 
-    @field_validator("url")
+    @field_validator("url", mode="after")
     @classmethod
-    def must_be_postgres(cls, v: str) -> str:
-        v = v.strip()
-        if not v.startswith(("postgres://", "postgresql://", "postgresql+asyncpg://")):
-            raise ValueError("Must be a valid PostgreSQL URL.")
-        return v
+    def cast_url_to_string(cls, v: PostgresDsn) -> str:
+        return str(v)
 
 
 class UpdateConnectionRequest(BaseModel):
@@ -181,7 +178,7 @@ async def test_connection(
     Test a PostgreSQL URL without persisting anything.
     Returns connectivity result, version info, and detected provider.
     """
-    result = await service.test_connection(body.url)
+    result = await service.test_connection(str(body.url))
     return TestConnectionResponse(**result.model_dump())
 
 
@@ -196,14 +193,14 @@ async def create_connection(
     Test a URL and persist it as a named connection in the workspace.
     Fails if the connection test fails.
     """
-    result = await service.test_connection(body.url)
+    result = await service.test_connection(str(body.url))
     if not result.success:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Connection test failed: {result.error}",
         )
 
-    encrypted_url = _encrypt_url(body.url)
+    encrypted_url = _encrypt_url(str(body.url))
 
     create_data = ConnectionCreateRequest(
         name=body.name,

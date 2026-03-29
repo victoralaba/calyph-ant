@@ -51,7 +51,7 @@ from uuid import UUID
 import asyncpg
 from asyncpg.pool import PoolConnectionProxy
 import redis.asyncio as aioredis
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from loguru import logger
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -76,7 +76,7 @@ _sync_engine: Any | None = None
 _redis: aioredis.Redis | None = None
 _redis_pubsub: aioredis.Redis | None = None
 
-_fernet: Fernet | None = None
+_fernet: MultiFernet | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,10 @@ async def init_db() -> None:
     """
     global _pool, _async_engine, _session_factory, _fernet
 
-    _fernet = Fernet(settings.ENCRYPTION_KEY.encode())
+    # Initialize MultiFernet with the list of keys. 
+    # Index 0 is the primary key for encryption. All keys try to decrypt.
+    fernet_instances = [Fernet(k.encode()) for k in settings.ENCRYPTION_KEYS]
+    _fernet = MultiFernet(fernet_instances)
 
     db_url = (
         settings.DATABASE_URL
@@ -104,7 +107,6 @@ async def init_db() -> None:
             f"(min={settings.POOL_MIN_SIZE} max={settings.POOL_MAX_SIZE})"
         )
 
-        # asyncpg-level pool for raw connections (get_raw_conn)
         _pool = await asyncpg.create_pool(
             dsn=settings.DATABASE_URL,
             min_size=settings.POOL_MIN_SIZE,
@@ -113,13 +115,11 @@ async def init_db() -> None:
             command_timeout=60,
         )
 
-        # SQLAlchemy engine reuses the asyncpg pool via a creator function
-        # so both layers share the same underlying connections.
         engine_kwargs: dict = {
             "pool_size": settings.POOL_MIN_SIZE,
             "max_overflow": settings.POOL_MAX_SIZE - settings.POOL_MIN_SIZE,
             "pool_pre_ping": True,
-            "pool_recycle": 1800,          # recycle connections older than 30 min
+            "pool_recycle": 1800,
         }
     else:
         logger.info("DB: pooling disabled (NullPool — dev mode)")
@@ -332,17 +332,18 @@ async def get_connection_url(
 # Encryption helpers
 # ---------------------------------------------------------------------------
 
+
 def encrypt_secret(plaintext: str) -> str:
-    """Encrypt a string using Fernet symmetric encryption."""
+    """Encrypt a string using the Primary (first) Fernet key via MultiFernet."""
     if not _fernet:
-        raise RuntimeError("Fernet not initialised. Call init_db() at startup.")
+        raise RuntimeError("MultiFernet not initialised. Call init_db() at startup.")
     return _fernet.encrypt(plaintext.encode()).decode()
 
 
 def decrypt_secret(ciphertext: str) -> str:
-    """Decrypt a Fernet-encrypted string."""
+    """Decrypt a Fernet-encrypted string. MultiFernet tries all configured keys automatically."""
     if not _fernet:
-        raise RuntimeError("Fernet not initialised. Call init_db() at startup.")
+        raise RuntimeError("MultiFernet not initialised. Call init_db() at startup.")
     return _fernet.decrypt(ciphertext.encode()).decode()
 
 
