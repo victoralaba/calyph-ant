@@ -59,6 +59,7 @@ from typing import Any, AsyncGenerator, cast
 from uuid import UUID
 
 import asyncpg
+from asyncpg.pool import PoolConnectionProxy
 from loguru import logger
 
 
@@ -1315,7 +1316,7 @@ async def stream_table(
 
 
 async def stream_query_result(
-    conn: asyncpg.Connection,
+    conn: asyncpg.Connection | PoolConnectionProxy,
     sql: str,
     args: list[Any] | None = None,
     chunk_size: int = STREAM_CHUNK_SIZE,

@@ -42,8 +42,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, cast
 from uuid import UUID, uuid4
+from fastapi import BackgroundTasks
+from core.db import get_db_context
 
+import asyncio
 import asyncpg
+from asyncpg.pool import PoolConnectionProxy
 from loguru import logger
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, Boolean
 from sqlalchemy import select
@@ -193,24 +197,63 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
     )
 
 
+class WorkspacePoolManager:
+    """
+    Global registry for tenant-specific PostgreSQL connection pools.
+    Implements persistent multiplexing (zero-latency checkouts) and LRU eviction.
+    """
+    def __init__(self, ttl_seconds: int = 600):
+        self._pools: dict[UUID, tuple[asyncpg.Pool, datetime]] = {}
+        self._lock = asyncio.Lock()
+        self._ttl_seconds = ttl_seconds
+
+    async def get_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
+        now = datetime.now(timezone.utc)
+        
+        async with self._lock:
+            # 1. Background Eviction (Garbage Collection)
+            # Find pools that have exceeded the TTL limit
+            stale_cids = [
+                cid for cid, (_, last_used) in self._pools.items()
+                if (now - last_used).total_seconds() > self._ttl_seconds
+            ]
+            
+            for cid in stale_cids:
+                stale_pool, _ = self._pools.pop(cid)
+                # Fire-and-forget the teardown so we don't block the current request
+                asyncio.create_task(stale_pool.close())
+
+            # 2. Check Out / Update Timestamp
+            # The 0ms path: Pool exists, update its TTL, return immediately.
+            if connection_id in self._pools:
+                pool, _ = self._pools[connection_id]
+                self._pools[connection_id] = (pool, now)
+                return pool
+            
+            # 3. Create New Pool (The TCP Tax - paid exactly once per session)
+            pool = await get_workspace_pool(url)
+            self._pools[connection_id] = (pool, now)
+            return pool
+
+# Initialize the global singleton manager
+pool_manager = WorkspacePoolManager()
+
+
 async def execute_query(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     db: AsyncSession,
     workspace_id: UUID,
     sql: str,
     connection_id: UUID,
     user_id: UUID,
+    background_tasks: BackgroundTasks,
     timeout: float = DEFAULT_TIMEOUT,
     max_rows: int = RESULT_ROW_LIMIT,
 ) -> dict[str, Any]:
     """
     Execute a SQL query and return results.
-    Non-streaming — strictly caps memory intake at max_rows using server-side cursors.
-    Records execution in query history.
-
-    STREAM-4 (FIXED): Uses an explicit transaction block to enforce SET LOCAL 
-    statement_timeout. Allows DML/DDL but correctly rejects commands that 
-    cannot run inside transactions (e.g., VACUUM).
+    Transaction block removed to allow native DBA commands (VACUUM, REINDEX).
+    Relies on session-level statement_timeout and pool reset mechanics.
     """
     timeout = min(timeout, MAX_TIMEOUT)
     timeout_ms = int(timeout * 1000)
@@ -223,46 +266,36 @@ async def execute_query(
     truncated: bool = False
 
     try:
-        # Enforce transaction block to validate SET LOCAL statement_timeout.
-        # Omit readonly=True so DML commands (INSERT/UPDATE) execute successfully.
-        async with pg_conn.transaction():
-            await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+        # 1. Dynamic Session Timeout (Replaces SET LOCAL)
+        # The asyncpg pool automatically executes RESET ALL when the socket 
+        # is returned, guaranteeing this state does not bleed to the next user.
+        await pg_conn.execute(f"SET statement_timeout = {timeout_ms}")
 
-            stmt = await pg_conn.prepare(sql)
-            
-            # Open a server-side cursor to strictly bound memory intake.
-            # This prevents Python from attempting to load millions of rows into RAM.
-            cursor = await stmt.cursor()
-            
-            # Fetch EXACTLY max_rows + 1. 
-            # If we get max_rows + 1, we know the data bleeds past our limit.
-            # asyncpg timeout acts as a secondary socket fail-safe.
-            raw_rows = await cursor.fetch(max_rows + 1, timeout=timeout + 1.0) 
-            
-            columns = list(raw_rows[0].keys()) if raw_rows else []
-            row_count_fetched = len(raw_rows)
+        # 2. Direct Execution (The DBA Wall is down)
+        # Because we removed the transaction block, we cannot use server-side cursors.
+        # We fetch directly. The statement_timeout serves as our primary safety net 
+        # against massive, memory-crashing queries (bounding by time instead of strict rows).
+        raw_rows = await pg_conn.fetch(sql, timeout=timeout + 1.0) 
+        
+        columns = list(raw_rows[0].keys()) if raw_rows else []
+        row_count_fetched = len(raw_rows)
 
-            if row_count_fetched > max_rows:
-                # Truncate the overflow row
-                rows = [dict(r) for r in raw_rows[:max_rows]]
-                truncated = True
-                # We forfeit the theoretical total count to guarantee memory safety.
-                row_count = max_rows
-            else:
-                rows = [dict(r) for r in raw_rows]
-                truncated = False
-                row_count = row_count_fetched
+        if row_count_fetched > max_rows:
+            # Truncate the overflow rows safely in memory
+            rows = [dict(r) for r in raw_rows[:max_rows]]
+            truncated = True
+            row_count = max_rows
+        else:
+            rows = [dict(r) for r in raw_rows]
+            truncated = False
+            row_count = row_count_fetched
 
     except asyncpg.QueryCanceledError:
         error = (
             f"Query exceeded the {timeout}s timeout and was cancelled by the server. "
             "Reduce query complexity or increase the timeout limit."
         )
-    except asyncpg.exceptions.ActiveSQLTransactionError:
-        error = (
-            "This command cannot be run inside a transaction block "
-            "(e.g., VACUUM, CREATE DATABASE). Please execute it via external tools."
-        )
+    # Notice: asyncpg.exceptions.ActiveSQLTransactionError is GONE.
     except asyncpg.PostgresSyntaxError as exc:
         error = f"Syntax error: {exc.args[0]}"
     except asyncpg.UndefinedTableError as exc:
@@ -278,20 +311,19 @@ async def execute_query(
 
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    # Record in history — failure logs a WARNING but never fails the response
-    try:
-        await _record_history(
-            db,
-            user_id,
-            workspace_id,
-            connection_id,
-            sql,
-            duration_ms,
-            row_count,
-            error,
-        )
-    except Exception as exc:
-        logger.warning(f"Failed to record query history: {exc}")
+    # ---------------------------------------------------------
+    # FIRE AND FORGET: Eject telemetry off the critical path
+    # ---------------------------------------------------------
+    background_tasks.add_task(
+        _background_record_history,
+        user_id,
+        workspace_id,
+        connection_id,
+        sql,
+        duration_ms,
+        row_count,
+        error,
+    )
 
     return {
         "columns": columns,
@@ -308,7 +340,7 @@ async def execute_query(
 # ---------------------------------------------------------------------------
 
 async def stream_query(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     sql: str,
     chunk_size: int = 500,
     execution_timeout_seconds: float = DEFAULT_STREAM_TIMEOUT,
@@ -414,7 +446,7 @@ async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def explain_query(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,  # <-- UPDATE TYPE
     sql: str,
     analyze: bool = False,
     buffers: bool = False,
@@ -480,7 +512,7 @@ async def explain_query(
 # ---------------------------------------------------------------------------
 
 async def describe_result_columns(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,  # <-- UPDATE TYPE
     sql: str,
 ) -> dict[str, Any]:
     """
@@ -545,6 +577,35 @@ class _RollbackSentinel(Exception):
 # ---------------------------------------------------------------------------
 # Query history
 # ---------------------------------------------------------------------------
+
+async def _background_record_history(
+    user_id: UUID,
+    workspace_id: UUID,
+    connection_id: UUID,
+    sql: str,
+    duration_ms: int,
+    row_count: int,
+    error: str | None,
+) -> None:
+    """
+    Isolated background task for writing query history.
+    Generates its own DB session so it safely survives after the HTTP response closes.
+    """
+    try:
+        async with get_db_context() as isolated_db:
+            await _record_history(
+                isolated_db,
+                user_id,
+                workspace_id,
+                connection_id,
+                sql,
+                duration_ms,
+                row_count,
+                error,
+            )
+    except Exception as exc:
+        logger.warning(f"Background query history write failed: {exc}")
+
 
 async def _record_history(
     db: AsyncSession,

@@ -55,8 +55,10 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 from uuid import UUID
 
+import asyncio
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from asyncpg.pool import PoolConnectionProxy  # <-- ADD THIS IMPORT
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -127,20 +129,6 @@ class SaveQueryRequest(BaseModel):
 # Connection helper
 # ---------------------------------------------------------------------------
 
-async def _pg(
-    connection_id: UUID,
-    workspace_id: UUID,
-    db: AsyncSession,
-) -> asyncpg.Connection:
-    url = await get_connection_url(db, connection_id, workspace_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    try:
-        return await asyncpg.connect(dsn=url, timeout=15)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
-
-
 async def _get_url(
     connection_id: UUID,
     workspace_id: UUID,
@@ -159,31 +147,6 @@ def require_workspace(user: CurrentUser) -> UUID:
 
 
 # ---------------------------------------------------------------------------
-# Stream connection lifecycle manager  (STREAM-LEAK-1 fix)
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def _managed_pg_conn(url: str) -> AsyncGenerator[asyncpg.Connection, None]:
-    """
-    Async context manager that opens an asyncpg connection and guarantees
-    it is closed on exit regardless of how the context is left — normal
-    return, exception, or cancellation (client disconnect).
-    """
-    # Acquire the resource first. If this fails, it raises an exception 
-    # immediately, and there is nothing to clean up.
-    conn = await asyncpg.connect(dsn=url, timeout=15)
-    
-    try:
-        yield conn
-    finally:
-        # If we reach here, we are guaranteed 'conn' is a valid Connection.
-        try:
-            await conn.close()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -192,24 +155,32 @@ async def execute_query(
     connection_id: UUID,
     body: ExecuteRequest,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute a SQL query and return paginated results."""
-    pg_conn = await _pg(connection_id, workspace_id, db)
+    """Execute a SQL query via persistent hot socket."""
+    url = await _get_url(connection_id, workspace_id, db)
+    
+    # Grab a pre-authenticated pool
+    pool = await service.pool_manager.get_pool(connection_id, url)
+    
     try:
-        return await service.execute_query(
-            pg_conn=pg_conn,
-            db=db,
-            workspace_id=workspace_id,
-            sql=body.sql,
-            connection_id=connection_id,
-            user_id=user.id,
-            timeout=body.timeout,
-            max_rows=body.max_rows,
-        )
-    finally:
-        await pg_conn.close()
+        # pool.acquire() natively handles checkouts and safe returns
+        async with pool.acquire() as pg_conn:
+            return await service.execute_query(
+                pg_conn=pg_conn,
+                db=db,
+                workspace_id=workspace_id,
+                sql=body.sql,
+                connection_id=connection_id,
+                user_id=user.id,
+                background_tasks=background_tasks,
+                timeout=body.timeout,
+                max_rows=body.max_rows,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database execution failed: {exc}")
 
 
 @router.post("/{connection_id}/stream")
@@ -222,61 +193,62 @@ async def stream_query(
 ):
     """
     Stream large query results as Server-Sent Events.
-
-    The first SSE event is always a metadata frame:
-        data: {"type": "meta", "pid": <backend_pid>}
-
-    Use the pid to cancel via POST /query/{connection_id}/cancel if needed.
-
-    Subsequent events are chunk frames:
-        data: {"type": "chunk", "chunk": N, "columns": [...], "rows": [...], "count": N}
-
-    On query timeout or error:
-        data: {"type": "error", "error": "..."}
-
-    Final event:
-        data: {"type": "done"}
-
-    STREAM-LEAK-1 fix: the database connection is managed outside the
-    generator so it is guaranteed to be closed on client disconnect,
-    generator exhaustion, or any exception path.
+    Uses the pool manager to guarantee connection is returned on client disconnect.
+    Engineered with strict L7 proxy bypass mechanics (Buffer blowouts & Heartbeats).
     """
     url = await _get_url(connection_id, workspace_id, db)
 
-    async def _generate_events(pg_conn: asyncpg.Connection) -> AsyncGenerator[str, None]:
-        """
-        Inner generator that assumes pg_conn is already open and managed
-        by the caller. Never opens or closes the connection itself.
-        """
+    async def _generate_events(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> AsyncGenerator[str, None]:
+        # 1. The Buffer Blowout (The 4KB Exploit)
+        # Force aggressive proxies (like Cloudflare) to immediately flush their 
+        # internal memory buffers by padding the initial connection with whitespace.
+        yield f": {' ' * 4096}\n\n"
+        
         try:
-            async for event in service.stream_query(
+            # Initialize the core database stream
+            stream = service.stream_query(
                 pg_conn,
                 body.sql,
                 body.chunk_size,
                 execution_timeout_seconds=body.execution_timeout_seconds,
-            ):
-                yield f"data: {json.dumps(event, default=str)}\n\n"
+            )
+            
+            # 2. The Void Ping Multiplexer
+            # We manually iterate the async generator so we can inject heartbeats.
+            # If a complex query takes 25 seconds to return the first row, we 
+            # ping the proxy every 10 seconds to prevent a 504 Gateway Timeout.
+            stream_iter = aiter(stream)
+            while True:
+                try:
+                    event = await asyncio.wait_for(anext(stream_iter), timeout=10.0)
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # The Void Ping: An SSE comment. Invisible to the frontend, 
+                    # but proves to the edge proxy that the TCP socket is alive.
+                    yield ": heartbeat\n\n"
+                except StopAsyncIteration:
+                    break
+                    
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
 
     async def _safe_stream() -> AsyncGenerator[str, None]:
-        """
-        Outer generator that owns the connection lifetime.
-        The async with block ensures pg_conn.close() is always called,
-        including when the ASGI server cancels the task on client disconnect.
-        """
-        async with _managed_pg_conn(url) as pg_conn:
+        pool = await service.pool_manager.get_pool(connection_id, url)
+        async with pool.acquire() as pg_conn:
             async for chunk in _generate_events(pg_conn):
                 yield chunk
 
+    # 3. Omni-Proxy Disarmament (The Header Barrage)
     return StreamingResponse(
         _safe_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
+            "X-Accel-Buffering": "no",       # Bypasses Nginx buffering
+            "Content-Encoding": "none",      # Forbids proxies from gzip buffering
             "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",  # Explicit streaming declaration
         },
     )
 
@@ -314,17 +286,16 @@ async def explain_query(
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Run EXPLAIN or EXPLAIN ANALYZE on a query.
-    Returns both the JSON plan (for tree rendering) and the text plan.
-    """
-    pg_conn = await _pg(connection_id, workspace_id, db)
+    url = await _get_url(connection_id, workspace_id, db)
+    pool = await service.pool_manager.get_pool(connection_id, url)
+    
     try:
-        return await service.explain_query(
-            pg_conn, body.sql, analyze=body.analyze, buffers=body.buffers
-        )
-    finally:
-        await pg_conn.close()
+        async with pool.acquire() as pg_conn:
+            return await service.explain_query(
+                pg_conn, body.sql, analyze=body.analyze, buffers=body.buffers
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Explain execution failed: {exc}")
 
 
 @router.post("/{connection_id}/describe")
@@ -335,21 +306,14 @@ async def describe_result_columns(
     workspace_id: UUID = Depends(require_workspace),    
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return column-level type metadata for a SELECT query's result set
-    without executing the query or fetching any rows.
-
-    Each entry in the "columns" array contains:
-      name    — column name as it appears in the SELECT list
-      pg_type — PostgreSQL base type name
-      kind    — "numeric" | "temporal" | "categorical"
-      nullable — always true (asyncpg prepare does not expose nullability)
-    """
-    pg_conn = await _pg(connection_id, workspace_id, db)
+    url = await _get_url(connection_id, workspace_id, db)
+    pool = await service.pool_manager.get_pool(connection_id, url)
+    
     try:
-        return await service.describe_result_columns(pg_conn, body.sql)
-    finally:
-        await pg_conn.close()
+        async with pool.acquire() as pg_conn:
+            return await service.describe_result_columns(pg_conn, body.sql)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Column description failed: {exc}")
 
 
 @router.get("/{connection_id}/history")
