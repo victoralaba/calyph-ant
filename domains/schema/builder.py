@@ -44,7 +44,8 @@ To add a new extension-backed index method (e.g. lantern, diskann):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pydantic import BaseModel, Field, model_validator
 from enum import Enum
 from typing import Any
 
@@ -369,23 +370,6 @@ async def assert_extensions_for_columns(
     for col in columns:
         data_type = col.data_type.upper().split("(")[0].strip()
 
-        if data_type == "VECTOR":
-            dims = col.vector_dimensions
-            if dims is None:
-                raise ValueError(
-                    f"Column '{col.name}' has type VECTOR but no vector_dimensions "
-                    f"specified. Set vector_dimensions to the embedding size "
-                    f"(e.g. 1536 for OpenAI text-embedding-3-small, "
-                    f"768 for Gemini, 384 for MiniLM). "
-                    f"pgvector supports {VECTOR_DIMENSIONS_MIN}–{VECTOR_DIMENSIONS_MAX}."
-                )
-            if not (VECTOR_DIMENSIONS_MIN <= dims <= VECTOR_DIMENSIONS_MAX):
-                raise ValueError(
-                    f"Column '{col.name}': vector_dimensions must be between "
-                    f"{VECTOR_DIMENSIONS_MIN} and {VECTOR_DIMENSIONS_MAX}, got {dims}. "
-                    f"Common values: "
-                    f"{', '.join(f'{k}={v}' for k, v in VECTOR_DIMENSION_PRESETS.items())}."
-                )
 
         required_ext = EXTENSION_REQUIRED.get(data_type)
         if required_ext and required_ext not in checked:
@@ -556,10 +540,13 @@ def _type_smart_defaults(data_type: str) -> list[dict[str, str]]:
 # Input models
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ColumnDefinition:
-    name: str
-    data_type: str
+# ---------------------------------------------------------------------------
+# Input models (The Boundary)
+# ---------------------------------------------------------------------------
+
+class ColumnDefinition(BaseModel):
+    name: str = Field(..., min_length=1)
+    data_type: str = Field(..., min_length=1)
     nullable: bool = True
     default: str | None = None
     primary_key: bool = False
@@ -567,37 +554,46 @@ class ColumnDefinition:
     check: str | None = None
     references: str | None = None
     comment: str | None = None
-    vector_dimensions: int | None = None
+    # Pydantic natively enforces the physical limits of pgvector here
+    vector_dimensions: int | None = Field(None, ge=VECTOR_DIMENSIONS_MIN, le=VECTOR_DIMENSIONS_MAX)
+
+    @model_validator(mode='after')
+    def validate_vector_requirements(self) -> "ColumnDefinition":
+        """Enforce that VECTOR types strictly provide their dimensions at the boundary."""
+        if self.data_type.upper().split("(")[0].strip() == "VECTOR":
+            if self.vector_dimensions is None:
+                raise ValueError(
+                    f"Column '{self.name}' has type VECTOR but no vector_dimensions "
+                    f"specified. Must be between {VECTOR_DIMENSIONS_MIN} and {VECTOR_DIMENSIONS_MAX}."
+                )
+        return self
 
 
-@dataclass
-class IndexDefinition:
-    name: str
-    columns: list[str]
+class IndexDefinition(BaseModel):
+    name: str = Field(..., min_length=1)
+    columns: list[str] = Field(..., min_length=1) # Rejects empty index requests automatically
     unique: bool = False
-    method: str = "btree"
+    method: str = Field("btree", min_length=1)
     predicate: str | None = None
     vector_lists: int | None = None
     vector_m: int | None = None
     vector_ef_construction: int | None = None
 
 
-@dataclass
-class CreateTableRequest:
-    table_name: str
-    schema_name: str = "public"
-    columns: list[ColumnDefinition] = field(default_factory=list)
+class CreateTableRequest(BaseModel):
+    table_name: str = Field(..., min_length=1)
+    schema_name: str = Field("public", min_length=1)
+    columns: list[ColumnDefinition] = Field(default_factory=list)
     if_not_exists: bool = False
-    composite_pk: list[str] = field(default_factory=list)
+    composite_pk: list[str] = Field(default_factory=list)
 
 
-@dataclass
-class AlterColumnRequest:
-    table_name: str
-    column_name: str
-    schema_name: str = "public"
-    new_name: str | None = None
-    new_type: str | None = None
+class AlterColumnRequest(BaseModel):
+    table_name: str = Field(..., min_length=1)
+    column_name: str = Field(..., min_length=1)
+    schema_name: str = Field("public", min_length=1)
+    new_name: str | None = Field(None, min_length=1)
+    new_type: str | None = Field(None, min_length=1)
     set_nullable: bool | None = None
     set_default: str | None = None
     drop_default: bool = False
@@ -1043,39 +1039,64 @@ def sql_comment_on_column(
 async def execute_sql(
     conn: asyncpg.Connection,
     statements: list[str],
+    workspace_role: str,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    if dry_run:
-        try:
-            async with conn.transaction():
-                for stmt in statements:
-                    await conn.execute(stmt)
-                raise _DryRunRollback()
-        except _DryRunRollback:
-            return {
-                "dry_run": True,
-                "statements": statements,
-                "error": None,
-                "message": "Dry run succeeded — no changes were committed.",
-            }
-        except Exception as exc:
-            return {
-                "dry_run": True,
-                "statements": statements,
-                "error": str(exc),
-                "message": "Dry run failed — the SQL contains errors.",
-            }
-
+    """
+    Executes raw DDL within a strict blast-radius sandbox.
+    Relies entirely on PostgreSQL for syntax parsing and role-based security.
+    """
     executed = []
     try:
+        # 1. The Boundary Lock: Open a strict transaction
         async with conn.transaction():
+            
+            # 2. The Sandbox: Isolate the blast radius immediately.
+            # This ensures if 'statements' contains malicious schema hopping,
+            # the Postgres engine physically rejects it.
+            await conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
+            
+            # 3. Execution: Feed the raw strings to the Postgres compiler
             for stmt in statements:
                 await conn.execute(stmt)
                 executed.append(stmt)
+                
+            # 4. The Dry-Run Fork
+            if dry_run:
+                raise _DryRunRollback()
+                
+        # If we reach here, dry_run was False and changes are committed.
         return {"dry_run": False, "statements": executed, "error": None}
+
+    except _DryRunRollback:
+        return {
+            "dry_run": True,
+            "statements": statements,
+            "error": None,
+            "message": "Dry run succeeded — no changes were committed.",
+        }
+    except asyncpg.PostgresSyntaxError as exc:
+        return {
+            "dry_run": dry_run,
+            "statements": statements,
+            "error": f"Syntax error in SQL: {exc.args[0]}",
+            "message": "Execution failed — the database engine rejected the syntax.",
+        }
+    except asyncpg.InsufficientPrivilegeError:
+        return {
+            "dry_run": dry_run,
+            "statements": statements,
+            "error": "Permission denied.",
+            "message": "Execution blocked — attempted to modify resources outside the assigned workspace.",
+        }
     except Exception as exc:
         logger.error(f"Schema execution failed: {exc}\nStatements: {statements}")
-        return {"dry_run": False, "statements": executed, "error": str(exc)}
+        return {
+            "dry_run": dry_run,
+            "statements": executed,
+            "error": str(exc),
+            "message": "Execution failed due to a database integrity or internal error.",
+        }
 
 
 class _DryRunRollback(Exception):
@@ -1086,19 +1107,27 @@ class _DryRunRollback(Exception):
 # Validators
 # ---------------------------------------------------------------------------
 
-_SAFE_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_$]*$')
-
 _ALLOWED_FK_ACTIONS = {
     "NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT",
 }
 
 
 def _validate_identifier(name: str) -> None:
-    if not _SAFE_IDENTIFIER.match(name):
+    """
+    Enforces the absolute physical boundaries of PostgreSQL quoted identifiers.
+    Postgres allows any character inside double quotes except the null byte.
+    We additionally reject unescaped double quotes to prevent boundary breakout.
+    """
+    if not name:
+        raise ValueError("Identifier cannot be empty.")
+    
+    if "\x00" in name:
+        raise ValueError("PostgreSQL identifiers cannot contain null bytes (\\x00).")
+    
+    if '"' in name:
         raise ValueError(
-            f"Unsafe identifier '{name}'. "
-            "Identifiers must start with a letter or underscore and contain "
-            "only letters, digits, underscores, or dollar signs."
+            f"Identifier '{name}' contains a double quote. "
+            "To prevent quote-breakout injection, double quotes are strictly prohibited."
         )
 
 
