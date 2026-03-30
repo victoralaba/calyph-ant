@@ -459,6 +459,62 @@ def _looks_like_sleep_error(exc: Exception) -> bool:
     return any(hint in error_str for hint in sleep_hints)
 
 
+async def get_validated_workspace_url(
+    db: AsyncSession,
+    connection_id: UUID,
+    workspace_id: UUID,
+) -> str:
+    """
+    Fetch URL and validate against SSRF before handing off to read-only tools.
+    Throws standard HTTP exceptions for seamless integration with routers.
+    """
+    from core.db import get_connection_url
+    from fastapi import HTTPException
+    
+    url = await get_connection_url(db, connection_id, workspace_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+        
+    try:
+        # Re-validate at execution time to catch DNS poisoning / SSRF changes
+        await parse_and_validate_url(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+        
+    return url
+
+
+async def acquire_workspace_connection(
+    db: AsyncSession,
+    connection_id: UUID,
+    workspace_id: UUID,
+    timeout: int = 15,
+) -> asyncpg.Connection:
+    """
+    Unified outbound connection gateway.
+    Enforces _host_semaphores concurrency limits and strict SSRF-checked URL resolution.
+    """
+    from fastapi import HTTPException, status
+    url = await get_validated_workspace_url(db, connection_id, workspace_id)
+    
+    # We know the URL is valid, extract host for the semaphore
+    host = urlparse(url).hostname or "unknown"
+
+    try:
+        # Strictly limit parallel handshake attempts to the same host
+        async with _host_semaphores[host]:
+            return await asyncpg.connect(
+                dsn=url,
+                timeout=timeout,
+                server_settings={"application_name": "calyphant-workspace-exec"}
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Could not connect to database: {exc}",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Keep-alive ping (called by Celery task)
 # ---------------------------------------------------------------------------

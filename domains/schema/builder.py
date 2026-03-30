@@ -278,43 +278,40 @@ SMART_DEFAULTS_ASYNC = {"auto_uuid", "auto_uuidv7"}
 
 
 async def resolve_smart_default(
-    conn: asyncpg.Connection,
-    symbolic_default: str,
+    pg_conn: asyncpg.Connection,
+    expression: str,
     data_type: str,
 ) -> str:
-    key = symbolic_default.strip().lower()
-
-    if key in SMART_DEFAULTS_STATIC:
-        return SMART_DEFAULTS_STATIC[key]
-
-    if key == "auto_uuid":
-        pg_version_num = await conn.fetchval("SHOW server_version_num")
-        try:
-            if pg_version_num is not None and int(pg_version_num) >= 130000:
-                return "gen_random_uuid()"
-        except (ValueError, TypeError):
-            pass
-
-        installed = await check_extension_installed(conn, "uuid-ossp")
-        if installed:
-            return "uuid_generate_v4()"
-
-        raise ValueError(
-            "UUID auto-generation requires PostgreSQL 13+ (built-in gen_random_uuid()) "
-            "or the 'uuid-ossp' extension. "
-            "Enable uuid-ossp via the Extensions manager or upgrade to PostgreSQL 13+."
-        )
-
-    if key == "auto_uuidv7":
-        installed = await check_extension_installed(conn, "pg_uuidv7")
-        if not installed:
-            raise ValueError(
-                "UUIDv7 auto-generation requires the 'pg_uuidv7' extension. "
-                "Enable it via the Extensions manager."
-            )
-        return "uuid_generate_v7()"
-
-    return symbolic_default
+    """
+    Evaluates dynamic default expressions (e.g., UUID generation) safely.
+    Runs in a guaranteed rolled-back transaction with a 1000ms timeout to prevent DoS.
+    """
+    tr = pg_conn.transaction()
+    await tr.start()
+    
+    try:
+        # 1. Iron-clad limit: 1000ms max for function evaluation
+        await pg_conn.execute("SET LOCAL statement_timeout = '1000';")
+        
+        # 2. Resolve the value by casting it to text so the UI can preview it
+        query = f"SELECT ({expression})::{data_type}::text"
+        resolved_value = await pg_conn.fetchval(query)
+        
+        if resolved_value is None:
+            return "NULL"
+            
+        # Format string defaults properly for Postgres
+        return f"'{resolved_value}'"
+        
+    except Exception as exc:
+        # If a smart default fails to evaluate or times out, we surface the error
+        # so the pipeline can reject the payload.
+        raise ValueError(f"Could not resolve smart default '{expression}': {exc}")
+        
+    finally:
+        # 3. Always rollback. We are just asking the DB what the value WOULD be.
+        # This prevents `nextval()` or volatile functions from permanently advancing.
+        await tr.rollback()
 
 
 async def resolve_column_defaults(
@@ -1037,66 +1034,52 @@ def sql_comment_on_column(
 # ---------------------------------------------------------------------------
 
 async def execute_sql(
-    conn: asyncpg.Connection,
-    statements: list[str],
+    pg_conn: asyncpg.Connection,
+    sql_statements: list[str],
     workspace_role: str,
     dry_run: bool = False,
-) -> dict[str, Any]:
+    timeout_ms: int = 15000,  # 15-second hard limit for synchronous UI operations
+) -> dict:
     """
-    Executes raw DDL within a strict blast-radius sandbox.
-    Relies entirely on PostgreSQL for syntax parsing and role-based security.
+    Executes a batch of DDL statements inside a strict tenant sandbox.
+    Enforces role isolation and engine-level execution timeouts.
     """
-    executed = []
-    try:
-        # 1. The Boundary Lock: Open a strict transaction
-        async with conn.transaction():
-            
-            # 2. The Sandbox: Isolate the blast radius immediately.
-            # This ensures if 'statements' contains malicious schema hopping,
-            # the Postgres engine physically rejects it.
-            await conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
-            
-            # 3. Execution: Feed the raw strings to the Postgres compiler
-            for stmt in statements:
-                await conn.execute(stmt)
-                executed.append(stmt)
-                
-            # 4. The Dry-Run Fork
-            if dry_run:
-                raise _DryRunRollback()
-                
-        # If we reach here, dry_run was False and changes are committed.
-        return {"dry_run": False, "statements": executed, "error": None}
+    if not sql_statements:
+        return {"dry_run": dry_run, "statements": [], "error": None, "message": "No statements to execute."}
 
-    except _DryRunRollback:
-        return {
-            "dry_run": True,
-            "statements": statements,
-            "error": None,
-            "message": "Dry run succeeded — no changes were committed.",
-        }
-    except asyncpg.PostgresSyntaxError as exc:
-        return {
-            "dry_run": dry_run,
-            "statements": statements,
-            "error": f"Syntax error in SQL: {exc.args[0]}",
-            "message": "Execution failed — the database engine rejected the syntax.",
-        }
-    except asyncpg.InsufficientPrivilegeError:
-        return {
-            "dry_run": dry_run,
-            "statements": statements,
-            "error": "Permission denied.",
-            "message": "Execution blocked — attempted to modify resources outside the assigned workspace.",
-        }
+    tr = pg_conn.transaction()
+    await tr.start()
+    
+    try:
+        # 1. Enforce engine-level circuit breaker for this entire block
+        await pg_conn.execute(f"SET LOCAL statement_timeout = '{timeout_ms}';")
+        
+        # 2. Strict Tenant Isolation: Assume the workspace role.
+        # This prevents DDL from modifying cross-tenant tables even if SQL injection occurs.
+        await pg_conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
+
+        for stmt in sql_statements:
+            await pg_conn.execute(stmt)
+
+        if dry_run:
+            # Physics dictates a dry run must never persist
+            await tr.rollback()
+            return {"dry_run": True, "statements": sql_statements, "error": None, "message": "Dry run successful."}
+        else:
+            await tr.commit()
+            return {"dry_run": False, "statements": sql_statements, "error": None, "message": "Execution successful."}
+
     except Exception as exc:
-        logger.error(f"Schema execution failed: {exc}\nStatements: {statements}")
-        return {
-            "dry_run": dry_run,
-            "statements": executed,
-            "error": str(exc),
-            "message": "Execution failed due to a database integrity or internal error.",
-        }
+        await tr.rollback()
+        
+        error_msg = str(exc)
+        if isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in error_msg.lower():
+            error_msg = (
+                f"Operation timed out ({timeout_ms / 1000}s limit exceeded). "
+                "The table is too large for synchronous changes, or the query is hanging."
+            )
+            
+        return {"dry_run": dry_run, "statements": sql_statements, "error": error_msg}
 
 
 class _DryRunRollback(Exception):

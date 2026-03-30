@@ -59,6 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
 from domains.connections.models import Connection
+from domains.connections.service import acquire_workspace_connection, get_validated_workspace_url
 from domains.schema import introspection, builder
 from domains.schema.builder import (
     AlterColumnRequest,
@@ -510,32 +511,50 @@ class SetCommentBody(BaseModel):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-async def _get_live_connection(
-    connection_id: UUID,
-    workspace_id: UUID,
-    db: AsyncSession,
-) -> asyncpg.Connection:
-    url = await get_connection_url(db, connection_id, workspace_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Connection not found.")
+async def _evaluate_untrusted_expression(
+    pg_conn: asyncpg.Connection,
+    expression: str,
+    expected_type: str | None = None,
+) -> None:
+    """
+    Executes a user-provided SQL expression inside a strict, rolled-back sandbox.
+    Prevents state mutation (side effects) and stops runaway queries (DoS).
+    """
+    tr = pg_conn.transaction()
+    await tr.start()
     try:
-        return await asyncpg.connect(dsn=url, timeout=15)
+        # Iron-clad limit: 1000ms execution max. 
+        # Aborts pg_sleep() or massive cross-joins instantly at the DB engine.
+        await pg_conn.execute("SET LOCAL statement_timeout = '1000';")
+        
+        # We cast the evaluation if a type is provided to ensure type compatibility
+        query = f"SELECT ({expression})"
+        if expected_type:
+            query += f"::{expected_type}"
+            
+        await pg_conn.execute(query)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Could not connect to database: {exc}",
-        )
-
-
-async def _get_url(
-    connection_id: UUID,
-    workspace_id: UUID,
-    db: AsyncSession,
-) -> str:
-    url = await get_connection_url(db, connection_id, workspace_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    return url
+        await tr.rollback()
+        
+        # Map Postgres timeouts to clear HTTP 400s
+        if isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in str(exc).lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Expression evaluation timed out. It is too complex or malicious: {expression}",
+            )
+        elif isinstance(exc, asyncpg.PostgresSyntaxError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid expression syntax: {exc.args[0]}",
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid expression: {exc}",
+            )
+    else:
+        # ALWAYS roll back on success. A validation check must NEVER commit state changes.
+        await tr.rollback()
 
 
 def _sql_preview(
@@ -571,12 +590,12 @@ async def _validate_and_resolve_columns(
 
     for col in resolved:
         if col.default is not None:
-            error = await validate_default_expression(pg_conn, col.default, col.data_type)
-            if error:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid DEFAULT for column '{col.name}': {error}",
-                )
+            # Replaced the unsafe imported validator with our strict local sandbox
+            await _evaluate_untrusted_expression(
+                pg_conn=pg_conn,
+                expression=col.default,
+                expected_type=col.data_type
+            )
 
     return resolved, extensions_required
 
@@ -607,7 +626,7 @@ async def get_full_snapshot(
     schema_name: str = Query("public"),
 ):
     wid = _require_workspace(user.workspace_id)
-    url = await _get_url(connection_id, wid, db)
+    url = await get_validated_workspace_url(db, connection_id, wid)
     snapshot = await introspection.introspect_database(url, schema_name)
     return snapshot
 
@@ -620,7 +639,7 @@ async def list_tables(
     schema_name: str = Query("public"),
 ):
     wid = _require_workspace(user.workspace_id)
-    url = await _get_url(connection_id, wid, db)
+    url = await get_validated_workspace_url(db, connection_id, wid)
     snapshot = await introspection.introspect_database(url, schema_name)
     return {
         "tables": [
@@ -646,7 +665,7 @@ async def get_table(
     schema_name: str = Query("public"),
 ):
     wid = _require_workspace(user.workspace_id)
-    url = await _get_url(connection_id, wid, db)
+    url = await get_validated_workspace_url(db, connection_id, wid)
     table = await introspection.introspect_table(url, table_name, schema_name)
     return table
 
@@ -678,7 +697,7 @@ async def create_table(
                 detail=f"composite_pk references columns not in this table: {bad}",
             )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         resolved_columns, extensions_required = await _validate_and_resolve_columns(
             pg_conn, columns
@@ -721,7 +740,7 @@ async def rename_table(
     )
 
     sql = sql_rename_table(table_name, body.new_name, body.schema_name)
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -759,7 +778,7 @@ async def drop_table(
         connection_id, wid, db, require_write=not dry_run, operation="DROP TABLE"
     )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
@@ -796,7 +815,7 @@ async def add_column(
     )
 
     col = ColumnDefinition(**body.column)
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         resolved_columns, extensions_required = await _validate_and_resolve_columns(
             pg_conn, [col]
@@ -841,7 +860,8 @@ async def alter_column(
     )
     statements = builder.sql_alter_column(req)
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    # Use the unified, semaphored connection factory
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         if body.set_default is not None:
             from domains.schema.builder import (
@@ -864,21 +884,19 @@ async def alter_column(
             if error:
                 raise HTTPException(status_code=400, detail=error)
         elif body.set_default is not None:
-            try:
-                await pg_conn.fetchval(
-                    f"SELECT ({req.set_default or body.set_default})"
-                )
-            except asyncpg.PostgresSyntaxError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid DEFAULT expression: {exc.args[0]}",
-                )
+            # Replaced the un-sandboxed fetchval with our strict evaluation boundary
+            await _evaluate_untrusted_expression(
+                pg_conn, 
+                req.set_default or body.set_default, 
+                body.new_type
+            )
 
         result = await builder.execute_sql(pg_conn, statements, workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
     if not body.dry_run and not result.get("error"):
+        import asyncio
         asyncio.create_task(_broadcast_schema_changed(
             wid, connection_id,
             change_kind="column_altered",
@@ -905,7 +923,7 @@ async def drop_column(
         connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TABLE (DROP COLUMN)"
     )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
@@ -943,7 +961,7 @@ async def create_index(
     )
 
     idx = IndexDefinition(**body.index)
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         try:
             extensions_required = await assert_extensions_for_index(pg_conn, idx)
@@ -986,7 +1004,7 @@ async def drop_index(
         connection_id, wid, db, require_write=not dry_run, operation="DROP INDEX"
     )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
@@ -1032,7 +1050,7 @@ async def add_foreign_key(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1067,7 +1085,7 @@ async def add_check_constraint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1103,7 +1121,7 @@ async def add_unique_constraint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1143,7 +1161,7 @@ async def drop_constraint(
         connection_id, wid, db, require_write=not body.dry_run, operation="DROP CONSTRAINT"
     )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
@@ -1176,7 +1194,7 @@ async def list_enums(
     schema_name: str = Query("public"),
 ):
     wid = _require_workspace(user.workspace_id)
-    url = await _get_url(connection_id, wid, db)
+    url = await get_validated_workspace_url(db, connection_id, wid)
     snapshot = await introspection.introspect_database(url, schema_name)
     return {
         "enums": [
@@ -1204,7 +1222,7 @@ async def create_enum(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1243,7 +1261,7 @@ async def add_enum_value(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         if body.dry_run:
             result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=True)
@@ -1289,7 +1307,7 @@ async def rename_enum_value(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1324,7 +1342,7 @@ async def drop_enum(
         connection_id, wid, db, require_write=not body.dry_run, operation="DROP TYPE (enum)"
     )
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
@@ -1371,7 +1389,7 @@ async def set_table_comment(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
@@ -1411,7 +1429,7 @@ async def set_column_comment(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    pg_conn = await _get_live_connection(connection_id, wid, db)
+    pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
