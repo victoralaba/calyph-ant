@@ -23,6 +23,9 @@ SQLAlchemy-specific leaks out of this module.
 
 from __future__ import annotations
 
+import asyncio
+import socket
+import ipaddress
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -30,7 +33,9 @@ from typing import Any
 from loguru import logger
 from sqlalchemy import Inspector, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import SQLAlchemyError
 
 
 # ---------------------------------------------------------------------------
@@ -128,46 +133,108 @@ class SchemaSnapshot:
     enums: list[EnumInfo]
     sequences: list[SequenceInfo]
     extensions: list[dict]
+    unreadable_entities: list[dict] = field(default_factory=list)
+
+
+def _validate_safe_target(url_str: str) -> None:
+    """
+    SECURITY: Server-Side Request Forgery (SSRF) Prevention.
+    Deconstructs the URL, resolves the hostname to an IP, and blocks 
+    any attempt to connect to loopback, private VPC, or cloud metadata IPs.
+    """
+    try:
+        parsed = make_url(url_str)
+    except Exception as exc:
+        raise ValueError(f"Malformed database URL: {exc}")
+
+    if not parsed.host:
+        raise ValueError("Invalid database URL: Missing hostname.")
+
+    try:
+        # Resolve the hostname to its physical IP address
+        ip_str = socket.gethostbyname(parsed.host)
+        ip_obj = ipaddress.ip_address(ip_str)
+    except socket.gaierror:
+        raise ValueError(f"Could not resolve hostname: {parsed.host}")
+
+    # The Guillotine: Block internal routing
+    if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+        logger.warning(f"SSRF Attempt Blocked: Target '{parsed.host}' resolved to internal IP {ip_str}.")
+        raise ValueError(
+            "Security Violation: Connection to internal or private networks is strictly prohibited."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Engine factory (sync — Inspector requires sync engine)
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=128)
+# ---------------------------------------------------------------------------
+# Engine factory (sync — Inspector requires sync engine)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=2048)
 def _make_sync_engine(url: str) -> Engine:
     """
     Build a short-lived sync SQLAlchemy engine for introspection.
-    Converts asyncpg DSN to psycopg3-compatible if needed.
-
-    Cached via LRU to prevent dialect setup overhead on repeated calls.
-    Uses NullPool so connections are never held open across the cache.
+    
+    SECURITY & STABILITY:
+    - Validates target IP against SSRF attacks.
+    - Cache maxsize bumped to 2048 to prevent multi-tenant thrashing.
+    - Injects strict libpq driver-level timeouts (5s connect, 15s statement).
     """
     from sqlalchemy import create_engine
 
+    # 1. Enforce Network Boundary (SSRF Protection)
+    _validate_safe_target(url)
+
+    # 2. Normalize Protocol
     clean = url.replace("postgresql+asyncpg://", "postgresql+psycopg://")
     if clean.startswith("postgres://"):
         clean = clean.replace("postgres://", "postgresql+psycopg://", 1)
     elif not clean.startswith("postgresql+"):
         clean = clean.replace("postgresql://", "postgresql+psycopg://", 1)
-    return create_engine(clean, poolclass=NullPool)
+        
+    # 3. Enforce Temporal Boundary (Guillotine Protocol)
+    strict_timeouts = {
+        "connect_timeout": 5, 
+        "options": "-c statement_timeout=15000"
+    }
+
+    return create_engine(
+        clean, 
+        poolclass=NullPool,
+        connect_args=strict_timeouts
+    )
 
 
 # ---------------------------------------------------------------------------
 # Core introspection
 # ---------------------------------------------------------------------------
 
-def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapshot:
+async def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapshot:
     """
     Full structural introspection of a database.
-    Runs synchronously — call from a thread pool in async contexts.
+    
+    ASYNC GATEWAY: This forces the underlying synchronous SQLAlchemy Inspector 
+    operations onto a background worker thread. It guarantees the FastAPI 
+    event loop will never be blocked by slow external database connections.
+    """
+    return await asyncio.to_thread(_sync_introspect_database, url, target_schema)
 
-    Args:
-        url: PostgreSQL connection URL (any supported scheme)
-        target_schema: PostgreSQL schema to inspect (default: public)
 
-    Returns:
-        SchemaSnapshot with complete structural metadata
+async def introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
+    """
+    Introspect a single table. Faster than full snapshot for targeted ops.
+    
+    ASYNC GATEWAY: Safely delegates to a background thread to prevent starvation.
+    """
+    return await asyncio.to_thread(_sync_introspect_table, url, table_name, schema)
+
+
+def _sync_introspect_database(url: str, target_schema: str = "public") -> SchemaSnapshot:
+    """
+    PRIVATE: Synchronous execution payload. Do not call this directly from an async router.
     """
     engine = _make_sync_engine(url)
     with engine.connect() as conn:
@@ -181,11 +248,13 @@ def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapsh
             if s not in ("pg_catalog", "information_schema", "pg_toast")
         ]
 
-        tables = _introspect_tables(inspector, conn, target_schema)
+        # Explicitly unpacking the tuple to handle the new telemetry contract
+        tables, unreadable_entities = _introspect_tables(inspector, conn, target_schema)
         enums = _introspect_enums(conn, target_schema)
         sequences = _introspect_sequences(conn, target_schema)
         extensions = _introspect_extensions(conn)
 
+    # Returning outside the `with` block so the connection is closed before we serialize
     return SchemaSnapshot(
         database=str(database or "unknown"),
         pg_version=str(pg_version or "").split(",")[0].strip(),
@@ -194,17 +263,26 @@ def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapsh
         enums=enums,
         sequences=sequences,
         extensions=extensions,
+        unreadable_entities=unreadable_entities,
     )
 
 
-def introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
-    """Introspect a single table. Faster than full snapshot for targeted ops."""
+def _sync_introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
+    """
+    PRIVATE: Synchronous execution payload for single-table inspection.
+    """
     engine = _make_sync_engine(url)
     with engine.connect() as conn:
         inspector = inspect(engine)
-        tables = _introspect_tables(inspector, conn, schema, only=[table_name])
+        
+        # Explicitly unpacking the tuple to handle the new telemetry contract
+        tables, unreadable_entities = _introspect_tables(inspector, conn, schema, only=[table_name])
+        
         if not tables:
-            raise ValueError(f"Table '{schema}.{table_name}' not found.")
+            # If the table failed, extract the specific DB reason and raise it violently
+            reason = unreadable_entities[0]["reason"] if unreadable_entities else "Unknown error"
+            raise ValueError(f"Table '{schema}.{table_name}' could not be read. Reason: {reason}")
+            
         return tables[0]
 
 
@@ -213,8 +291,23 @@ def _introspect_tables(
     conn: Any,
     schema: str,
     only: list[str] | None = None,
-) -> list[TableInfo]:
+) -> tuple[list[TableInfo], list[dict]]:
+    """
+    Extracts table metadata. 
+    
+    PERFORMANCE & MEMORY CONTRACT:
+    - Phase 1 (Map): If `only` is None, this returns a lightweight blueprint 
+      (Names, Kinds, Row Counts) to prevent memory exhaustion on massive databases.
+    - Phase 2 (Drill-Down): If `only` is provided, it performs deep introspection
+      (Columns, Indexes, Constraints) for those specific tables.
+      
+    Returns:
+        A tuple of (successful_tables, unreadable_entities)
+    """
+    import re  # Required for the EXPLAIN fallback telemetry
+    
     tables: list[TableInfo] = []
+    unreadable_entities: list[dict] = []
 
     table_names = inspector.get_table_names(schema=schema)
     view_names = inspector.get_view_names(schema=schema)
@@ -228,7 +321,7 @@ def _introspect_tables(
         )
     }
 
-    # Fetch view definitions safely bound by the 'only' filter
+    # Fetch view definitions safely
     view_definitions: dict[str, str] = {}
     try:
         if only:
@@ -241,13 +334,13 @@ def _introspect_tables(
                 text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema"),
                 {"schema": schema},
             )
-            
         for row in rows:
             view_definitions[row[0]] = (row[1] or "").strip()
-    except Exception as exc:
-        logger.warning(f"Could not fetch view definitions for schema '{schema}': {exc}")
+    except SQLAlchemyError as exc:
+        logger.error(f"Failed to fetch view definitions for schema '{schema}': {exc}")
+        unreadable_entities.append({"type": "schema_views", "name": "all", "reason": str(exc)})
 
-    # Fetch materialized view definitions safely bound by the 'only' filter
+    # Fetch materialized view definitions safely
     matview_definitions: dict[str, str] = {}
     try:
         if only:
@@ -260,13 +353,11 @@ def _introspect_tables(
                 text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema"),
                 {"schema": schema},
             )
-            
         for row in rows:
             matview_definitions[row[0]] = (row[1] or "").strip()
-    except Exception as exc:
-        logger.warning(
-            f"Could not fetch materialized view definitions for schema '{schema}': {exc}"
-        )
+    except SQLAlchemyError as exc:
+        logger.error(f"Failed to fetch matview definitions for schema '{schema}': {exc}")
+        unreadable_entities.append({"type": "schema_matviews", "name": "all", "reason": str(exc)})
 
     def kind_of(name: str) -> str:
         if name in mat_views:
@@ -280,9 +371,9 @@ def _introspect_tables(
         all_names = [n for n in all_names if n in only]
 
     if not all_names:
-        return []
+        return [], unreadable_entities
 
-    # 1. Bulk fetch custom row estimates (safely bound)
+    # 1. Telemetry Sanitization: Fetch custom row estimates safely
     if only:
         est_sql = text("""
             SELECT c.relname, c.reltuples::bigint 
@@ -298,19 +389,33 @@ def _introspect_tables(
         """)
         est_rows = conn.execute(est_sql, {"schema": schema})
         
-    row_estimates = {row[0]: row[1] for row in est_rows}
+    row_estimates = {}
+    for row in est_rows:
+        t_name = row[0]
+        reltuples = row[1]
+        
+        if reltuples == -1:
+            # STALE DATA FIX: Table has never been analyzed. Value is dead.
+            row_estimates[t_name] = None
+        elif reltuples == 0 and only:
+            # FALLBACK RADAR: If drilling down into a "0 row" table, verify with planner
+            try:
+                # Safely format identifiers since they originate directly from the catalog
+                explain_res = conn.execute(text(f'EXPLAIN SELECT 1 FROM "{schema}"."{t_name}"')).fetchone()
+                match = re.search(r'rows=(\d+)', explain_res[0]) if explain_res else None
+                row_estimates[t_name] = int(match.group(1)) if match else 0
+            except Exception:
+                row_estimates[t_name] = 0
+        else:
+            row_estimates[t_name] = reltuples
 
-    # 2. Extract I/O strategy: Bulk vs Single
-    is_bulk = only is None or len(only) > 1
+    # 2. Lazy Loading Boundary
+    is_full_sweep = only is None
+    is_bulk_drilldown = only is not None and len(only) > 1
 
-    multi_cols = {}
-    multi_pks = {}
-    multi_fks = {}
-    multi_idxs = {}
-    multi_checks = {}
-    multi_uniques = {}
+    multi_cols, multi_pks, multi_fks, multi_idxs, multi_checks, multi_uniques = {}, {}, {}, {}, {}, {}
 
-    if is_bulk:
+    if not is_full_sweep and is_bulk_drilldown:
         multi_cols = inspector.get_multi_columns(schema=schema)
         multi_pks = inspector.get_multi_pk_constraint(schema=schema)
         multi_fks = inspector.get_multi_foreign_keys(schema=schema)
@@ -321,10 +426,11 @@ def _introspect_tables(
     for name in all_names:
         k = kind_of(name)
         try:
-            if is_bulk:
-                # Use a two-part key here!
+            # MEMORY FIX: If full sweep, skip fetching deep constraints entirely to save RAM
+            if is_full_sweep:
+                cols_raw, pk_raw, fks_raw, idxs_raw, checks_raw, uniques_raw = [], {}, [], [], [], []
+            elif is_bulk_drilldown:
                 table_key = (schema, name)
-                
                 cols_raw = multi_cols.get(table_key, [])
                 pk_raw = multi_pks.get(table_key, {})
                 fks_raw = multi_fks.get(table_key, [])
@@ -352,17 +458,22 @@ def _introspect_tables(
                 row_est=row_estimates.get(name)
             )
 
-            # Attach the view definition so the export can emit real SQL
             if k == "view":
                 table_info.view_definition = view_definitions.get(name)
             elif k == "materialized_view":
                 table_info.view_definition = matview_definitions.get(name)
                 
             tables.append(table_info)
-        except Exception as exc:
-            logger.warning(f"Could not introspect {schema}.{name}: {exc}")
+            
+        except SQLAlchemyError as exc:
+            logger.error(f"Database error introspecting {schema}.{name}: {exc}")
+            unreadable_entities.append({
+                "type": k,
+                "name": name,
+                "reason": str(exc)
+            })
 
-    return tables
+    return tables, unreadable_entities
 
 
 
