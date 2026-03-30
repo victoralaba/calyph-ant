@@ -26,6 +26,7 @@ cryptography
 
 # ── Config + validation ───────────────────────────────────────────────────────
 pydantic
+pydantic[email]
 pydantic-settings
 
 # ── Redis + task queue ────────────────────────────────────────────────────────
