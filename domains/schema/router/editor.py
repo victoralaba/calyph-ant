@@ -58,12 +58,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
+from domains.billing.flutterwave import get_limits
+from domains.users.service import get_user
 from domains.connections.models import Connection
 from domains.connections.service import acquire_workspace_connection, get_validated_workspace_url
 from domains.schema import introspection, builder
 from domains.schema.builder import (
     AlterColumnRequest,
     ColumnDefinition,
+    ColumnCheckConstraint,
     CreateTableRequest,
     IndexDefinition,
     assert_extensions_for_columns,
@@ -443,7 +446,8 @@ class AddForeignKeyBody(BaseModel):
 class AddCheckConstraintBody(BaseModel):
     table: str
     name: str
-    expression: str
+    column_name: str
+    constraint: ColumnCheckConstraint
     schema_name: str = "public"
     dry_run: bool = False
 
@@ -690,6 +694,26 @@ async def create_table(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
+    
+    # --- NEW: QUOTA GATE ---
+    if not body.dry_run:
+        # Fetch user's tier limits
+        db_user = await get_user(db, user.id)
+        limits = get_limits(db_user.tier if db_user else "free")
+        max_tables = limits.get("max_tables_per_connection", 20)
+        
+        if max_tables != -1:
+            # Quickly count existing tables via introspection
+            url = await get_validated_workspace_url(db, connection_id, wid)
+            snapshot = await introspection.introspect_database(url, body.schema_name)
+            current_count = len(snapshot.tables)
+            
+            if current_count >= max_tables:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Tier limit reached: You cannot create more than {max_tables} tables. Please upgrade your plan."
+                )
+
     workspace_role = await _get_workspace_role(
         connection_id, wid, db, require_write=not body.dry_run, operation="CREATE TABLE"
     )
@@ -1088,8 +1112,11 @@ async def add_check_constraint(
 
     try:
         sql = sql_add_check_constraint(
-            table=body.table, name=body.name,
-            expression=body.expression, schema_name=body.schema_name,
+            table=body.table, 
+            name=body.name,
+            column_name=body.column_name,
+            constraint=body.constraint,
+            schema_name=body.schema_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
