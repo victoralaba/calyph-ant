@@ -9,10 +9,10 @@ than getting a raw asyncpg InsufficientPrivilegeError surfaced as a 500.
 
 Permission guard
 ----------------
-_require_write_access() fetches the connection's stored capabilities,
-checks the privileges.is_read_only flag, and raises HTTP 403 before
-opening a DB connection if the role is read-only. This is called at the
-top of every write endpoint (create_table, add_column, drop_*, etc.).
+_get_workspace_role() fetches the connection's stored capabilities,
+checks the privileges.is_read_only flag if require_write=True, and raises HTTP 403 
+before opening a DB connection if the role is read-only. It returns the current_role 
+which is passed down to execute_sql to enforce the transaction-level sandbox.
 
 Read-only endpoints (introspection, export) are unaffected.
 
@@ -114,18 +114,20 @@ _CONFIRM_KEY_PREFIX = "calyphant:ddl_confirm:"
 
 
 # ---------------------------------------------------------------------------
-# Permission guard
+# Permission guard & Sandbox context
 # ---------------------------------------------------------------------------
 
-async def _require_write_access(
+async def _get_workspace_role(
     connection_id: UUID,
     workspace_id: UUID,
     db: AsyncSession,
+    require_write: bool = True,
     operation: str = "This schema operation",
-) -> None:
+) -> str:
     """
-    Fetch the connection's stored capabilities and raise HTTP 403 if
-    the connection role is read-only.
+    Fetch the connection's stored capabilities. If require_write=True,
+    raise HTTP 403 if the connection role is read-only. Returns the
+    current active role to be injected into the sandbox boundaries.
     """
     result = await db.execute(
         select(Connection.capabilities).where(
@@ -136,14 +138,12 @@ async def _require_write_access(
     )
     caps = result.scalar_one_or_none()
     if caps is None:
-        return  # Connection lookup will 404 downstream
+        raise HTTPException(status_code=404, detail="Connection not found.")
 
     privs: dict = caps.get("privileges", {})
-    if not privs:
-        return  # No privilege data — fall through
+    role = privs.get("current_role", "unknown")
 
-    if privs.get("is_read_only", False):
-        role = privs.get("current_role", "unknown")
+    if require_write and privs.get("is_read_only", False):
         warnings = privs.get("privilege_warnings", [])
         detail_msg = warnings[0] if warnings else ""
         raise HTTPException(
@@ -162,6 +162,8 @@ async def _require_write_access(
                 "missing_privileges": privs.get("missing_roles", []),
             },
         )
+        
+    return role
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,7 @@ async def _load_confirm_session(token: str) -> list[str] | None:
 async def _execute_with_confirmation(
     pg_conn: asyncpg.Connection,
     sql_statements: list[str],
+    workspace_role: str,
     confirmed: bool,
     confirm_token: str | None,
     dry_run: bool,
@@ -248,7 +251,7 @@ async def _execute_with_confirmation(
         No confirmation token needed.
     """
     if dry_run:
-        result = await builder.execute_sql(pg_conn, sql_statements, dry_run=True)
+        result = await builder.execute_sql(pg_conn, sql_statements, workspace_role, dry_run=True)
         return _sql_preview(sql_statements, True, result, extensions_required)
 
     if not confirmed:
@@ -302,7 +305,7 @@ async def _execute_with_confirmation(
             ),
         )
 
-    result = await builder.execute_sql(pg_conn, sql_statements, dry_run=False)
+    result = await builder.execute_sql(pg_conn, sql_statements, workspace_role, dry_run=False)
 
     if not result.get("error") and workspace_id and connection_id and broadcast_kind:
         asyncio.create_task(_broadcast_schema_changed(
@@ -605,9 +608,7 @@ async def get_full_snapshot(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await _get_url(connection_id, wid, db)
-    snapshot = await asyncio.to_thread(
-        introspection.introspect_database, url, schema_name
-    )
+    snapshot = await introspection.introspect_database(url, schema_name)
     return snapshot
 
 
@@ -620,9 +621,7 @@ async def list_tables(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await _get_url(connection_id, wid, db)
-    snapshot = await asyncio.to_thread(
-        introspection.introspect_database, url, schema_name
-    )
+    snapshot = await introspection.introspect_database(url, schema_name)
     return {
         "tables": [
             {
@@ -648,9 +647,7 @@ async def get_table(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await _get_url(connection_id, wid, db)
-    table = await asyncio.to_thread(
-        introspection.introspect_table, url, table_name, schema_name
-    )
+    table = await introspection.introspect_table(url, table_name, schema_name)
     return table
 
 
@@ -666,10 +663,9 @@ async def create_table(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "CREATE TABLE"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="CREATE TABLE"
+    )
 
     columns = [ColumnDefinition(**c) for c in body.columns]
 
@@ -695,7 +691,7 @@ async def create_table(
             composite_pk=body.composite_pk,
         )
         sql = builder.sql_create_table(req)
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -720,15 +716,14 @@ async def rename_table(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "RENAME TABLE"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="RENAME TABLE"
+    )
 
     sql = sql_rename_table(table_name, body.new_name, body.schema_name)
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -757,26 +752,19 @@ async def drop_table(
         description="Token from a previous confirmed=false call.",
     ),
 ):
-    """
-    Drop a table.
-
-    Phase 1 (confirmed=false): returns SQL preview + confirm_token.
-    Phase 2 (confirmed=true): requires confirm_token, executes DROP.
-    dry_run=true: validates SQL inside a rolled-back transaction, no token needed.
-    """
     wid = _require_workspace(user.workspace_id)
     sql = builder.sql_drop_table(table_name, schema_name, cascade)
 
-    if not dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "DROP TABLE"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not dry_run, operation="DROP TABLE"
+    )
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
             sql_statements=[sql],
+            workspace_role=workspace_role,
             confirmed=confirmed,
             confirm_token=confirm_token,
             dry_run=dry_run,
@@ -803,10 +791,9 @@ async def add_column(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ALTER TABLE (ADD COLUMN)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TABLE (ADD COLUMN)"
+    )
 
     col = ColumnDefinition(**body.column)
     pg_conn = await _get_live_connection(connection_id, wid, db)
@@ -816,7 +803,7 @@ async def add_column(
         )
         resolved_col = resolved_columns[0]
         sql = builder.sql_add_column(body.table_name, resolved_col, body.schema_name)
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -838,10 +825,9 @@ async def alter_column(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ALTER TABLE (ALTER COLUMN)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TABLE (ALTER COLUMN)"
+    )
 
     req = AlterColumnRequest(
         table_name=body.table_name,
@@ -888,7 +874,7 @@ async def alter_column(
                     detail=f"Invalid DEFAULT expression: {exc.args[0]}",
                 )
 
-        result = await builder.execute_sql(pg_conn, statements, dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, statements, workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -910,28 +896,21 @@ async def drop_column(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Drop a column.
-
-    Phase 1 (confirmed=false): returns SQL preview + confirm_token.
-    Phase 2 (confirmed=true): requires confirm_token, executes DROP COLUMN.
-    dry_run=true: validates SQL, no token needed.
-    """
     wid = _require_workspace(user.workspace_id)
     sql = builder.sql_drop_column(
         body.table_name, body.column_name, body.schema_name, body.cascade
     )
 
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ALTER TABLE (DROP COLUMN)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TABLE (DROP COLUMN)"
+    )
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
             sql_statements=[sql],
+            workspace_role=workspace_role,
             confirmed=body.confirmed,
             confirm_token=body.confirm_token,
             dry_run=body.dry_run,
@@ -959,10 +938,9 @@ async def create_index(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "CREATE INDEX"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="CREATE INDEX"
+    )
 
     idx = IndexDefinition(**body.index)
     pg_conn = await _get_live_connection(connection_id, wid, db)
@@ -973,7 +951,7 @@ async def create_index(
             raise HTTPException(status_code=400, detail=str(exc))
 
         sql = builder.sql_create_index(body.table_name, idx, body.schema_name)
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1001,25 +979,19 @@ async def drop_index(
         description="Token from a previous confirmed=false call.",
     ),
 ):
-    """
-    Drop an index.
-
-    Phase 1 (confirmed=false): returns SQL preview + confirm_token.
-    Phase 2 (confirmed=true): requires confirm_token, executes DROP INDEX.
-    """
     wid = _require_workspace(user.workspace_id)
     sql = builder.sql_drop_index(index_name, schema_name)
 
-    if not dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "DROP INDEX"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not dry_run, operation="DROP INDEX"
+    )
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
             sql_statements=[sql],
+            workspace_role=workspace_role,
             confirmed=confirmed,
             confirm_token=confirm_token,
             dry_run=dry_run,
@@ -1046,10 +1018,9 @@ async def add_foreign_key(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ADD FOREIGN KEY"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ADD FOREIGN KEY"
+    )
 
     try:
         sql = sql_add_foreign_key(
@@ -1063,7 +1034,7 @@ async def add_foreign_key(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1084,10 +1055,9 @@ async def add_check_constraint(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ADD CHECK CONSTRAINT"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ADD CHECK CONSTRAINT"
+    )
 
     try:
         sql = sql_add_check_constraint(
@@ -1099,7 +1069,7 @@ async def add_check_constraint(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1121,10 +1091,9 @@ async def add_unique_constraint(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ADD UNIQUE CONSTRAINT"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ADD UNIQUE CONSTRAINT"
+    )
 
     try:
         sql = sql_add_unique_constraint(
@@ -1136,7 +1105,7 @@ async def add_unique_constraint(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1161,12 +1130,6 @@ async def drop_constraint(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Drop a constraint.
-
-    Phase 1 (confirmed=false): returns SQL preview + confirm_token.
-    Phase 2 (confirmed=true): requires confirm_token, executes DROP CONSTRAINT.
-    """
     wid = _require_workspace(user.workspace_id)
     try:
         sql = sql_drop_constraint(
@@ -1176,16 +1139,16 @@ async def drop_constraint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "DROP CONSTRAINT"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="DROP CONSTRAINT"
+    )
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
             sql_statements=[sql],
+            workspace_role=workspace_role,
             confirmed=body.confirmed,
             confirm_token=body.confirm_token,
             dry_run=body.dry_run,
@@ -1214,9 +1177,7 @@ async def list_enums(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await _get_url(connection_id, wid, db)
-    snapshot = await asyncio.to_thread(
-        introspection.introspect_database, url, schema_name
-    )
+    snapshot = await introspection.introspect_database(url, schema_name)
     return {
         "enums": [
             {"name": e.name, "schema": e.schema, "values": e.values}
@@ -1234,10 +1195,9 @@ async def create_enum(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "CREATE TYPE (enum)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="CREATE TYPE (enum)"
+    )
 
     try:
         sql = sql_create_enum(body.name, body.values, body.schema_name)
@@ -1246,7 +1206,7 @@ async def create_enum(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1271,10 +1231,9 @@ async def add_enum_value(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ALTER TYPE (ADD VALUE)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TYPE (ADD VALUE)"
+    )
 
     try:
         sql = sql_add_enum_value(
@@ -1287,7 +1246,7 @@ async def add_enum_value(
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         if body.dry_run:
-            result = await builder.execute_sql(pg_conn, [sql], dry_run=True)
+            result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=True)
         else:
             try:
                 await pg_conn.execute(sql)
@@ -1318,10 +1277,9 @@ async def rename_enum_value(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "ALTER TYPE (RENAME VALUE)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="ALTER TYPE (RENAME VALUE)"
+    )
 
     try:
         sql = sql_rename_enum_value(
@@ -1333,7 +1291,7 @@ async def rename_enum_value(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1354,12 +1312,6 @@ async def drop_enum(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Drop an enum type.
-
-    Phase 1 (confirmed=false): returns SQL preview + confirm_token.
-    Phase 2 (confirmed=true): requires confirm_token, executes DROP TYPE.
-    """
     wid = _require_workspace(user.workspace_id)
     try:
         sql = sql_drop_enum(
@@ -1368,16 +1320,16 @@ async def drop_enum(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "DROP TYPE (enum)"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="DROP TYPE (enum)"
+    )
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
         response = await _execute_with_confirmation(
             pg_conn=pg_conn,
             sql_statements=[sql],
+            workspace_role=workspace_role,
             confirmed=body.confirmed,
             confirm_token=body.confirm_token,
             dry_run=body.dry_run,
@@ -1408,10 +1360,9 @@ async def set_table_comment(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "COMMENT ON TABLE"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="COMMENT ON TABLE"
+    )
 
     try:
         sql = sql_comment_on_table(
@@ -1422,7 +1373,7 @@ async def set_table_comment(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
@@ -1448,10 +1399,9 @@ async def set_column_comment(
     db: AsyncSession = Depends(get_db),
 ):
     wid = _require_workspace(user.workspace_id)
-    if not body.dry_run:
-        await _require_write_access(
-            connection_id, wid, db, "COMMENT ON COLUMN"
-        )
+    workspace_role = await _get_workspace_role(
+        connection_id, wid, db, require_write=not body.dry_run, operation="COMMENT ON COLUMN"
+    )
 
     try:
         sql = sql_comment_on_column(
@@ -1463,7 +1413,7 @@ async def set_column_comment(
 
     pg_conn = await _get_live_connection(connection_id, wid, db)
     try:
-        result = await builder.execute_sql(pg_conn, [sql], dry_run=body.dry_run)
+        result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
 
