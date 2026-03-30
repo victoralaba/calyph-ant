@@ -540,6 +540,33 @@ def _type_smart_defaults(data_type: str) -> list[dict[str, str]]:
 # Input models (The Boundary)
 # ---------------------------------------------------------------------------
 
+class CheckOperator(str, Enum):
+    GT = ">"
+    LT = "<"
+    GTE = ">="
+    LTE = "<="
+    EQ = "="
+    NEQ = "!="
+    IS_NOT_NULL = "IS NOT NULL"
+    IS_NULL = "IS NULL"
+
+class ColumnCheckConstraint(BaseModel):
+    operator: CheckOperator
+    value: str | int | float | None = None
+
+    @model_validator(mode='after')
+    def validate_value_for_operator(self) -> "ColumnCheckConstraint":
+        """Enforce strict value pairings based on the operator's physical reality."""
+        is_null_op = self.operator in (CheckOperator.IS_NOT_NULL, CheckOperator.IS_NULL)
+        
+        if is_null_op and self.value is not None:
+            raise ValueError(f"Operator '{self.operator}' cannot take a value.")
+        if not is_null_op and self.value is None:
+            raise ValueError(f"Operator '{self.operator}' strictly requires a value.")
+        
+        return self
+
+
 class ColumnDefinition(BaseModel):
     name: str = Field(..., min_length=1)
     data_type: str = Field(..., min_length=1)
@@ -547,7 +574,7 @@ class ColumnDefinition(BaseModel):
     default: str | None = None
     primary_key: bool = False
     unique: bool = False
-    check: str | None = None
+    check: ColumnCheckConstraint | None = None  # Replaced raw str with strictly validated AST
     references: str | None = None
     comment: str | None = None
     # Pydantic natively enforces the physical limits of pgvector here
@@ -833,17 +860,32 @@ def sql_add_foreign_key(
 def sql_add_check_constraint(
     table: str,
     name: str,
-    expression: str,
+    column_name: str,
+    constraint: ColumnCheckConstraint,
     schema_name: str = "public",
 ) -> str:
+    """
+    Compiles a strictly validated Check Constraint AST into SQL.
+    Absolutely no raw user strings are evaluated as logic.
+    """
     _validate_identifier(table)
     _validate_identifier(name)
+    _validate_identifier(column_name)
     _validate_identifier(schema_name)
-    if not expression.strip():
-        raise ValueError("Check constraint expression cannot be empty.")
+    
+    if constraint.operator in (CheckOperator.IS_NOT_NULL, CheckOperator.IS_NULL):
+        expr_sql = f'"{column_name}" {constraint.operator.value}'
+    else:
+        val = constraint.value
+        if isinstance(val, str):
+            escaped_val = val.replace("'", "''")
+            expr_sql = f'"{column_name}" {constraint.operator.value} \'{escaped_val}\''
+        else:
+            expr_sql = f'"{column_name}" {constraint.operator.value} {val}'
+
     return (
         f'ALTER TABLE "{schema_name}"."{table}" '
-        f'ADD CONSTRAINT "{name}" CHECK ({expression});'
+        f'ADD CONSTRAINT "{name}" CHECK ({expr_sql});'
     )
 
 
@@ -1037,11 +1079,12 @@ async def execute_sql(
     sql_statements: list[str],
     workspace_role: str,
     dry_run: bool = False,
-    timeout_ms: int = 15000,  # 15-second hard limit for synchronous UI operations
+    timeout_ms: int = 15000,
+    lock_timeout_ms: int = 2000,  # 2-second aggressive lock acquisition limit
 ) -> dict:
     """
     Executes a batch of DDL statements inside a strict tenant sandbox.
-    Enforces role isolation and engine-level execution timeouts.
+    Enforces role isolation, statement timeouts, and fast-fail lock timeouts.
     """
     if not sql_statements:
         return {"dry_run": dry_run, "statements": [], "error": None, "message": "No statements to execute."}
@@ -1050,11 +1093,13 @@ async def execute_sql(
     await tr.start()
     
     try:
-        # 1. Enforce engine-level circuit breaker for this entire block
+        # 1. Enforce engine-level circuit breaker for execution length
         await pg_conn.execute(f"SET LOCAL statement_timeout = '{timeout_ms}';")
         
-        # 2. Strict Tenant Isolation: Assume the workspace role.
-        # This prevents DDL from modifying cross-tenant tables even if SQL injection occurs.
+        # 2. Enforce aggressive fast-fail on lock acquisition
+        await pg_conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout_ms}';")
+        
+        # 3. Strict Tenant Isolation
         await pg_conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
 
         for stmt in sql_statements:
@@ -1072,17 +1117,21 @@ async def execute_sql(
         await tr.rollback()
         
         error_msg = str(exc)
-        if isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in error_msg.lower():
+        
+        # Determine failure origin: queuing (lock) vs execution (statement)
+        # Use getattr to bypass static type-checker complaints on the base Exception class
+        if getattr(exc, "sqlstate", None) == '55P03':  # lock_not_available
             error_msg = (
-                f"Operation timed out ({timeout_ms / 1000}s limit exceeded). "
+                f"Lock acquisition timed out ({lock_timeout_ms / 1000}s limit). "
+                "The table is currently locked by another active query or mutation. Try again shortly."
+            )
+        elif isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in error_msg.lower():
+            error_msg = (
+                f"Operation timed out ({timeout_ms / 1000}s limit). "
                 "The table is too large for synchronous changes, or the query is hanging."
             )
             
         return {"dry_run": dry_run, "statements": sql_statements, "error": error_msg}
-
-
-class _DryRunRollback(Exception):
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1138,8 +1187,18 @@ def _column_sql(col: ColumnDefinition) -> str:
         parts.append("UNIQUE")
     if col.default is not None:
         parts.append(f"DEFAULT {col.default}")
+        
     if col.check:
-        parts.append(f"CHECK ({col.check})")
+        if col.check.operator in (CheckOperator.IS_NOT_NULL, CheckOperator.IS_NULL):
+            parts.append(f'CHECK ("{col.name}" {col.check.operator.value})')
+        else:
+            val = col.check.value
+            if isinstance(val, str):
+                escaped_val = val.replace("'", "''")
+                parts.append(f'CHECK ("{col.name}" {col.check.operator.value} \'{escaped_val}\')')
+            else:
+                parts.append(f'CHECK ("{col.name}" {col.check.operator.value} {val})')
+                
     if col.references:
         parts.append(f"REFERENCES {col.references}")
 
