@@ -444,6 +444,62 @@ def cleanup_old_backups():
     _run(_cleanup())
 
 
+# In worker/celery.py (Add to task_routes and beat_schedule if necessary, but default queue works)
+
+@celery_app.task(name="worker.celery.build_index_background")
+def build_index_background(
+    connection_id: str,
+    workspace_id: str,
+    sql: str,
+    workspace_role: str,
+    index_name: str,
+    table_name: str,
+):
+    """
+    Executes heavy CREATE INDEX CONCURRENTLY queries.
+    By definition, this must run OUTSIDE a transaction block.
+    """
+    async def _build():
+        import asyncpg
+        from core.db import _session_factory, get_connection_url
+        
+        if not _session_factory:
+            return
+
+        async with _session_factory() as db:
+            url = await get_connection_url(db, UUID(connection_id), UUID(workspace_id))
+            if not url:
+                return
+
+        pg_conn = await asyncpg.connect(dsn=url)
+        try:
+            # 1. Identity Lock: Assume tenant privileges
+            await pg_conn.execute(f'SET ROLE "{workspace_role}";')
+            
+            # 2. Heavy Compute Lock: Allow 1 hour for massive vector/GIN indexes
+            await pg_conn.execute("SET statement_timeout = '3600000';")
+            
+            # 3. Execute directly (NO transaction wrapper)
+            logger.info(f"Starting background index build for {index_name}...")
+            await pg_conn.execute(sql)
+            logger.info(f"Background index build {index_name} completed.")
+            
+            # 4. Telemetry: Ping the frontend that the heavy build is done
+            from domains.schema.router.editor import _broadcast_schema_changed
+            await _broadcast_schema_changed(
+                UUID(workspace_id), UUID(connection_id),
+                change_kind="index_created",
+                object_name=index_name, table_name=table_name,
+            )
+        except Exception as exc:
+            logger.error(f"Background index build failed: {exc}")
+            # Optional: Broadcast a failure event so the UI stops showing a spinner
+        finally:
+            await pg_conn.close()
+
+    _run(_build())
+
+
 @celery_app.task(name="worker.celery.drain_slow_queries")
 def drain_slow_queries():
     """Snapshot pg_stat_statements for all active connections."""

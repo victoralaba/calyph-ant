@@ -428,6 +428,7 @@ class CreateIndexBody(BaseModel):
     schema_name: str = "public"
     index: dict
     dry_run: bool = False
+    concurrently: bool = False
 
 
 class AddForeignKeyBody(BaseModel):
@@ -686,6 +687,7 @@ async def get_table(
 # Table DDL
 # ---------------------------------------------------------------------------
 
+
 @router.post("/{connection_id}/tables", response_model=SqlPreviewResponse)
 async def create_table(
     connection_id: UUID,
@@ -695,42 +697,33 @@ async def create_table(
 ):
     wid = _require_workspace(user.workspace_id)
     
-    # --- NEW: QUOTA GATE ---
-    if not body.dry_run:
-        # Fetch user's tier limits
-        db_user = await get_user(db, user.id)
-        limits = get_limits(db_user.tier if db_user else "free")
-        max_tables = limits.get("max_tables_per_connection", 20)
-        
-        if max_tables != -1:
-            # Quickly count existing tables via introspection
-            url = await get_validated_workspace_url(db, connection_id, wid)
-            snapshot = await introspection.introspect_database(url, body.schema_name)
-            current_count = len(snapshot.tables)
-            
-            if current_count >= max_tables:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Tier limit reached: You cannot create more than {max_tables} tables. Please upgrade your plan."
-                )
-
-    workspace_role = await _get_workspace_role(
-        connection_id, wid, db, require_write=not body.dry_run, operation="CREATE TABLE"
-    )
-
-    columns = [ColumnDefinition(**c) for c in body.columns]
-
-    if body.composite_pk:
-        col_names = {c.name for c in columns}
-        bad = [c for c in body.composite_pk if c not in col_names]
-        if bad:
-            raise HTTPException(
-                status_code=400,
-                detail=f"composite_pk references columns not in this table: {bad}",
-            )
-
     pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
+        # --- QUOTA GATE: Prevent Schema Sprawl ---
+        if not body.dry_run:
+            db_user = await get_user(db, user.id)
+            limits = get_limits(db_user.tier if db_user else "free")
+            max_tables = limits.get("max_tables_per_connection", 20)
+
+            if max_tables != -1:
+                # Count base tables in the target schema
+                current_count = await pg_conn.fetchval(
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = $1 AND table_type = 'BASE TABLE'",
+                    body.schema_name
+                )
+                if current_count >= max_tables:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Table limit reached ({max_tables}). Upgrade your plan to create more."
+                    )
+        # ----------------------------------------
+
+        workspace_role = await _get_workspace_role(
+            connection_id, wid, db, require_write=not body.dry_run, operation="CREATE TABLE"
+        )
+
+        columns = [ColumnDefinition(**c) for c in body.columns]
         resolved_columns, extensions_required = await _validate_and_resolve_columns(
             pg_conn, columns, workspace_role
         )
@@ -753,7 +746,6 @@ async def create_table(
         ))
 
     return _sql_preview([sql], body.dry_run, result, extensions_required)
-
 
 @router.patch(
     "/{connection_id}/tables/{table_name}/rename",
@@ -993,15 +985,39 @@ async def create_index(
         connection_id, wid, db, require_write=not body.dry_run, operation="CREATE INDEX"
     )
 
-    idx = IndexDefinition(**body.index)
+    idx_data = body.index.copy()
+    idx_data["concurrently"] = body.concurrently
+    idx = IndexDefinition(**idx_data)
+    
     pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
-        try:
-            extensions_required = await assert_extensions_for_index(pg_conn, idx)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        extensions_required = await assert_extensions_for_index(pg_conn, idx)
 
-        sql = builder.sql_create_index(body.table_name, idx, body.schema_name)
+        # Handle background builds for non-blocking execution
+        if body.concurrently and not body.dry_run:
+            from worker.celery import build_index_background
+            
+            sql = builder.sql_create_index(body.table_name, idx, body.schema_name)
+            
+            # Use type: ignore to resolve Pylance 'apply_async unknown' error
+            build_index_background.apply_async( # type: ignore
+                args=[
+                    str(connection_id), str(wid), sql,
+                    workspace_role, idx.name, body.table_name
+                ],
+                queue="maintenance"
+            )
+            
+            return _sql_preview(
+                [sql], False, 
+                {"message": "Background index build started. You will be notified when complete."}, 
+                extensions_required
+            )
+
+        # Normal path: strip concurrently if dry_run to satisfy transaction rules
+        sql = builder.sql_create_index(
+            body.table_name, idx, body.schema_name, disable_concurrently=body.dry_run
+        )
         result = await builder.execute_sql(pg_conn, [sql], workspace_role, dry_run=body.dry_run)
     finally:
         await pg_conn.close()
@@ -1111,6 +1127,7 @@ async def add_check_constraint(
     )
 
     try:
+        # Fixed: passing strict column_name and constraint AST
         sql = sql_add_check_constraint(
             table=body.table, 
             name=body.name,

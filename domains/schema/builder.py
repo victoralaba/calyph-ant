@@ -598,6 +598,7 @@ class IndexDefinition(BaseModel):
     unique: bool = False
     method: str = Field("btree", min_length=1)
     predicate: str | None = None
+    concurrently: bool = False
     vector_lists: int | None = None
     vector_m: int | None = None
     vector_ef_construction: int | None = None
@@ -780,12 +781,14 @@ def sql_create_index(
     table: str,
     idx: IndexDefinition,
     schema_name: str = "public",
+    disable_concurrently: bool = False,
 ) -> str:
     _validate_identifier(table)
     _validate_identifier(idx.name)
     _validate_identifier(schema_name)
 
     unique_clause = "UNIQUE " if idx.unique else ""
+    concurrent_clause = "CONCURRENTLY " if idx.concurrently and not disable_concurrently else ""
     cols = ", ".join(f'"{c}"' for c in idx.columns)
 
     descriptor = INDEX_METHOD_REGISTRY.get(idx.method.lower())
