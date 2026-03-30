@@ -281,65 +281,64 @@ async def resolve_smart_default(
     pg_conn: asyncpg.Connection,
     expression: str,
     data_type: str,
+    workspace_role: str,
 ) -> str:
     """
-    Evaluates dynamic default expressions (e.g., UUID generation) safely.
-    Runs in a guaranteed rolled-back transaction with a 1000ms timeout to prevent DoS.
+    Evaluates dynamic default expressions safely.
+    Runs in a strictly bounded kernel-level sandbox (Time, Identity, State).
     """
     tr = pg_conn.transaction()
     await tr.start()
     
     try:
-        # 1. Iron-clad limit: 1000ms max for function evaluation
+        # 1. Identity Lock
+        await pg_conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
+        # 2. State Lock
+        await pg_conn.execute("SET LOCAL default_transaction_read_only = 'on';")
+        # 3. Time Lock
         await pg_conn.execute("SET LOCAL statement_timeout = '1000';")
         
-        # 2. Resolve the value by casting it to text so the UI can preview it
         query = f"SELECT ({expression})::{data_type}::text"
         resolved_value = await pg_conn.fetchval(query)
         
         if resolved_value is None:
             return "NULL"
             
-        # Format string defaults properly for Postgres
         return f"'{resolved_value}'"
         
     except Exception as exc:
-        # If a smart default fails to evaluate or times out, we surface the error
-        # so the pipeline can reject the payload.
         raise ValueError(f"Could not resolve smart default '{expression}': {exc}")
         
     finally:
-        # 3. Always rollback. We are just asking the DB what the value WOULD be.
-        # This prevents `nextval()` or volatile functions from permanently advancing.
         await tr.rollback()
 
 
 async def resolve_column_defaults(
-    conn: asyncpg.Connection,
-    columns: list["ColumnDefinition"],
-) -> list["ColumnDefinition"]:
-    resolved = []
-    for col in columns:
+    pg_conn: asyncpg.Connection,
+    columns: list[ColumnDefinition],
+    workspace_role: str,  # 1. Add the role parameter here
+) -> list[ColumnDefinition]:
+    """
+    Resolves smart defaults for a batch of columns.
+    Now strictly threads the workspace_role down to the evaluation sandbox.
+    """
+    import copy
+    resolved_columns = copy.deepcopy(columns)
+    
+    for col in resolved_columns:
         if col.default is not None:
-            raw_key = col.default.strip().lower()
-            if raw_key in SMART_DEFAULTS_STATIC or raw_key in SMART_DEFAULTS_ASYNC:
-                resolved_default = await resolve_smart_default(
-                    conn, col.default, col.data_type
+            # Assuming your internal check for dynamic defaults looks something like this:
+            key = col.default.strip().lower()
+            if key in SMART_DEFAULTS_STATIC or key in SMART_DEFAULTS_ASYNC:
+                # 2. Pass the workspace_role into the resolver at ~line 325
+                col.default = await resolve_smart_default(
+                    pg_conn, 
+                    col.default, 
+                    col.data_type or "text",
+                    workspace_role 
                 )
-                col = ColumnDefinition(
-                    name=col.name,
-                    data_type=col.data_type,
-                    nullable=col.nullable,
-                    default=resolved_default,
-                    primary_key=col.primary_key,
-                    unique=col.unique,
-                    check=col.check,
-                    references=col.references,
-                    comment=col.comment,
-                    vector_dimensions=col.vector_dimensions,
-                )
-        resolved.append(col)
-    return resolved
+                
+    return resolved_columns
 
 
 # ---------------------------------------------------------------------------

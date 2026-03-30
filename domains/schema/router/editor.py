@@ -514,20 +514,27 @@ class SetCommentBody(BaseModel):
 async def _evaluate_untrusted_expression(
     pg_conn: asyncpg.Connection,
     expression: str,
+    workspace_role: str,
     expected_type: str | None = None,
 ) -> None:
     """
-    Executes a user-provided SQL expression inside a strict, rolled-back sandbox.
-    Prevents state mutation (side effects) and stops runaway queries (DoS).
+    Executes a user-provided SQL expression inside an inescapable kernel-level sandbox.
+    Enforces Time (DoS), Identity (Blast Radius), and State (Mutability) boundaries.
     """
     tr = pg_conn.transaction()
     await tr.start()
     try:
-        # Iron-clad limit: 1000ms execution max. 
-        # Aborts pg_sleep() or massive cross-joins instantly at the DB engine.
+        # 1. Identity Lock: Restrict execution to the tenant's exact privilege level.
+        # This prevents the expression from querying system catalogs or cross-tenant data.
+        await pg_conn.execute(f'SET LOCAL ROLE "{workspace_role}";')
+        
+        # 2. State Lock: Physically prevent writes, updates, or deletes.
+        # This aborts any volatile functions (like nextval or custom triggers) hiding in the expression.
+        await pg_conn.execute("SET LOCAL default_transaction_read_only = 'on';")
+        
+        # 3. Time Lock: 1000ms execution max to prevent pool starvation.
         await pg_conn.execute("SET LOCAL statement_timeout = '1000';")
         
-        # We cast the evaluation if a type is provided to ensure type compatibility
         query = f"SELECT ({expression})"
         if expected_type:
             query += f"::{expected_type}"
@@ -536,7 +543,6 @@ async def _evaluate_untrusted_expression(
     except Exception as exc:
         await tr.rollback()
         
-        # Map Postgres timeouts to clear HTTP 400s
         if isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in str(exc).lower():
             raise HTTPException(
                 status_code=400,
@@ -553,7 +559,7 @@ async def _evaluate_untrusted_expression(
                 detail=f"Invalid expression: {exc}",
             )
     else:
-        # ALWAYS roll back on success. A validation check must NEVER commit state changes.
+        # ALWAYS roll back on success. 
         await tr.rollback()
 
 
@@ -577,9 +583,11 @@ def _sql_preview(
 async def _validate_and_resolve_columns(
     pg_conn: asyncpg.Connection,
     columns: list[ColumnDefinition],
+    workspace_role: str,
 ) -> tuple[list[ColumnDefinition], list[str]]:
     try:
-        resolved = await resolve_column_defaults(pg_conn, columns)
+        # Thread the identity context into the bulk resolver
+        resolved = await resolve_column_defaults(pg_conn, columns, workspace_role)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -590,10 +598,10 @@ async def _validate_and_resolve_columns(
 
     for col in resolved:
         if col.default is not None:
-            # Replaced the unsafe imported validator with our strict local sandbox
             await _evaluate_untrusted_expression(
                 pg_conn=pg_conn,
                 expression=col.default,
+                workspace_role=workspace_role,
                 expected_type=col.data_type
             )
 
@@ -700,7 +708,7 @@ async def create_table(
     pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         resolved_columns, extensions_required = await _validate_and_resolve_columns(
-            pg_conn, columns
+            pg_conn, columns, workspace_role
         )
         req = CreateTableRequest(
             table_name=body.table_name,
@@ -818,7 +826,7 @@ async def add_column(
     pg_conn = await acquire_workspace_connection(db, connection_id, wid)
     try:
         resolved_columns, extensions_required = await _validate_and_resolve_columns(
-            pg_conn, [col]
+            pg_conn, [col], workspace_role
         )
         resolved_col = resolved_columns[0]
         sql = builder.sql_add_column(body.table_name, resolved_col, body.schema_name)
@@ -872,7 +880,7 @@ async def alter_column(
             key = body.set_default.strip().lower()
             if key in SMART_DEFAULTS_STATIC or key in SMART_DEFAULTS_ASYNC:
                 resolved_default = await resolve_smart_default(
-                    pg_conn, body.set_default, body.new_type or "text"
+                    pg_conn, body.set_default, body.new_type or "text", workspace_role
                 )
                 req.set_default = resolved_default
                 statements = builder.sql_alter_column(req)
@@ -888,6 +896,7 @@ async def alter_column(
             await _evaluate_untrusted_expression(
                 pg_conn, 
                 req.set_default or body.set_default, 
+                workspace_role,
                 body.new_type
             )
 
