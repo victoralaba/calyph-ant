@@ -66,6 +66,9 @@ celery_app.conf.update(
         "worker.celery.keep_alive_ping": {"queue": "keep_alive"},
         "worker.celery.run_all_keep_alive_pings": {"queue": "keep_alive"},
         "worker.celery.scheduled_backup": {"queue": "backups"},
+        "worker.celery.execute_background_backup": {"queue": "backups"},
+        "worker.celery.execute_background_restore": {"queue": "backups"},
+        "worker.celery.scheduled_backup": {"queue": "backups"},
         "worker.celery.dispatch_scheduled_backups": {"queue": "maintenance"},
         "worker.celery.drain_slow_queries": {"queue": "maintenance"},
         "worker.celery.expire_invites": {"queue": "maintenance"},
@@ -816,6 +819,107 @@ def execute_background_diff(job_id: str, source_url: str, target_url: str, schem
                 await update_state("FAILED", error=str(e))
 
     _run(_process())
+
+
+@celery_app.task(name="worker.celery.execute_background_backup")
+def execute_background_backup(record_id: str, connection_id: str, workspace_id: str, label: str, fmt: str, schema_only: bool):
+    """
+    Executes a user-initiated backup strictly outside the API lifecycle.
+    Binds the generated physics data to the pending BackupRecord.
+    """
+    async def _run_backup():
+        import asyncpg
+        from core.db import _session_factory, get_connection_url
+        from domains.backups.engine import create_backup
+        from uuid import UUID
+
+        if not _session_factory:
+            return
+
+        async with _session_factory() as db:
+            url = await get_connection_url(db, UUID(connection_id), UUID(workspace_id))
+            if not url:
+                return
+
+            pg_conn = await asyncpg.connect(dsn=url, timeout=15)
+            try:
+                await create_backup(
+                    db=db,
+                    pg_conn=pg_conn,
+                    connection_id=UUID(connection_id),
+                    workspace_id=UUID(workspace_id),
+                    label=label,
+                    fmt=fmt,
+                    schema_only=schema_only,
+                    existing_record_id=UUID(record_id)
+                )
+            except Exception as e:
+                logger.error(f"Background Backup Task {record_id} failed: {e}")
+            finally:
+                await pg_conn.close()
+
+    _run(_run_backup())
+
+
+@celery_app.task(name="worker.celery.execute_background_restore")
+def execute_background_restore(
+    job_id: str, 
+    connection_id: str, 
+    backup_id: str, 
+    workspace_id: str, 
+    strategy: str | None, 
+    per_row_overrides: dict | None, 
+    restore_session_id: str | None
+):
+    """
+    Executes heavy schema inserts, conflict detection, and restores 
+    outside the API lifecycle. Updates the Redis state machine dynamically.
+    """
+    import json
+    async def _run_restore():
+        import asyncpg
+        from core.db import _session_factory, get_connection_url, get_redis
+        from domains.backups.engine import restore_backup
+        from uuid import UUID
+
+        redis = await get_redis()
+        state_key = f"restore_job:{job_id}"
+
+        async def update_state(status: str, result=None, error=None):
+            state = {"job_id": job_id, "status": status, "result": result, "error": error}
+            await redis.setex(state_key, 3600, json.dumps(state))
+
+        await update_state("PROCESSING")
+
+        if not _session_factory:
+            await update_state("FAILED", error="Database factory unavailable.")
+            return
+
+        async with _session_factory() as db:
+            url = await get_connection_url(db, UUID(connection_id), UUID(workspace_id))
+            if not url:
+                await update_state("FAILED", error="Target database connection not found.")
+                return
+
+            pg_conn = await asyncpg.connect(dsn=url, timeout=15)
+            try:
+                result = await restore_backup(
+                    db=db,
+                    pg_conn=pg_conn,
+                    backup_id=UUID(backup_id),
+                    workspace_id=UUID(workspace_id),
+                    strategy=strategy,
+                    per_row_overrides=per_row_overrides,
+                    restore_session_id=restore_session_id
+                )
+                await update_state("COMPLETED", result=result)
+            except Exception as e:
+                logger.error(f"Background Restore Task {job_id} failed: {e}")
+                await update_state("FAILED", error=str(e))
+            finally:
+                await pg_conn.close()
+
+    _run(_run_restore())
 
 
 @celery_app.task(name="worker.celery.garbage_collect_scratch_schemas")

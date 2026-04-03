@@ -102,10 +102,6 @@ from shared.types import Base
 CHUNK_ROW_LIMIT = 50_000   # rows per .calyph part file
 CALYPH_VERSION = "2"
 
-MAX_CONCURRENT_SUBPROCESSES = 3
-_subprocess_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SUBPROCESSES)
-
-
 # ---------------------------------------------------------------------------
 # ORM models
 # ---------------------------------------------------------------------------
@@ -217,6 +213,13 @@ class RestoreDeadLetter(Base):
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class RestoreJobResponse(BaseModel):
+    job_id: str
+    status: str
+    result: dict | None = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -453,9 +456,42 @@ async def pg_dump_sql(url: str, schema_only: bool = False, timeout_sec: int = 30
         args.append("--schema-only")
     args.append(url)
     
-    async with _subprocess_semaphore:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError(f"pg_dump timed out after {timeout_sec}s.")
+        
+    if proc.returncode != 0:
+        raise RuntimeError(f"pg_dump failed: {stderr.decode()}")
+    return gzip.compress(stdout)
+
+
+async def psql_restore(url: str, sql_gz: bytes, timeout_sec: int = 600) -> dict[str, Any]:
+    """
+    Restore a gzipped SQL dump via psql subprocess.
+    Executes without localized semaphores; concurrency is safely managed by Celery worker limits.
+    """
+    sql_bytes = gzip.decompress(sql_gz)
+
+    with tempfile.NamedTemporaryFile(suffix=".sql", delete=False) as f:
+        f.write(sql_bytes)
+        tmp_path = f.name
+
+    try:
         proc = await asyncio.create_subprocess_exec(
-            *args,
+            "psql",
+            "--no-password",
+            "--set", "ON_ERROR_STOP=off",
+            "--file", tmp_path,
+            url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={"PGPASSWORD": _extract_password(url), **_safe_env()},
@@ -465,55 +501,20 @@ async def pg_dump_sql(url: str, schema_only: bool = False, timeout_sec: int = 30
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
-            raise RuntimeError(f"pg_dump timed out after {timeout_sec}s.")
+            raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
             
-        if proc.returncode != 0:
-            raise RuntimeError(f"pg_dump failed: {stderr.decode()}")
-        return gzip.compress(stdout)
-
-
-async def psql_restore(url: str, sql_gz: bytes, timeout_sec: int = 600) -> dict[str, Any]:
-    """
-    Restore a gzipped SQL dump via psql subprocess.
-    Protected by concurrency semaphore and strict execution timeouts.
-    """
-    sql_bytes = gzip.decompress(sql_gz)
-
-    with tempfile.NamedTemporaryFile(suffix=".sql", delete=False) as f:
-        f.write(sql_bytes)
-        tmp_path = f.name
-
-    try:
-        async with _subprocess_semaphore:
-            proc = await asyncio.create_subprocess_exec(
-                "psql",
-                "--no-password",
-                "--set", "ON_ERROR_STOP=off",
-                "--file", tmp_path,
-                url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={"PGPASSWORD": _extract_password(url), **_safe_env()},
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
-                
-            stderr_text = stderr.decode()
-            errors = [
-                line for line in stderr_text.splitlines()
-                if line.strip().upper().startswith("ERROR")
-            ]
-            return {
-                "success": proc.returncode == 0,
-                "return_code": proc.returncode,
-                "error_count": len(errors),
-                "errors": errors[:50],
-                "stdout": stdout.decode()[:2000],
-            }
+        stderr_text = stderr.decode()
+        errors = [
+            line for line in stderr_text.splitlines()
+            if line.strip().upper().startswith("ERROR")
+        ]
+        return {
+            "success": proc.returncode == 0,
+            "return_code": proc.returncode,
+            "error_count": len(errors),
+            "errors": errors[:50],
+            "stdout": stdout.decode()[:2000],
+        }
     finally:
         os.unlink(tmp_path)
 
@@ -779,19 +780,28 @@ async def create_backup(
     label: str,
     fmt: str = "calyph",
     schema_only: bool = False,
+    existing_record_id: UUID | None = None,
 ) -> BackupRecord:
     schema_version, schema_order_index = await _resolve_schema_version(connection_id, db)
 
-    record = BackupRecord(
-        connection_id=connection_id,
-        workspace_id=workspace_id,
-        label=label,
-        format=fmt,
-        status="running",
-        schema_version=schema_version,
-        schema_order_index=schema_order_index,
-    )
-    db.add(record)
+    # Decouple API state creation from Background Execution
+    if existing_record_id:
+        record = await db.get(BackupRecord, existing_record_id)
+        if not record:
+            raise ValueError(f"Provided existing_record_id {existing_record_id} not found")
+        record.status = "running"
+    else:
+        record = BackupRecord(
+            connection_id=connection_id,
+            workspace_id=workspace_id,
+            label=label,
+            format=fmt,
+            status="running",
+            schema_version=schema_version,
+            schema_order_index=schema_order_index,
+        )
+        db.add(record)
+
     await db.commit()
     await db.refresh(record)
 
@@ -1516,31 +1526,49 @@ async def list_backups(
     }
 
 
-@router.post("/{connection_id}", status_code=status.HTTP_201_CREATED)
+@router.post("/{connection_id}", status_code=status.HTTP_202_ACCEPTED)
 async def create_backup_endpoint(
     connection_id: UUID,
     body: CreateBackupRequest,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    [UI CONSIDERATION]
+    This endpoint now returns an HTTP 202 Accepted immediately. 
+    The returned BackupRecord object will have status="pending".
+    The UI MUST poll `GET /backups/{connection_id}` to update the visual state 
+    when the background worker moves the status to "completed" or "failed".
+    """
     if not user.workspace_id:
         raise HTTPException(status_code=400, detail="User has no workspace.")
-    assert user.workspace_id is not None
     if body.format not in ("calyph", "sql"):
         raise HTTPException(status_code=400, detail="format must be 'calyph' or 'sql'")
 
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
-    try:
-        record = await create_backup(
-            db=db, pg_conn=pg_conn, connection_id=connection_id,
-            workspace_id=user.workspace_id, label=body.label,
-            fmt=body.format, schema_only=body.schema_only,
-        )
-    finally:
-        await pg_conn.close()
+    # Resolve schema so the UI sees it immediately on the pending record
+    from domains.backups.engine import _resolve_schema_version
+    schema_version, schema_order_index = await _resolve_schema_version(connection_id, db)
 
-    if record.status == "failed":
-        raise HTTPException(status_code=500, detail=f"Backup failed: {record.error}")
+    # Establish the state in the DB synchronously so the user sees immediate feedback
+    record = BackupRecord(
+        connection_id=connection_id,
+        workspace_id=user.workspace_id,
+        label=body.label,
+        format=body.format,
+        status="pending",
+        schema_version=schema_version,
+        schema_order_index=schema_order_index,
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+
+    # Fire and Forget to the worker queue
+    from worker.celery import execute_background_backup
+    execute_background_backup.apply_async( # type: ignore
+        args=[str(record.id), str(connection_id), str(user.workspace_id), body.label, body.format, body.schema_only],
+        queue="backups"
+    )
 
     return {
         "id": str(record.id),
@@ -1550,6 +1578,59 @@ async def create_backup_endpoint(
         "schema_version": record.schema_version,
         "schema_order_index": record.schema_order_index,
     }
+
+
+@router.post("/{connection_id}/{backup_id}/restore", status_code=status.HTTP_202_ACCEPTED, response_model=RestoreJobResponse)
+async def restore_backup_endpoint(
+    connection_id: UUID,
+    backup_id: UUID,
+    body: RestoreRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    [UI CONSIDERATION]
+    Restores and conflict detection now execute entirely in the background.
+    This endpoint establishes a state machine in Redis and returns a Job ID.
+    The UI MUST poll `GET /backups/restore/{job_id}/status` to get the Phase 1
+    Conflict Report or the Phase 2 Execution Results.
+    """
+    assert user.workspace_id is not None
+    
+    job_id = str(uuid4())
+    state = {
+        "job_id": job_id,
+        "status": "PENDING",
+        "result": None,
+        "error": None
+    }
+
+    from core.db import get_redis
+    redis = await get_redis()
+    await redis.setex(f"restore_job:{job_id}", 3600, json.dumps(state))
+
+    from worker.celery import execute_background_restore
+    execute_background_restore.apply_async( # type: ignore
+        args=[
+            job_id, str(connection_id), str(backup_id), str(user.workspace_id), 
+            body.strategy, body.per_row_overrides, body.restore_session_id
+        ],
+        queue="backups"
+    )
+
+    return state
+
+
+@router.get("/restore/{job_id}/status", response_model=RestoreJobResponse)
+async def get_restore_job_status(job_id: str, user: CurrentUser):
+    from core.db import get_redis
+    redis = await get_redis()
+    raw_state = await redis.get(f"restore_job:{job_id}")
+
+    if not raw_state:
+        raise HTTPException(status_code=404, detail="Restore job not found or expired from cache.")
+
+    return json.loads(raw_state)
 
 
 @router.get("/{connection_id}/{backup_id}/download")
@@ -1583,44 +1664,6 @@ async def download_backup(
         "part": part,
         "total_parts": record.part_count,
     }
-
-
-@router.post("/{connection_id}/{backup_id}/restore")
-async def restore_backup_endpoint(
-    connection_id: UUID,
-    backup_id: UUID,
-    body: RestoreRequest,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Two-phase restore.
-
-    Phase 1: POST with empty body (no strategy).  Returns conflict_report
-             and restore_session_id.
-
-    Phase 2: POST with strategy='skip'|'overwrite'|'review' and the
-             restore_session_id from Phase 1.
-             For strategy='review', also include per_row_overrides:
-               {"table_name": {"pk_value": "skip"|"overwrite"}}
-    """
-    assert user.workspace_id is not None
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
-    try:
-        result = await restore_backup(
-            db=db,
-            pg_conn=pg_conn,
-            backup_id=backup_id,
-            workspace_id=user.workspace_id,
-            strategy=body.strategy,
-            per_row_overrides=body.per_row_overrides,
-            restore_session_id=body.restore_session_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    finally:
-        await pg_conn.close()
-    return result
 
 
 @router.post("/{connection_id}/diff")
