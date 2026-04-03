@@ -120,6 +120,11 @@ celery_app.conf.beat_schedule = {
         "task": "platform.catalogue.refresh_stale_entries",
         "schedule": crontab(hour=4, minute=0),
     },
+    # Sweep orphaned scratch schemas every 5 minutes
+    "garbage-collect-scratch-schemas": {
+        "task": "worker.celery.garbage_collect_scratch_schemas",
+        "schedule": crontab(minute="*/5"),
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -668,3 +673,114 @@ def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: st
                 container.kill()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Background Diff Engine & Garbage Collector
+# ---------------------------------------------------------------------------
+
+@celery_app.task(name="worker.celery.execute_background_diff")
+def execute_background_diff(job_id: str, source_url: str, target_url: str, schema: str, timeout_ms: int):
+    """
+    Executes the diffing engine against live databases. 
+    Updates Redis state machine at every transition.
+    """
+    import json
+    async def _process():
+        from core.db import get_redis
+        from domains.schema.diff import diff_schemas
+        
+        redis = await get_redis()
+        state_key = f"diff_job:{job_id}"
+        
+        async def update_state(job_status: str, result=None, error=None):
+            state = {
+                "job_id": job_id,
+                "status": job_status,
+                "result": result,
+                "error": error
+            }
+            await redis.setex(state_key, 3600, json.dumps(state))
+
+        await update_state("PROCESSING")
+
+        try:
+            # Execute with physics lock enforced inside the diff module
+            # We intercept diff_schemas directly since it wraps _run_migra
+            diff_result = await diff_schemas(
+                source_url=source_url, 
+                target_url=target_url, 
+                schema=schema
+            )
+            
+            if diff_result.error:
+                await update_state("FAILED", error=diff_result.error)
+                return
+
+            # Serialize dataclasses to dicts for HTTP delivery
+            serialized = [
+                {
+                    "kind": c.kind.value,
+                    "object_type": c.object_type,
+                    "object_name": c.object_name,
+                    "table_name": c.table_name,
+                    "detail": c.detail,
+                    "is_destructive": c.is_destructive,
+                    "sql": c.sql
+                } for c in diff_result.changes
+            ]
+            
+            await update_state("COMPLETED", result=serialized)
+            
+        except Exception as e:
+            if "timeout" in str(e).lower():
+                await update_state("TIMEOUT", error="Execution exceeded tier time limits.")
+            else:
+                await update_state("FAILED", error=str(e))
+
+    _run(_process())
+
+
+@celery_app.task(name="worker.celery.garbage_collect_scratch_schemas")
+def garbage_collect_scratch_schemas():
+    """
+    The Garbage Truck. Runs via Celery Beat every 5 minutes.
+    Indiscriminately terminates any schema matching the signature older than 15 minutes.
+    """
+    async def _sweep():
+        import time
+        from sqlalchemy import text
+        from core.db import _session_factory
+        
+        if not _session_factory:
+            return
+
+        now = int(time.time())
+        
+        async with _session_factory() as session:
+            try:
+                # 1. Single-sweep introspection
+                result = await session.execute(
+                    text("SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE '_calyphant_diff_%'")
+                )
+                schemas = [row[0] for row in result.fetchall()]
+                
+                # 2. Parse and execute drops
+                for schema in schemas:
+                    parts = schema.split('_')
+                    try:
+                        # Format: _calyphant_diff_{timestamp}_{uuid}
+                        created_at = int(parts[3])
+                        if now - created_at > 900:  # 15 minutes grace period
+                            await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+                    except (IndexError, ValueError):
+                        # Ruthless fallback: If it matches prefix but violates timestamp, nuke it.
+                        await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+                
+                await session.commit()
+                logger.info(f"Garbage Collector swept {len(schemas)} scratch schemas.")
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Garbage Collector failed: {e}")
+
+    _run(_sweep())

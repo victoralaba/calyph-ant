@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -39,6 +41,32 @@ from loguru import logger
 
 from worker.celery import execute_ephemeral_diff
 
+
+def enforce_physics_timeout(dsn: str, timeout_ms: int) -> str:
+    """
+    Appends strict statement_timeout to the libpq connection string.
+    If the Celery worker dies, PostgreSQL unilaterally severs the connection
+    and kills the orphaned migra process.
+    """
+    parsed = urlparse(dsn)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    # Inject PostgreSQL native statement timeout. 
+    # Use existing options if present, or create new list.
+    existing_options = query.get('options', [''])[0]
+    new_option = f"-c statement_timeout={timeout_ms}"
+    query['options'] = [f"{existing_options} {new_option}".strip()]
+    
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+def generate_scratch_schema_name() -> str:
+    """
+    Embeds the UNIX timestamp directly into the schema name.
+    The background Garbage Collector relies on this for precise execution.
+    """
+    current_time = int(time.time())
+    short_uuid = uuid4().hex[:8]
+    return f"_calyphant_diff_{current_time}_{short_uuid}"
 
 # ---------------------------------------------------------------------------
 # Change models  (unchanged)
@@ -408,9 +436,11 @@ def _get_internal_db_url() -> str:
 # migra subprocess runner
 # ---------------------------------------------------------------------------
 
-async def _run_migra(source_url: str, target_url: str, schema: str) -> str | None:
+async def _run_migra(source_url: str, target_url: str, schema: str, timeout_ms: int = 15000) -> str | None:
+    # Enforce physical constraints on the target database connection
+    # to mathematically eliminate zombie processes.
     src = _normalise_url(source_url)
-    tgt = _normalise_url(target_url)
+    tgt = enforce_physics_timeout(_normalise_url(target_url), timeout_ms)
 
     proc = await asyncio.create_subprocess_exec(
         "migra",
@@ -421,7 +451,12 @@ async def _run_migra(source_url: str, target_url: str, schema: str) -> str | Non
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.terminate()
+        raise
 
     if proc.returncode == 0:
         return None

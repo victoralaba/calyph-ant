@@ -9,11 +9,13 @@ stay in their router.py files.
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, Optional, Any, List
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import DeclarativeBase
+
+from enum import Enum
 
 
 # ---------------------------------------------------------------------------
@@ -87,3 +89,26 @@ class HealthStatus(BaseModel):
     redis: str
     version: str
     environment: str
+
+
+# ---------------------------------------------------------------------------
+# The API Contract & State Machine (the ules must be followed in the UI)
+# ---------------------------------------------------------------------------
+
+class DiffJobStatus(str, Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    TIMEOUT = "TIMEOUT"
+    FAILED = "FAILED"
+
+class DiffRequestPayload(BaseModel):
+    source_connection_id: UUID
+    target_connection_id: UUID
+    schema_name: str = "public"
+
+class DiffJobResponse(BaseModel):
+    job_id: str
+    status: DiffJobStatus
+    result: Optional[List[Any]] = Field(default=None, description="Array of SchemaChange objects if completed")
+    error: Optional[str] = Field(default=None, description="Error message if failed or timed out")

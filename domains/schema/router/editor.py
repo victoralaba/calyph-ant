@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import uuid
 from typing import Any
 from uuid import UUID
 
@@ -1496,3 +1497,67 @@ async def set_column_comment(
         ))
 
     return _sql_preview([sql], body.dry_run, result)
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous Schema Diffing Gateway
+# ---------------------------------------------------------------------------
+
+from shared.types import DiffRequestPayload, DiffJobResponse, DiffJobStatus
+
+@router.post("/diff", status_code=status.HTTP_202_ACCEPTED, response_model=DiffJobResponse)
+async def request_schema_diff(
+    body: DiffRequestPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    wid = _require_workspace(user.workspace_id)
+    
+    # Resolve connections into secure internal URLs
+    from domains.connections.service import get_validated_workspace_url
+    source_url = await get_validated_workspace_url(db, body.source_connection_id, wid)
+    target_url = await get_validated_workspace_url(db, body.target_connection_id, wid)
+
+    # 1. Determine Tier Timeouts
+    db_user = await get_user(db, user.id)
+    tier = db_user.tier if db_user else "free"
+    tier_timeout_ms = 300000 if tier == "enterprise" else (60000 if tier == "pro" else 15000)
+
+    # 2. Establish State Machine in Redis
+    job_id = str(uuid.uuid4())
+    state = {
+        "job_id": job_id,
+        "status": DiffJobStatus.PENDING.value,
+        "result": None,
+        "error": None
+    }
+    
+    from core.db import get_redis
+    redis = await get_redis()
+    await redis.setex(f"diff_job:{job_id}", 3600, json.dumps(state))
+
+    # 3. Fire & Forget to Background Worker
+    from worker.celery import execute_background_diff
+    execute_background_diff.apply_async( # type: ignore
+        args=[job_id, source_url, target_url, body.schema_name, tier_timeout_ms],
+        queue="default"
+    )
+
+    return DiffJobResponse(**state)
+
+
+@router.get("/diff/{job_id}/status", response_model=DiffJobResponse)
+async def get_diff_status(job_id: str, user: CurrentUser):
+    _require_workspace(user.workspace_id)
+    
+    from core.db import get_redis
+    redis = await get_redis()
+    raw_state = await redis.get(f"diff_job:{job_id}")
+    
+    if not raw_state:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Job not found or has expired from cache."
+        )
+    
+    return DiffJobResponse(**json.loads(raw_state))
