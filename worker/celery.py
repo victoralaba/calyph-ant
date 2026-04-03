@@ -34,7 +34,7 @@ import time
 from typing import Any, Dict
 
 try:
-    import docker
+    import docker #type: ignore
 except ImportError:
     docker = None
 
@@ -674,6 +674,83 @@ def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: st
             except Exception:
                 pass
 
+
+@celery_app.task(name="worker.celery.execute_background_ephemeral_diff")
+def execute_background_ephemeral_diff(
+    job_id: str, 
+    source_sql: str, 
+    target_db_url: str, 
+    schema: str, 
+    live_label: str = "live", 
+    sql_label: str = "provided schema"
+):
+    """
+    Asynchronous state-machine wrapper for ephemeral schema diffing.
+    Executes the AST parsing in the background and updates Redis state.
+    """
+    import json
+    
+    async def _process():
+        from core.db import get_redis
+        redis = await get_redis()
+        state_key = f"diff_job:{job_id}"
+        
+        async def update_state(job_status: str, result=None, error=None):
+            state = {
+                "job_id": job_id,
+                "status": job_status,
+                "result": result,
+                "error": error
+            }
+            await redis.setex(state_key, 3600, json.dumps(state))
+
+        await update_state("PROCESSING")
+
+        try:
+            # Call the bound Celery task directly in-process. 
+            # We pass None for 'self' since execute_ephemeral_diff doesn't use it.
+            result_dict = execute_ephemeral_diff(
+                None, 
+                source_sql=source_sql, 
+                target_db_url=target_db_url, 
+                schema=schema
+            )
+            
+            if result_dict.get("error"):
+                await update_state("FAILED", error=result_dict["error"])
+                return
+
+            changes = result_dict.get("changes", [])
+            has_destructive = result_dict.get("has_destructive_changes", False)
+            
+            # Reconstruct the summary matching DiffResult expectations
+            if not changes:
+                summary = "Schemas are identical."
+            else:
+                counts = {}
+                for c in changes:
+                    counts[c["kind"]] = counts.get(c["kind"], 0) + 1
+                parts = [f"{count} {kind.replace('_', ' ')}" for kind, count in sorted(counts.items())]
+                dest = " ⚠ Contains destructive changes." if has_destructive else ""
+                summary = f"{len(changes)} changes: {', '.join(parts)}.{dest}"
+
+            # Format the final HTTP payload
+            final_result = {
+                "source_label": live_label,
+                "target_label": sql_label,
+                "changes": changes,
+                "sql": result_dict.get("sql", ""),
+                "has_destructive_changes": has_destructive,
+                "summary": summary,
+                "diff_source": "schema_only"
+            }
+            
+            await update_state("COMPLETED", result=final_result)
+            
+        except Exception as e:
+            await update_state("FAILED", error=f"Ephemeral diff engine failure: {str(e)}")
+
+    _run(_process())
 
 # ---------------------------------------------------------------------------
 # Background Diff Engine & Garbage Collector

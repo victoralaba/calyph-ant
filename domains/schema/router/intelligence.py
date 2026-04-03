@@ -37,6 +37,8 @@ them with a single renderer regardless of the diff source.
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
 from typing import Any
 from uuid import UUID
 
@@ -46,12 +48,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
-from core.db import get_db, get_connection_url
+from core.db import get_db, get_connection_url, get_redis
 from domains.schema import introspection
 from domains.schema.diff import (
     DiffResult,
-    diff_against_calyph,
-    diff_against_sql,
     diff_schemas,
 )
 from domains.schema.auto_migration import (
@@ -61,6 +61,8 @@ from domains.schema.auto_migration import (
     diff_at_versions,
     diff_at_versions_semantic,
 )
+from domains.connections.service import get_validated_workspace_url
+from shared.types import DiffJobResponse, DiffJobStatus
 
 router = APIRouter(prefix="/schema", tags=["schema-intelligence"])
 
@@ -216,7 +218,7 @@ async def diff_live_schemas(
 # Diff — live vs SQL text (Gap 9-1)
 # ---------------------------------------------------------------------------
 
-@router.post("/{connection_id}/diff-against-sql")
+@router.post("/{connection_id}/diff-against-sql", status_code=status.HTTP_202_ACCEPTED, response_model=DiffJobResponse)
 async def diff_live_against_sql(
     connection_id: UUID,
     body: DiffAgainstSqlRequest,
@@ -226,42 +228,49 @@ async def diff_live_against_sql(
 ):
     """
     Compare the live database schema against a raw SQL schema string.
-
-    Useful when:
-    - A teammate sends you a schema file and you want to know the delta
-    - You have a migration script and want to verify it reflects the
-      current state before applying
-    - You want to compare against a known baseline
-
-    The SQL is executed in a temporary schema on Calyphant's internal
-    database, diffed against the live connection, then immediately dropped.
-    Row data on the live connection is never read.
-
-    Response shape is identical to POST /schema/{id}/diff.
+    Returns a job_id for background processing to prevent thread starvation.
+    
+    UI EXPECTATION: The Svelte frontend MUST poll `/schema/diff/{job_id}/status` 
+    (or equivalent status endpoint) until status is 'COMPLETED' or 'FAILED'. 
+    Do not expect an immediate DiffResult payload.
     """
-    live_url = await _get_url(connection_id, workspace_id, db)
+    # 1. SSRF Boundary: Enforce connection ownership natively before touching DSNs
+    live_url = await get_validated_workspace_url(db, connection_id, workspace_id)
 
-    try:
-        result = await diff_against_sql(
-            live_url=live_url,
-            schema_sql=body.schema_sql,
-            live_label=body.live_label,
-            sql_label=body.sql_label,
-            schema=body.schema_name,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Diff failed: {exc}")
+    # 2. Establish State Machine
+    job_id = str(uuid.uuid4())
+    state = {
+        "job_id": job_id,
+        "status": DiffJobStatus.PENDING.value,
+        "result": None,
+        "error": None
+    }
+    
+    redis = await get_redis()
+    await redis.setex(f"diff_job:{job_id}", 3600, json.dumps(state))
 
-    return _serialise_diff(result, diff_source="schema_only")
+    # 3. Dispatch to Background Worker
+    from worker.celery import execute_background_ephemeral_diff
+    execute_background_ephemeral_diff.apply_async( # type: ignore
+        args=[
+            job_id, 
+            body.schema_sql, 
+            live_url, 
+            body.schema_name,
+            body.live_label,
+            body.sql_label
+        ],
+        queue="default"
+    )
+
+    return DiffJobResponse(**state)
 
 
 # ---------------------------------------------------------------------------
 # Diff — live vs .calyph backup (Gap 9-1)
 # ---------------------------------------------------------------------------
 
-@router.post("/{connection_id}/diff-against-calyph")
+@router.post("/{connection_id}/diff-against-calyph", status_code=status.HTTP_202_ACCEPTED, response_model=DiffJobResponse)
 async def diff_live_against_calyph(
     connection_id: UUID,
     user: CurrentUser,
@@ -273,17 +282,11 @@ async def diff_live_against_calyph(
     schema_name: str = Form(default="public"),
 ):
     """
-    Compare the live database schema against the DDL embedded in a
-    .calyph backup file.
-
-    Only the schema block (DDL) of the backup is read — row data is never
-    loaded.  This is always a schema-only diff regardless of how much row
-    data the backup contains.
-
-    Upload the .calyph.gz file as multipart form data alongside optional
-    label and schema_name fields.
-
-    Response shape is identical to POST /schema/{id}/diff.
+    Compare the live database schema against the DDL embedded in a .calyph backup file.
+    Extracts the schema block synchronously, then dispatches AST parsing to a background worker.
+    
+    UI EXPECTATION: The Svelte frontend MUST poll `/schema/diff/{job_id}/status` 
+    until status is 'COMPLETED' or 'FAILED'.
     """
     if not backup_file.filename or not backup_file.filename.endswith(".gz"):
         raise HTTPException(
@@ -295,22 +298,50 @@ async def diff_live_against_calyph(
     if not calyph_data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    live_url = await _get_url(connection_id, workspace_id, db)
-
+    # 1. Parse .calyph file to raw SQL on the fast web thread (JSON extraction, no heavy AST parsing)
+    from domains.backups.engine import parse_calyph_backup
+    from domains.schema.diff import _calyph_schema_to_sql
+    
     try:
-        result = await diff_against_calyph(
-            live_url=live_url,
-            calyph_data=calyph_data,
-            live_label=live_label,
-            calyph_label=calyph_label,
-            schema=schema_name,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        parsed = parse_calyph_backup(calyph_data)
+        schema_block = parsed.get("schema", {})
+        if not schema_block or not schema_block.get("tables"):
+            raise ValueError("The .calyph file contains no schema DDL. Only v2 backups include full DDL.")
+        
+        schema_sql = _calyph_schema_to_sql(schema_block)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Diff failed: {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not parse backup file: {exc}")
 
-    return _serialise_diff(result, diff_source="schema_only")
+    # 2. SSRF Boundary: Enforce connection ownership
+    live_url = await get_validated_workspace_url(db, connection_id, workspace_id)
+
+    # 3. Setup Async Job
+    job_id = str(uuid.uuid4())
+    state = {
+        "job_id": job_id,
+        "status": DiffJobStatus.PENDING.value,
+        "result": None,
+        "error": None
+    }
+    
+    redis = await get_redis()
+    await redis.setex(f"diff_job:{job_id}", 3600, json.dumps(state))
+
+    # 4. Dispatch to Background Worker
+    from worker.celery import execute_background_ephemeral_diff
+    execute_background_ephemeral_diff.apply_async( # type: ignore
+        args=[
+            job_id, 
+            schema_sql, 
+            live_url, 
+            schema_name,
+            live_label,
+            calyph_label
+        ],
+        queue="default"
+    )
+
+    return DiffJobResponse(**state)
 
 
 # ---------------------------------------------------------------------------
