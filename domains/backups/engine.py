@@ -89,17 +89,21 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from core.auth import CurrentUser
 from core.config import settings
-from core.db import get_db, get_connection_url
+from core.db import get_db
+from domains.connections.service import get_validated_workspace_url
 from shared.storage import _check_r2_enabled
 from shared.types import Base
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants & Concurrency
 # ---------------------------------------------------------------------------
 
 CHUNK_ROW_LIMIT = 50_000   # rows per .calyph part file
 CALYPH_VERSION = "2"
+
+MAX_CONCURRENT_SUBPROCESSES = 3
+_subprocess_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SUBPROCESSES)
 
 
 # ---------------------------------------------------------------------------
@@ -443,28 +447,35 @@ async def generate_r2_download_url(key: str, expires_in: int = 3600) -> str:
 # pg_dump (SQL format)
 # ---------------------------------------------------------------------------
 
-async def pg_dump_sql(url: str, schema_only: bool = False) -> bytes:
+async def pg_dump_sql(url: str, schema_only: bool = False, timeout_sec: int = 300) -> bytes:
     args = ["pg_dump", "--no-password"]
     if schema_only:
         args.append("--schema-only")
     args.append(url)
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={"PGPASSWORD": _extract_password(url), **_safe_env()},
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"pg_dump failed: {stderr.decode()}")
-    return gzip.compress(stdout)
+    
+    async with _subprocess_semaphore:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise RuntimeError(f"pg_dump timed out after {timeout_sec}s.")
+            
+        if proc.returncode != 0:
+            raise RuntimeError(f"pg_dump failed: {stderr.decode()}")
+        return gzip.compress(stdout)
 
 
-async def psql_restore(url: str, sql_gz: bytes) -> dict[str, Any]:
+async def psql_restore(url: str, sql_gz: bytes, timeout_sec: int = 600) -> dict[str, Any]:
     """
     Restore a gzipped SQL dump via psql subprocess.
-    Returns a summary dict with executed_ok, errors, and stderr.
-    ON_ERROR_STOP is intentionally off so we collect all errors.
+    Protected by concurrency semaphore and strict execution timeouts.
     """
     sql_bytes = gzip.decompress(sql_gz)
 
@@ -473,29 +484,36 @@ async def psql_restore(url: str, sql_gz: bytes) -> dict[str, Any]:
         tmp_path = f.name
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "psql",
-            "--no-password",
-            "--set", "ON_ERROR_STOP=off",
-            "--file", tmp_path,
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={"PGPASSWORD": _extract_password(url), **_safe_env()},
-        )
-        stdout, stderr = await proc.communicate()
-        stderr_text = stderr.decode()
-        errors = [
-            line for line in stderr_text.splitlines()
-            if line.strip().upper().startswith("ERROR")
-        ]
-        return {
-            "success": proc.returncode == 0,
-            "return_code": proc.returncode,
-            "error_count": len(errors),
-            "errors": errors[:50],   # cap for response size
-            "stdout": stdout.decode()[:2000],
-        }
+        async with _subprocess_semaphore:
+            proc = await asyncio.create_subprocess_exec(
+                "psql",
+                "--no-password",
+                "--set", "ON_ERROR_STOP=off",
+                "--file", tmp_path,
+                url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
+                
+            stderr_text = stderr.decode()
+            errors = [
+                line for line in stderr_text.splitlines()
+                if line.strip().upper().startswith("ERROR")
+            ]
+            return {
+                "success": proc.returncode == 0,
+                "return_code": proc.returncode,
+                "error_count": len(errors),
+                "errors": errors[:50],
+                "stdout": stdout.decode()[:2000],
+            }
     finally:
         os.unlink(tmp_path)
 
@@ -540,10 +558,10 @@ async def _resolve_schema_version(
 
 
 # ---------------------------------------------------------------------------
-# Core backup — chunked .calyph builder
+# Core backup — chunked .calyph builder (Streaming Generator)
 # ---------------------------------------------------------------------------
 
-async def _build_calyph_chunked(
+async def _stream_calyph_chunked(
     pg_conn: asyncpg.Connection,
     label: str,
     schema_only: bool = False,
@@ -552,89 +570,93 @@ async def _build_calyph_chunked(
     schema_version: str | None = None,
     schema_order_index: int = 0,
     db_url: str | None = None,
-) -> list[bytes]:
-    """
-    Build one or more .calyph part files.
-
-    All data reads happen inside a single REPEATABLE READ transaction so
-    every part sees the same consistent snapshot.  The transaction is held
-    open only for data reads — DDL introspection happens after.
-
-    Returns a list of gzip bytes, one element per part.
-    Single-part backups return a list of length 1.
-    """
+):
     from domains.schema.introspection import introspect_database
 
-    async with pg_conn.transaction(isolation="repeatable_read", readonly=True):
-        db_name = await pg_conn.fetchval("SELECT current_database()")
-        pg_ver = await pg_conn.fetchval("SELECT version()")
-        assert db_name is not None, "Failed to get database name"
-        assert pg_ver is not None, "Failed to get PostgreSQL version"
+    db_name = await pg_conn.fetchval("SELECT current_database()")
+    pg_ver = await pg_conn.fetchval("SELECT version()")
+    assert db_name is not None, "Failed to get database name"
+    assert pg_ver is not None, "Failed to get PostgreSQL version"
 
-        table_rows = await pg_conn.fetch(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
-            "ORDER BY table_name"
-        )
-        table_names = [r["table_name"] for r in table_rows]
-
-        # Read all rows inside the transaction using server-side cursor
-        # so we never hold the full result set in memory.
-        all_table_data: dict[str, list[dict]] = {}
-        if not schema_only:
-            for table_name in table_names:
-                rows = []
-                async with pg_conn.transaction():
-                    async for batch in _cursor_chunks(pg_conn, table_name, CHUNK_ROW_LIMIT):
-                        rows.extend(batch)
-                all_table_data[table_name] = rows
-        # Transaction ends here
-
-    # DDL introspection after the transaction
+    # Introspection
     snapshot = None
     dsn = db_url
     if not dsn and db is not None and connection_id is not None:
-        dsn = await get_connection_url(db, connection_id, workspace_id=None)  # type: ignore
+        dsn = await get_validated_workspace_url(db, connection_id, workspace_id=None) # type: ignore
+        
     if dsn:
         try:
             snapshot = await asyncio.to_thread(introspect_database, dsn, "public")
         except Exception as exc:
             logger.warning(f"Full DDL introspection failed: {exc}")
 
+    table_rows = await pg_conn.fetch(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
+        "ORDER BY table_name"
+    )
+    table_names = [r["table_name"] for r in table_rows]
+    table_names_set = set(table_names)
+
     if snapshot is not None:
-        table_names_set = set(table_names)
         schema_block = _serialise_snapshot_filtered(snapshot, table_names_set)
     else:
         schema_block = {
-            "calyph_schema_version": 1,
+            "calyph_schema_version": 2,
             "tables": {name: {} for name in table_names},
         }
 
-    # Split table data into chunks of CHUNK_ROW_LIMIT rows per part
+    # Schema-only path
     if schema_only:
-        # Schema-only: single part, no row data
         header = _calyph_header(
             database=db_name, pg_version=pg_ver.split(",")[0],
             label=label, schema_version=schema_version,
             schema_order_index=schema_order_index,
         )
-        return [_build_calyph_bytes(header, schema_block, {})]
+        yield _build_calyph_bytes(header, schema_block, {})
+        return
 
-    parts = _partition_table_data(all_table_data)
-    total_parts = len(parts)
+    # Data Streaming path
+    current_part_idx = 1
+    current_table_data: dict[str, list[dict]] = {}
+    current_row_count = 0
 
-    result_parts: list[bytes] = []
-    for idx, part_data in enumerate(parts, start=1):
-        header = _calyph_header(
-            database=db_name, pg_version=pg_ver.split(",")[0],
-            label=label, schema_version=schema_version,
-            schema_order_index=schema_order_index,
-            part=idx if total_parts > 1 else None,
-            total_parts=total_parts if total_parts > 1 else None,
-        )
-        result_parts.append(_build_calyph_bytes(header, schema_block, part_data))
+    async with pg_conn.transaction(isolation="repeatable_read", readonly=True):
+        for table_name in table_names:
+            async with pg_conn.transaction():
+                cursor = await pg_conn.cursor(f'SELECT * FROM "public"."{table_name}"')
+                while True:
+                    rows = await cursor.fetch(5000)
+                    if not rows:
+                        break
+                        
+                    dict_rows = [dict(r) for r in rows]
+                    current_table_data.setdefault(table_name, []).extend(dict_rows)
+                    current_row_count += len(dict_rows)
 
-    return result_parts
+                    if current_row_count >= CHUNK_ROW_LIMIT:
+                        header = _calyph_header(
+                            database=db_name, pg_version=pg_ver.split(",")[0],
+                            label=label, schema_version=schema_version,
+                            schema_order_index=schema_order_index,
+                            part=current_part_idx,
+                        )
+                        yield _build_calyph_bytes(header, schema_block, current_table_data)
+                        
+                        current_part_idx += 1
+                        current_table_data = {}
+                        current_row_count = 0
+
+        # Flush remainder
+        if current_row_count > 0 or current_part_idx == 1:
+            header = _calyph_header(
+                database=db_name, pg_version=pg_ver.split(",")[0],
+                label=label, schema_version=schema_version,
+                schema_order_index=schema_order_index,
+                part=current_part_idx if current_part_idx > 1 else None,
+                total_parts=current_part_idx if current_part_idx > 1 else None,
+            )
+            yield _build_calyph_bytes(header, schema_block, current_table_data)
 
 
 async def _cursor_chunks(
@@ -774,37 +796,34 @@ async def create_backup(
     await db.refresh(record)
 
     try:
-        url = await get_connection_url(db, connection_id, workspace_id)
+        url = await get_validated_workspace_url(db, connection_id, workspace_id)
 
         if fmt == "calyph":
-            parts = await _build_calyph_chunked(
-                pg_conn=pg_conn,
-                label=label,
-                schema_only=schema_only,
-                connection_id=connection_id,
-                db=db,
-                schema_version=schema_version,
-                schema_order_index=schema_order_index,
-                db_url=url,
-            )
             total_size = 0
+            part_count = 0
             first_key: str | None = None
-            for idx, part_bytes in enumerate(parts, start=1):
-                part_num = idx if len(parts) > 1 else None
-                key = _r2_key(workspace_id, connection_id, record.id, "calyph", part_num)
+            first_checksum: str | None = None
+            
+            async for part_bytes in _stream_calyph_chunked(
+                pg_conn=pg_conn, label=label, schema_only=schema_only,
+                connection_id=connection_id, db=db, schema_version=schema_version,
+                schema_order_index=schema_order_index, db_url=url,
+            ):
+                part_count += 1
+                key = _r2_key(workspace_id, connection_id, record.id, "calyph", part_count if part_count > 1 else None)
                 await upload_to_r2(key, part_bytes)
+                
                 total_size += len(part_bytes)
                 if first_key is None:
                     first_key = key
+                    first_checksum = hashlib.sha256(part_bytes).hexdigest()
 
             record.r2_key = first_key
             record.size_bytes = total_size
-            record.part_count = len(parts)
-            record.checksum = hashlib.sha256(parts[0]).hexdigest()
+            record.part_count = part_count
+            record.checksum = first_checksum
 
         else:
-            if not url:
-                raise ValueError("Connection URL not found.")
             data = await pg_dump_sql(url, schema_only=schema_only)
             key = _r2_key(workspace_id, connection_id, record.id, "sql")
             await upload_to_r2(key, data)
@@ -977,7 +996,7 @@ async def restore_backup(
         if not record.r2_key:
             raise ValueError("Backup has no stored data.")
         data = await download_from_r2(record.r2_key)
-        url = await get_connection_url(db, record.connection_id, workspace_id)
+        url = await get_validated_workspace_url(db, record.connection_id, workspace_id)
         if not url:
             raise ValueError("Connection not found.")
         result = await psql_restore(url, data)
@@ -1452,11 +1471,10 @@ class CreateScheduleRequest(BaseModel):
 
 
 async def _pg(connection_id: UUID, workspace_id: UUID, db: AsyncSession) -> asyncpg.Connection:
-    url = await get_connection_url(db, connection_id, workspace_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Connection not found.")
+    from fastapi import HTTPException
+    url = await get_validated_workspace_url(db, connection_id, workspace_id)
     try:
-        return await asyncpg.connect(dsn=url, timeout=30)
+        return await asyncpg.connect(dsn=url, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
