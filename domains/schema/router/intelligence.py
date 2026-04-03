@@ -365,9 +365,7 @@ async def export_schema_sql(
       Use pg_dump --schema-only for complete procedural code export.
     """
     url = await _get_url(connection_id, workspace_id, db)
-    snapshot = await asyncio.to_thread(
-        introspection.introspect_database, url, schema_name
-    )
+    snapshot = await introspection.introspect_database(url, schema_name)
 
     lines = [
         f"-- Calyphant schema export",
@@ -590,9 +588,7 @@ async def export_table_structure(
     url = await _get_url(connection_id, workspace_id, db)
 
     try:
-        table = await asyncio.to_thread(
-            introspection.introspect_table, url, table_name, schema_name
-        )
+        table = await introspection.introspect_table(url, table_name, schema_name)
     except ValueError:
         raise HTTPException(
             status_code=404,
@@ -765,9 +761,7 @@ async def capture_pre_edit_snapshot(
     is unavailable — never returns 503 so editors can always continue.
     """
     url = await _get_url(connection_id, workspace_id, db)
-    snapshot_meta = await asyncio.to_thread(
-        introspection.introspect_database, url, schema_name
-    )
+    snapshot_meta = await introspection.introspect_database(url, schema_name)
     table_count = len([t for t in snapshot_meta.tables if t.kind == "table"])
 
     snapshot_id: str = ""
