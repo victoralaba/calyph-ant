@@ -37,6 +37,8 @@ from uuid import uuid4
 import asyncpg
 from loguru import logger
 
+from worker.celery import execute_ephemeral_diff
+
 
 # ---------------------------------------------------------------------------
 # Change models  (unchanged)
@@ -159,73 +161,68 @@ async def diff_against_sql(
     live_label: str = "live",
     sql_label: str = "provided schema",
     schema: str = "public",
-    internal_db_url: str | None = None,
+    internal_db_url: str | None = None,  # Ignored, kept for backward compatibility
 ) -> DiffResult:
     """
     Compare a live connection's schema against an arbitrary SQL schema string.
 
-    The SQL is replayed into a temporary schema on a scratch database
-    (Calyphant's own internal DB by default).  migra then diffs the live
-    connection against the scratch schema.
-
-    Args:
-        live_url:         URL of the live database to diff against.
-        schema_sql:       Raw CREATE TABLE / ALTER TABLE / etc. SQL that
-                          defines the schema to compare.
-        live_label:       Display label for the live connection side.
-        sql_label:        Display label for the SQL string side.
-        schema:           PostgreSQL schema name on the live side (default: public).
-        internal_db_url:  Scratch database URL.  Defaults to Calyphant's own DB.
+    The SQL is dispatched to a background Celery worker which spins up an 
+    ephemeral Docker container, executes the diff, parses the AST, and 
+    returns the payload. The main web thread remains entirely unblocked.
     """
-    scratch_url = internal_db_url or _get_internal_db_url()
-    temp_schema = f"_calyphant_sql_diff_{uuid4().hex[:10]}"
-
-    conn: asyncpg.Connection | None = None
     try:
-        conn = await asyncpg.connect(dsn=scratch_url, timeout=15)
-        assert conn is not None # for mypy — if this fails, the exception from connect() will be raised instead
-
-        # Create the temp schema
-        await conn.execute(f'CREATE SCHEMA "{temp_schema}"')
-
-        # Replay the provided SQL inside the temp schema
-        rewritten = _rewrite_schema(schema_sql, "public", temp_schema)
-        try:
-            await conn.execute(f'SET search_path TO "{temp_schema}"')
-            await conn.execute(rewritten)
-        except Exception as exc:
-            raise ValueError(
-                f"Provided schema SQL failed to execute: {exc}"
-            ) from exc
-        finally:
-            await conn.execute("SET search_path TO public")
-
-        # Build a scratch URL that migra will see as having search_path=temp_schema
-        scratch_conn_url = _url_with_search_path(scratch_url, temp_schema)
-
-        sql = await _run_migra(live_url, scratch_conn_url, schema)
-        if sql is None:
+        # 1. Dispatch to Celery (does not block event loop)
+        celery_task = execute_ephemeral_diff.delay(  #type: ignore
+            source_sql=schema_sql,
+            target_db_url=live_url,
+            schema=schema
+        )
+        
+        # 2. Wait for background worker to finish (with a 45s hard timeout)
+        # Yields the thread back to FastAPI so other users can be served
+        result_dict = await asyncio.to_thread(celery_task.get, timeout=45.0)
+        
+        if result_dict.get("error"):
             return DiffResult(
-                source_label=live_label, target_label=sql_label, sql="", changes=[]
+                source_label=live_label, 
+                target_label=sql_label, 
+                error=result_dict["error"]
             )
 
-        changes = _parse_sql_to_changes(sql)
-        has_destructive = any(c.kind in _DESTRUCTIVE_KINDS for c in changes)
+        # 3. Rehydrate the dictionaries back into SchemaChange dataclasses
+        rehydrated_changes = [
+            SchemaChange(
+                kind=ChangeKind(c["kind"]),
+                object_type=c["object_type"],
+                object_name=c["object_name"],
+                table_name=c["table_name"],
+                detail=c["detail"],
+                is_destructive=c["is_destructive"],
+                sql=c["sql"]
+            ) for c in result_dict.get("changes", [])
+        ]
+
         return DiffResult(
             source_label=live_label,
             target_label=sql_label,
-            changes=changes,
-            sql=sql,
-            has_destructive_changes=has_destructive,
+            changes=rehydrated_changes,
+            sql=result_dict.get("sql", ""),
+            has_destructive_changes=result_dict.get("has_destructive_changes", False),
         )
 
-    finally:
-        if conn:
-            try:
-                await conn.execute(f'DROP SCHEMA IF EXISTS "{temp_schema}" CASCADE')
-            except Exception:
-                pass
-            await conn.close()
+    except asyncio.TimeoutError:
+        return DiffResult(
+            source_label=live_label, 
+            target_label=sql_label, 
+            error="Schema diffing timed out. The schema is too large or the worker is overloaded."
+        )
+    except Exception as exc:
+        logger.error(f"Celery ephemeral diff task failed: {exc}")
+        return DiffResult(
+            source_label=live_label, 
+            target_label=sql_label, 
+            error=f"Diff engine failure: {str(exc)}"
+        )
 
 
 async def diff_against_calyph(

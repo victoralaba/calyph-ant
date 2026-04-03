@@ -23,10 +23,20 @@ import asyncio
 from datetime import datetime, timezone
 from uuid import UUID
 
-from celery import Celery
+from celery import Celery, shared_task
 from celery.schedules import crontab
 from celery.utils.log import get_task_logger
 from kombu import Queue
+
+import socket
+import subprocess
+import time
+from typing import Any, Dict
+
+try:
+    import docker
+except ImportError:
+    docker = None
 
 from core.config import settings
 
@@ -538,3 +548,123 @@ def drain_slow_queries():
                 pass
 
     _run(_drain())
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral Schema Diffing Engine
+# ---------------------------------------------------------------------------
+
+import logging
+logger = logging.getLogger(__name__)
+
+# Initialize Docker client lazily or handle absence gracefully
+docker_client = None
+if docker:
+    try:
+        docker_client = docker.from_env()
+    except Exception as exc:
+        logger.warning(f"Failed to bind to local Docker daemon. Ephemeral diffs will fail: {exc}")
+
+
+def _wait_for_db(host: str, port: int, timeout: int = 15) -> bool:
+    """Ping the port until Postgres is ready to accept connections."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+@shared_task(bind=True, time_limit=90, soft_time_limit=75)
+def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: str = "public") -> Dict[str, Any]:
+    """
+    Spawns an ephemeral Postgres container, applies the source SQL, 
+    runs migra against the target DB, and parses the AST.
+    """
+    if not docker_client:
+        return {"sql": "", "changes": [], "has_destructive_changes": False, "error": "Docker daemon is not available on the worker node."}
+
+    container = None
+    try:
+        logger.info("Spawning ephemeral Postgres container for diff...")
+        
+        # 1. Boot the ephemeral container with strict resource limits
+        container = docker_client.containers.run(
+            "postgres:15-alpine",
+            detach=True,
+            remove=True,  # The Guillotine: Auto-delete volume and container on stop
+            environment={"POSTGRES_PASSWORD": "ephemeral_pass"},
+            ports={'5432/tcp': None},  # Bind to a random available host port
+            mem_limit="512m",          # Blast radius containment
+            nano_cpus=500000000        # 0.5 CPU limit
+        )
+        
+        # 2. Extract the random port
+        container.reload()
+        host_port = container.attrs['NetworkSettings']['Ports']['5432/tcp'][0]['HostPort']
+        ephemeral_url = f"postgresql://postgres:ephemeral_pass@localhost:{host_port}/postgres"
+        
+        # 3. Wait for Postgres to boot (~1-2 seconds for Alpine)
+        if not _wait_for_db("localhost", int(host_port)):
+            raise RuntimeError("Ephemeral Postgres container failed to boot within timeout.")
+
+        # 4. Inject the user's schema into the ephemeral container
+        inject_cmd = [
+            "psql", ephemeral_url, "-c", 
+            f"CREATE SCHEMA IF NOT EXISTS \"{schema}\"; SET search_path TO \"{schema}\"; {source_sql}"
+        ]
+        subprocess.run(inject_cmd, check=True, capture_output=True, text=True)
+
+        # 5. Run migra directly inside the Celery worker
+        migra_cmd = ["migra", "--unsafe", "--schema", schema, ephemeral_url, target_db_url]
+        proc = subprocess.run(migra_cmd, capture_output=True, text=True)
+
+        if proc.returncode not in (0, 2):
+            raise RuntimeError(f"Migra failed: {proc.stderr}")
+            
+        sql_output = proc.stdout.strip() if proc.returncode == 2 else ""
+
+        # 6. Parse the AST safely off the main web thread
+        from domains.schema.diff import _parse_sql_to_changes, _DESTRUCTIVE_KINDS
+        
+        changes = _parse_sql_to_changes(sql_output)
+        
+        # Serialize dataclasses to pure Python dicts for Celery/Redis transport
+        serialized_changes = [
+            {
+                "kind": c.kind.value,
+                "object_type": c.object_type,
+                "object_name": c.object_name,
+                "table_name": c.table_name,
+                "detail": c.detail,
+                "is_destructive": c.is_destructive,
+                "sql": c.sql
+            } for c in changes
+        ]
+        
+        has_destructive = any(c.kind in _DESTRUCTIVE_KINDS for c in changes)
+
+        return {
+            "sql": sql_output,
+            "changes": serialized_changes,
+            "has_destructive_changes": has_destructive,
+            "error": None
+        }
+
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"SQL Injection to ephemeral DB failed: {exc.stderr}")
+        return {"sql": "", "changes": [], "has_destructive_changes": False, "error": "Provided schema SQL contains syntax errors."}
+    except Exception as exc:
+        logger.error(f"Ephemeral diff failed: {exc}")
+        return {"sql": "", "changes": [], "has_destructive_changes": False, "error": str(exc)}
+        
+    finally:
+        # 7. Guaranteed Destruction
+        if container:
+            try:
+                container.kill()
+            except Exception:
+                pass
