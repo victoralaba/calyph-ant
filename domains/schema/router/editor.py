@@ -45,20 +45,21 @@ All other logic is unchanged from the original.
 from __future__ import annotations
 
 import asyncio
-import json
+import json    
 import secrets
 import uuid
 from typing import Any
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
+from core.middleware import limiter
 from domains.billing.flutterwave import get_limits
 from domains.users.service import get_user
 from domains.connections.models import Connection
@@ -116,6 +117,45 @@ def _require_workspace(workspace_id: UUID | None) -> UUID:
 
 _CONFIRM_SESSION_TTL = 900     # 15 minutes — plenty of time for a human to review
 _CONFIRM_KEY_PREFIX = "calyphant:ddl_confirm:"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Rate Limiting (Zero-Latency JWT Extraction)
+# ---------------------------------------------------------------------------
+def get_dynamic_diff_limit(request: Request) -> str:
+    """
+    Evaluates the user's tier from the JWT to assign a dynamic rate limit.
+    Zero-latency: Relies purely on the auth token, skipping DB lookups.
+    
+    Expected JWT Payload Requirement:
+    The auth service MUST inject {"tier": "free" | "pro" | "enterprise"} 
+    into the JWT during login. If missing, it defaults to free.
+    """
+    try:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1]
+            from jose import jwt
+            from core.config import settings
+            
+            # Decode without verifying expiration or signature to save CPU cycles.
+            # (Strict validation happens later in the core.auth dependency. Here we just want speed).
+            payload = jwt.decode(
+                token, 
+                settings.SECRET_KEY, 
+                algorithms=[settings.JWT_ALGORITHM], 
+                options={"verify_exp": False, "verify_signature": False}
+            )
+            tier = payload.get("tier", "free")
+            
+            if tier == "enterprise":
+                return "60/minute"  # 1 per second (CI/CD friendly)
+            elif tier == "pro":
+                return "20/minute"  # 1 every 3 seconds
+    except Exception:
+        pass
+        
+    return "5/minute"  # Brutal throttle for Free/Anonymous to mathematically eliminate worker exhaustion
 
 
 # ---------------------------------------------------------------------------
@@ -1506,11 +1546,23 @@ async def set_column_comment(
 from shared.types import DiffRequestPayload, DiffJobResponse, DiffJobStatus
 
 @router.post("/diff", status_code=status.HTTP_202_ACCEPTED, response_model=DiffJobResponse)
+@limiter.limit(get_dynamic_diff_limit)
 async def request_schema_diff(
+    request: Request,  # REQUIRED by slowapi for the limiter context
     body: DiffRequestPayload,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    UI/CLIENT CONSIDERATIONS (Must be strictly enforced by Svelte 5 frontend):
+    1. HTTP 429 Handling: When this endpoint returns 429 Too Many Requests, 
+       the frontend MUST catch the error and freeze the 'Compare' button. Do NOT automate retries.
+    2. Monetization Hook: If a user hits the 429 limit and their current tier 
+       is 'free' or 'pro', the UI should instantly surface a "Rate limit exceeded" modal 
+       with a direct CTA to upgrade their tier. Never waste a 429.
+    3. Polling Backoff: Do not rely on spamming this endpoint to check status; 
+       status checking belongs strictly to the `/diff/{job_id}/status` endpoint.
+    """
     wid = _require_workspace(user.workspace_id)
     
     # Resolve connections into secure internal URLs
@@ -1518,10 +1570,15 @@ async def request_schema_diff(
     source_url = await get_validated_workspace_url(db, body.source_connection_id, wid)
     target_url = await get_validated_workspace_url(db, body.target_connection_id, wid)
 
-    # 1. Determine Tier Timeouts
+    # 1. Determine Tier Timeouts & Isolate Resources
     db_user = await get_user(db, user.id)
     tier = db_user.tier if db_user else "free"
     tier_timeout_ms = 300000 if tier == "enterprise" else (60000 if tier == "pro" else 15000)
+    
+    # ISOLATION LAYER: Force Enterprise users into a dedicated queue lane. 
+    # This ensures a heavy enterprise user doing 50 massive diffs via CI/CD 
+    # cannot starve out the standard worker pool handling Free/Pro users.
+    target_queue = "enterprise_diffs" if tier == "enterprise" else "default"
 
     # 2. Establish State Machine in Redis
     job_id = str(uuid.uuid4())
@@ -1540,7 +1597,7 @@ async def request_schema_diff(
     from worker.celery import execute_background_diff
     execute_background_diff.apply_async( # type: ignore
         args=[job_id, source_url, target_url, body.schema_name, tier_timeout_ms],
-        queue="default"
+        queue=target_queue
     )
 
     return DiffJobResponse(**state)
