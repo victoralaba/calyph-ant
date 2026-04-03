@@ -79,12 +79,6 @@ from shared.types import (
 # ---------------------------------------------------------------------------
 # Concurrency Management
 # ---------------------------------------------------------------------------
-# Limits concurrent connection attempts to the SAME external database host.
-# Protects the worker's async event loop from "thunderous herd" connection spikes.
-import asyncio
-from collections import defaultdict
-
-_host_semaphores: dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(5))
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +119,8 @@ def detect_provider(host: str) -> CloudProvider:
 async def parse_and_validate_url(url: str) -> dict[str, Any]:
     """
     Parse a PostgreSQL connection URL and resolve its DNS asynchronously.
-    Enforces SSRF protection by blocking internal/private IPs in production.
+    Enforces SSRF protection by blocking internal/private IPs.
+    Returns the resolved IP to defeat TOCTOU vulnerabilities downstream.
     """
     try:
         parsed = urlparse(url)
@@ -136,20 +131,17 @@ async def parse_and_validate_url(url: str) -> dict[str, Any]:
     if not host:
         raise ValueError("No host found in connection URL.")
 
+    port = parsed.port or 5432
+
     # ---------------------------------------------------------
     # DEFENSE: Async DNS Resolution & SSRF Protection
     # ---------------------------------------------------------
     loop = asyncio.get_running_loop()
     try:
-        # Resolve host asynchronously to prevent event-loop blocking
-        # Returns a list of (family, type, proto, canonname, sockaddr)
-        addr_info = await loop.getaddrinfo(host, parsed.port or 5432, family=socket.AF_UNSPEC)
-        
-        # Extract the first resolved IP address
+        addr_info = await loop.getaddrinfo(host, port, family=socket.AF_UNSPEC)
         resolved_ip = addr_info[0][4][0]
         ip_obj = ipaddress.ip_address(resolved_ip)
 
-        # Block private, loopback, and link-local routing
         if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
             if not settings.is_development:
                 raise ValueError(
@@ -162,12 +154,37 @@ async def parse_and_validate_url(url: str) -> dict[str, Any]:
 
     return {
         "host": host,
-        "port": parsed.port or 5432,
+        "resolved_ip": resolved_ip,  # Added to defeat TOCTOU
+        "port": port,
         "database": (parsed.path or "").lstrip("/") or "postgres",
         "username": parsed.username,
         "password": parsed.password or "",
         "provider": detect_provider(host),
     }
+
+@retry(
+    retry=retry_if_exception_type((OSError, asyncpg.PostgresConnectionError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=True,
+)
+async def _connect_raw(url: str, timeout: int = 10, resolved_ip: str | None = None) -> asyncpg.Connection:
+    """
+    Attempt a raw asyncpg connection with retries for transient failures.
+    
+    THE ELON MUSK RAZOR FIX:
+    Unbounded semaphores deleted. We rely purely on strict mathematical timeouts.
+    TOCTOU is defeated by passing `host=resolved_ip` as an override keyword 
+    argument directly to asyncpg, forcing it to ignore the potentially poisoned 
+    DNS record in the URL string while preserving SNI for SSL via the DSN.
+    """
+    kwargs = {"dsn": url, "timeout": timeout}
+    
+    # Inject the verified physical IP address to prevent DNS rebinding
+    if resolved_ip:
+        kwargs["host"] = resolved_ip
+
+    return await asyncpg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -315,43 +332,26 @@ async def introspect_privileges(conn: asyncpg.Connection) -> PrivilegeReport:
     wait=wait_exponential(multiplier=1, min=1, max=8),
     reraise=True,
 )
-async def _connect_raw(url: str, timeout: int = 10, host: str | None = None) -> asyncpg.Connection:
-    """Attempt a raw asyncpg connection with retries for transient failures and concurrency limits."""
-    sem_key = host or "unknown_host"
-    
-    # Strictly limit parallel handshake attempts to the same host
-    async with _host_semaphores[sem_key]:
-        return await asyncpg.connect(dsn=url, timeout=timeout)
-
 
 async def test_connection(url: str) -> ConnectionTestResult:
-    """
-    Attempt to connect to the database and collect metadata.
-    Returns a ConnectionTestResult regardless of success/failure.
-    Does not persist anything.
-
-    Privilege introspection is run after a successful connect and stored
-    in capabilities under the "privileges" key. Introspection failure
-    never fails the overall connection test — it just leaves privileges
-    absent from capabilities.
-    """
     components = await parse_and_validate_url(url)
     provider = components["provider"]
     is_sleeping_provider = provider in _SLEEPING_PROVIDERS
 
     conn: asyncpg.Connection | None = None
     try:
-        # Allow a longer timeout for providers that may need to wake
         timeout = 20 if is_sleeping_provider else 10
         
-        # Pass the extracted host to trigger the concurrency limit semaphore
-        conn = await _connect_raw(url, timeout=timeout, host=components["host"])
+        # Pass the pre-resolved, verified IP address to the connector
+        conn = await _connect_raw(
+            url, 
+            timeout=timeout, 
+            resolved_ip=components["resolved_ip"]
+        )
 
-        # Collect version info
         version_str: str = str(await conn.fetchval("SELECT version()"))
         version_num: int = int(await conn.fetchval("SHOW server_version_num") or 0)
 
-        # Collect installed extensions
         ext_rows = await conn.fetch(
             "SELECT name, default_version, installed_version "
             "FROM pg_available_extensions "
@@ -360,7 +360,6 @@ async def test_connection(url: str) -> ConnectionTestResult:
         )
         extensions = [dict(r) for r in ext_rows]
 
-        # Quick capability flags
         ext_names = {r["name"] for r in ext_rows}
         capabilities: dict[str, Any] = {
             "has_pgvector": "vector" in ext_names,
@@ -371,7 +370,6 @@ async def test_connection(url: str) -> ConnectionTestResult:
             "extensions": extensions,
         }
 
-        # Privilege introspection — fail-open
         try:
             priv_report = await introspect_privileges(conn)
             capabilities["privileges"] = priv_report.to_dict()
@@ -492,22 +490,24 @@ async def acquire_workspace_connection(
 ) -> asyncpg.Connection:
     """
     Unified outbound connection gateway.
-    Enforces _host_semaphores concurrency limits and strict SSRF-checked URL resolution.
+    Semaphores deleted. URL is pre-validated and TOCTOU protected.
     """
     from fastapi import HTTPException, status
     url = await get_validated_workspace_url(db, connection_id, workspace_id)
     
-    # We know the URL is valid, extract host for the semaphore
-    host = urlparse(url).hostname or "unknown"
+    # We resolve the IP directly here to maintain the TOCTOU shield
+    components = await parse_and_validate_url(url)
 
     try:
-        # Strictly limit parallel handshake attempts to the same host
-        async with _host_semaphores[host]:
-            return await asyncpg.connect(
-                dsn=url,
-                timeout=timeout,
-                server_settings={"application_name": "calyphant-workspace-exec"}
-            )
+        # UI CONSIDERATION: If this fails, the UI must gracefully handle 
+        # HTTP 503. Do not blindly retry immediately; implement exponential backoff 
+        # on the Svelte client to prevent DDOSing the Calyphant worker.
+        return await asyncpg.connect(
+            dsn=url,
+            host=components["resolved_ip"],
+            timeout=timeout,
+            server_settings={"application_name": "calyphant-workspace-exec"}
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -522,19 +522,19 @@ async def acquire_workspace_connection(
 async def ping_connection(url: str) -> bool:
     """
     Fire a cheap query to keep a cloud database awake.
-    Returns True if successful. Does not raise.
+    Semaphores deleted. Strict 15s physics limit enforced by asyncpg.
     """
-    try:
-        host = urlparse(url).hostname or "unknown"
-    except Exception:
-        host = "unknown"
-
     conn = None
     try:
-        async with _host_semaphores[host]:
-            conn = await asyncpg.connect(dsn=url, timeout=15)
-            await conn.fetchval("SELECT 1")
-            return True
+        # Resolve to bypass DNS poisoning on background tasks
+        components = await parse_and_validate_url(url)
+        conn = await asyncpg.connect(
+            dsn=url, 
+            host=components["resolved_ip"],
+            timeout=15
+        )
+        await conn.fetchval("SELECT 1")
+        return True
     except Exception as exc:
         logger.warning(f"Keep-alive ping failed: {exc}")
         return False
@@ -546,26 +546,22 @@ async def ping_connection(url: str) -> bool:
 async def execute_presence_heartbeat(url: str) -> None:
     """
     A brutally fast, silent network pulse triggered by the frontend visibility API.
-    Fails silently. Strict 3-second timeout. No database writes.
-    Designed exclusively to reset the idle-timer on serverless DB proxies.
+    Semaphores deleted. The 3-second timeout is the only constraint needed.
     """
-    try:
-        host = urlparse(url).hostname or "unknown"
-    except Exception:
-        host = "unknown"
-
     conn = None
     try:
-        # Prevent heartbeat spam from overwhelming the event loop
-        async with _host_semaphores[host]:
-            # 3-second timeout: If it takes longer than 3 seconds to connect, 
-            # it is either already asleep or unreachable. Don't block the worker.
-            conn = await asyncpg.connect(
-                dsn=url, 
-                timeout=3,
-                server_settings={"application_name": "calyphant-ui-heartbeat"}
-            )
-            await conn.fetchval("SELECT 1")
+        # Resolve to bypass DNS poisoning
+        components = await parse_and_validate_url(url)
+        
+        # 3-second timeout: If it takes longer than 3 seconds to connect, 
+        # it is either already asleep or unreachable. Don't block the worker.
+        conn = await asyncpg.connect(
+            dsn=url, 
+            host=components["resolved_ip"],
+            timeout=3,
+            server_settings={"application_name": "calyphant-ui-heartbeat"}
+        )
+        await conn.fetchval("SELECT 1")
     except Exception as exc:
         # We explicitly swallow exceptions here. Heartbeats are ephemeral.
         logger.debug(f"Presence heartbeat dropped: {exc}")

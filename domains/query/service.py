@@ -200,10 +200,17 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
 class WorkspacePoolManager:
     """
     Global registry for tenant-specific PostgreSQL connection pools.
-    Implements persistent multiplexing (zero-latency checkouts) and LRU eviction.
+    
+    THE ELON MUSK RAZOR FIX:
+    The global lock now ONLY protects the dictionary mutation. It does NOT 
+    wrap the 15-second I/O bound pool initialization. 
+    We store an asyncio.Task in the dictionary. If 100 users hit the exact 
+    same sleeping database simultaneously, they all await the exact same 
+    initialization task concurrently without blocking the rest of the application.
     """
     def __init__(self, ttl_seconds: int = 600):
-        self._pools: dict[UUID, tuple[asyncpg.Pool, datetime]] = {}
+        # Stores: connection_id -> (Task[asyncpg.Pool], last_used_datetime)
+        self._pools: dict[UUID, tuple[asyncio.Task, datetime]] = {}
         self._lock = asyncio.Lock()
         self._ttl_seconds = ttl_seconds
 
@@ -212,28 +219,36 @@ class WorkspacePoolManager:
         
         async with self._lock:
             # 1. Background Eviction (Garbage Collection)
-            # Find pools that have exceeded the TTL limit
             stale_cids = [
                 cid for cid, (_, last_used) in self._pools.items()
                 if (now - last_used).total_seconds() > self._ttl_seconds
             ]
             
             for cid in stale_cids:
-                stale_pool, _ = self._pools.pop(cid)
-                # Fire-and-forget the teardown so we don't block the current request
-                asyncio.create_task(stale_pool.close())
+                stale_task, _ = self._pools.pop(cid)
+                # Only attempt to close if the task actually finished successfully
+                if stale_task.done() and not stale_task.exception():
+                    asyncio.create_task(stale_task.result().close())
 
             # 2. Check Out / Update Timestamp
-            # The 0ms path: Pool exists, update its TTL, return immediately.
             if connection_id in self._pools:
-                pool, _ = self._pools[connection_id]
-                self._pools[connection_id] = (pool, now)
-                return pool
-            
-            # 3. Create New Pool (The TCP Tax - paid exactly once per session)
-            pool = await get_workspace_pool(url)
-            self._pools[connection_id] = (pool, now)
-            return pool
+                task, _ = self._pools[connection_id]
+                self._pools[connection_id] = (task, now)
+                pool_task = task
+            else:
+                # 3. Create New Pool Task (The TCP Tax)
+                # We schedule the task but do NOT await it inside this lock!
+                pool_task = asyncio.create_task(get_workspace_pool(url))
+                self._pools[connection_id] = (pool_task, now)
+
+        # UI CONSIDERATION: The UI streaming state (e.g., "Connecting...") will 
+        # resolve instantly for cached pools. For sleeping databases, the UI will 
+        # hang here for up to 15s. Ensure the Svelte frontend does NOT timeout 
+        # the HTTP request before this 15s window closes.
+        
+        # Await outside the lock. All concurrent requests for this specific tenant
+        # coalesce onto this single task safely.
+        return await pool_task
 
 # Initialize the global singleton manager
 pool_manager = WorkspacePoolManager()
