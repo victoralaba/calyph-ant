@@ -99,7 +99,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Annotated
 from uuid import UUID
 
 import asyncpg
@@ -112,10 +112,11 @@ from fastapi import (
     Query,
     UploadFile,
     status,
+    Path,
 )
 from fastapi.responses import StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import uuid4
 
@@ -164,17 +165,40 @@ router = APIRouter(prefix="/tables", tags=["tables"])
 # ---------------------------------------------------------------------------
 # Schemas — Row CRUD
 # ---------------------------------------------------------------------------
+import re
+
+# We compile the regex for the dictionary key validator
+_ID_REGEX_COMPILED = re.compile(r"^[a-zA-Z0-9_]+$")
 
 class FetchRowsRequest(BaseModel):
     filters: list[dict] = Field(default_factory=list)
     sort: list[dict] = Field(default_factory=list)
     limit: int = Field(100, ge=1, le=1000)
     offset: int = Field(0, ge=0)
-    columns: list[str] | None = None
+    # UI CONSIDERATION: Columns requested must strictly match the regex.
+    columns: list[StrictIdentifier] | None = None
+
+    @model_validator(mode='after')
+    def validate_nested_identifiers(self) -> "FetchRowsRequest":
+        # Defend against injection inside the nested filter/sort dicts
+        for f in self.filters:
+            if "column" in f and not _ID_REGEX_COMPILED.match(str(f["column"])):
+                raise ValueError(f"Invalid filter column name: {f['column']}")
+        for s in self.sort:
+            if "column" in s and not _ID_REGEX_COMPILED.match(str(s["column"])):
+                raise ValueError(f"Invalid sort column name: {s['column']}")
+        return self
 
 
 class InsertRowRequest(BaseModel):
     data: dict[str, Any]
+
+    @model_validator(mode='after')
+    def validate_keys(self) -> "InsertRowRequest":
+        for key in self.data.keys():
+            if not _ID_REGEX_COMPILED.match(key):
+                raise ValueError(f"Invalid column name '{key}'. Column names must be alphanumeric and underscores only.")
+        return self
 
 
 class UpdateRowRequest(BaseModel):
@@ -189,42 +213,38 @@ class UpdateRowRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode='after')
+    def validate_keys(self) -> "UpdateRowRequest":
+        for key in self.data.keys():
+            if not _ID_REGEX_COMPILED.match(key):
+                raise ValueError(f"Invalid update column name '{key}'.")
+        if self.row_version:
+            for key in self.row_version.keys():
+                # __version__ is an internal artifact allowed in some contexts, but row_version keys must be structural
+                if not _ID_REGEX_COMPILED.match(key) and key != "__version__":
+                    raise ValueError(f"Invalid row_version column name '{key}'.")
+        return self
+
 
 class BulkDeleteRequest(BaseModel):
-    pk_column: str
+    pk_column: StrictIdentifier
     pk_values: list[Any] = Field(..., min_length=1, max_length=1000)
-    confirmed: bool = Field(
-        default=False,
-        description=(
-            "Submit with confirmed=false (default) to receive a dry-run "
-            "preview. Re-submit with confirmed=true to execute."
-        ),
-    )
-    cascade: bool = Field(
-        default=False,
-        description=(
-            "When true, allow the database to cascade deletes to dependent "
-            "rows via FK ON DELETE CASCADE constraints. When false, the "
-            "delete will fail with 409 if any FK constraint would be violated."
-        ),
-    )
+    confirmed: bool = Field(default=False)
+    cascade: bool = Field(default=False)
 
 
 class BulkUpdateRequest(BaseModel):
-    pk_column: str
+    pk_column: StrictIdentifier
     rows: list[dict[str, Any]] = Field(..., min_length=1, max_length=500)
-    confirmed: bool = Field(
-        default=False,
-        description=(
-            "Submit with confirmed=false (default) to receive a dry-run "
-            "preview of what would change, including any lock or stale-row "
-            "conflicts. Re-submit with confirmed=true to execute.\n\n"
-            "Each row dict must include the pk_column value. "
-            "Optionally include a '__version__' key with the column "
-            "snapshot the client last read for that row to enable "
-            "per-row optimistic concurrency checking."
-        ),
-    )
+    confirmed: bool = Field(default=False)
+
+    @model_validator(mode='after')
+    def validate_keys(self) -> "BulkUpdateRequest":
+        for row in self.rows:
+            for key in row.keys():
+                if key != "__version__" and not _ID_REGEX_COMPILED.match(key):
+                    raise ValueError(f"Invalid column name '{key}' in bulk update payload.")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -251,16 +271,23 @@ class ImportExecuteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Strict Identifiers (SQL Injection Armor)
 # ---------------------------------------------------------------------------
-from typing import Annotated
-from fastapi import Path, Query
 
-# UI CONSIDERATION: The frontend UI must strictly enforce that table names
-# and schema names only contain alphanumeric characters and underscores.
-# Do not allow users to input spaces, dashes, or special characters when 
-# creating or querying tables. If they do, the API will automatically reject
-# it with a 422 Unprocessable Entity before it ever touches the database.
-TablePath = Annotated[str, Path(pattern=r"^[a-zA-Z0-9_]+$")]
-SchemaQuery = Annotated[str, Query(default="public", pattern=r"^[a-zA-Z0-9_]+$")]
+# UI CONSIDERATION: The frontend UI must strictly enforce that table names, 
+# schema names, and column names only contain alphanumeric characters and underscores.
+# Do not allow users to input spaces, dashes, or special characters. If they do, 
+# the API will automatically reject it with a 422 Unprocessable Entity.
+# This is a strict security boundary to prevent quote-breakout SQL injection.
+
+_IDENTIFIER_REGEX = r"^[a-zA-Z0-9_]+$"
+
+TablePath = Annotated[str, Path(pattern=_IDENTIFIER_REGEX)]
+SchemaQuery = Annotated[str, Query(default="public", pattern=_IDENTIFIER_REGEX)]
+
+# Used for Query parameters that represent structural column names
+StrictColumnQuery = Annotated[str, Query(pattern=_IDENTIFIER_REGEX)]
+
+# Used for Pydantic model fields that represent structural names
+StrictIdentifier = Annotated[str, Field(pattern=_IDENTIFIER_REGEX)]
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +637,7 @@ async def update_row_endpoint(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
-    pk_column: str = Query("id"),
+    pk_column: StrictColumnQuery = "id",
 ):
     """
     Update a single row by primary key.
@@ -667,7 +694,7 @@ async def delete_row_endpoint(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
-    pk_column: str = Query("id"),
+    pk_column: StrictColumnQuery = "id",
     confirmed: bool = Query(
         default=False,
         description=(
@@ -850,7 +877,7 @@ async def undo_row_update_endpoint(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
-    pk_column: str = Query("id"),
+    pk_column: StrictColumnQuery = "id",
 ):
     """
     Undo the most recent UPDATE for a row.

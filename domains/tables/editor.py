@@ -75,6 +75,21 @@ STREAM_CHUNK_SIZE = 500
 BULK_DELETE_PREVIEW_SAMPLE = 50
 
 
+def _validate_identifier(name: str) -> None:
+    """
+    Defense-in-depth: Enforces the absolute physical boundaries of PostgreSQL quoted identifiers.
+    Even if a request bypasses Pydantic validation internally, this ensures the engine 
+    physically refuses to format an unsafe string into SQL.
+    """
+    if not name:
+        raise ValueError("Identifier cannot be empty.")
+    if "\x00" in name:
+        raise ValueError("PostgreSQL identifiers cannot contain null bytes (\\x00).")
+    if '"' in name:
+        raise ValueError(
+            f"Identifier '{name}' contains a double quote. "
+            "To prevent quote-breakout injection, double quotes are strictly prohibited."
+        )
 # ---------------------------------------------------------------------------
 # Concurrency / integrity exceptions
 # ---------------------------------------------------------------------------
@@ -566,6 +581,12 @@ async def insert_row(
     if not data:
         raise ValueError("Cannot insert an empty row.")
 
+    _validate_identifier(table)
+    _validate_identifier(schema)
+
+    for k in data.keys():
+        _validate_identifier(k)
+
     cols = ", ".join(f'"{k}"' for k in data.keys())
     placeholders = ", ".join(f"${i + 1}" for i in range(len(data)))
     sql = (
@@ -586,10 +607,8 @@ async def insert_row(
     if not row:
         raise RuntimeError("Insert failed, no row was returned.")
 
-    # Cast tells Pylance to treat this strictly as dict[str, Any]
     result = cast(dict[str, Any], dict(row))
 
-    # REPLACE asyncio.create_task(...) WITH:
     await _write_audit_entry(
         operation="insert",
         table=table,
@@ -615,22 +634,20 @@ async def update_row(
 ) -> dict[str, Any] | None:
     """
     Update a single row by primary key.
-
-    SAFETY-1 — Optimistic concurrency when row_version is supplied.
-    SAFETY-9 — Type-aware version comparison.
-    SAFETY-10 — RowLockConflict enriched with presence identity.
-    SAFETY-6 (FIXED) — Guarantees a valid 'before' state for blind updates to support Undo.
-
-    Returns updated row dict or None if the row does not exist.
-    Raises RowLockConflict, StaleRowError, ValueError.
     """
     if not data:
         raise ValueError("No fields to update.")
 
+    _validate_identifier(table)
+    _validate_identifier(schema)
+    _validate_identifier(pk_column)
+
+    for k in data.keys():
+        _validate_identifier(k)
+
     live: dict = {}
     result: dict = {}
 
-    # Unified transaction: Always fetch state first to guarantee audit integrity
     async with conn.transaction():
         lock_sql = (
             f'SELECT * FROM "{schema}"."{table}" '
@@ -640,7 +657,6 @@ async def update_row(
         locked_row = await conn.fetchrow(lock_sql, pk_value)
 
         if locked_row is None:
-            # Row might be locked by another process or simply missing
             exists = await conn.fetchval(
                 f'SELECT 1 FROM "{schema}"."{table}" '
                 f'WHERE "{pk_column}" = $1',
@@ -667,7 +683,6 @@ async def update_row(
 
         live = dict(locked_row)
 
-        # Conditionally apply optimistic concurrency rules
         if row_version is not None:
             conflicts: list[dict] = []
             for col, expected in row_version.items():
@@ -685,7 +700,6 @@ async def update_row(
             if conflicts:
                 raise StaleRowError(table, pk_column, pk_value, conflicts)
 
-        # Apply the mutation
         set_parts = [f'"{k}" = ${i + 1}' for i, k in enumerate(data.keys())]
         pk_idx = len(data) + 1
         update_sql = (
@@ -705,7 +719,7 @@ async def update_row(
         "schema": schema,
         "pk_column": pk_column,
         "pk_value": pk_value,
-        "before": live,  # Now guaranteed to be populated
+        "before": live,
         "after": result,
     }
 
