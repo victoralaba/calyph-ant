@@ -667,8 +667,7 @@ async def apply_migration(
     - has_conflict is True AND force_apply is False
 
     force_apply=True allows applying a conflicted migration after the
-    developer has manually reviewed and accepted the risk. This is the
-    escape hatch for the resolution workflow.
+    developer has manually reviewed and accepted the risk.
     """
     record = await _get_migration_or_raise(db, migration_id)
 
@@ -694,7 +693,21 @@ async def apply_migration(
         )
 
     try:
+        # ---------------------------------------------------------------------
+        # UI CONSIDERATION: The frontend MUST expect a maximum response time 
+        # of ~35 seconds for this endpoint. If the DB operation takes longer, 
+        # the backend will aggressively kill it and return a 400 error. 
+        # The UI should display: "Migration aborted: Operation too heavy. 
+        # Consider batching or adding CONCURRENTLY to indexes."
+        # ---------------------------------------------------------------------
         async with pg_conn.transaction():
+            # 1. Enforce aggressive fast-fail on lock acquisition (2 seconds)
+            # If another user is querying the table, don't hang the pool waiting.
+            await pg_conn.execute("SET LOCAL lock_timeout = '2000';")
+            
+            # 2. Enforce engine-level circuit breaker for execution length (30 seconds)
+            await pg_conn.execute("SET LOCAL statement_timeout = '30000';")
+            
             await pg_conn.execute(record.up_sql)
 
         record.applied = True
@@ -715,10 +728,18 @@ async def apply_migration(
         logger.error(f"Migration {record.version} failed (privileges): {exc}")
         raise
     except Exception as exc:
-        record.error = str(exc)
+        error_msg = str(exc)
+        
+        # Translate physics violations into clear feedback
+        if getattr(exc, "sqlstate", None) == '55P03':  # lock_not_available
+            error_msg = "Lock acquisition timed out (2s limit). The table is locked by an active transaction."
+        elif isinstance(exc, asyncpg.QueryCanceledError) or "timeout" in error_msg.lower():
+            error_msg = "Migration timed out (30s limit). DDL must be optimized or batched."
+            
+        record.error = error_msg
         await db.commit()
-        logger.error(f"Migration {record.version} failed: {exc}")
-        raise
+        logger.error(f"Migration {record.version} failed: {error_msg}")
+        raise ValueError(error_msg)
 
 
 async def rollback_migration(

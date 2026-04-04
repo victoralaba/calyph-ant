@@ -73,6 +73,7 @@ celery_app.conf.update(
         "worker.celery.drain_slow_queries": {"queue": "maintenance"},
         "worker.celery.expire_invites": {"queue": "maintenance"},
         "worker.celery.cleanup_old_backups": {"queue": "maintenance"},
+        "worker.celery.execute_ephemeral_semantic_diff": {"queue": "maintenance"},
         # Platform catalogue tasks
         "platform.catalogue.enrich_extension_async": {"queue": "maintenance"},
         "platform.catalogue.refresh_stale_entries": {"queue": "maintenance"},
@@ -965,3 +966,98 @@ def garbage_collect_scratch_schemas():
                 logger.error(f"Garbage Collector failed: {e}")
 
     _run(_sweep())
+
+
+@celery_app.task(name="worker.celery.execute_ephemeral_semantic_diff")
+def execute_ephemeral_semantic_diff(
+    scratch_url: str, 
+    migrations_up_to_from: list[str], 
+    migrations_up_to_to: list[str], 
+    schema_name: str
+) -> dict:
+    """
+    Executes a semantic schema diff inside an ephemeral schema, entirely 
+    offloaded from the FastAPI event loop.
+    """
+    import asyncio
+    
+    # We must run this in a new local event loop because Celery tasks are sync wrappers
+    def _run_sync():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_async_semantic_diff(
+                scratch_url, migrations_up_to_from, migrations_up_to_to, schema_name
+            ))
+        finally:
+            loop.close()
+            
+    return _run_sync()
+
+
+async def _async_semantic_diff(scratch_url: str, migrations_from: list[str], migrations_to: list[str], schema_name: str) -> dict:
+    import asyncpg
+    from uuid import uuid4
+    from domains.schema.diff import run_migra_on_schemas, _parse_sql_to_changes, _DESTRUCTIVE_KINDS
+    from domains.schema.auto_migration import _rewrite_for_schema
+    
+    schema_a = f"_calyphant_diff_a_{uuid4().hex[:8]}"
+    schema_b = f"_calyphant_diff_b_{uuid4().hex[:8]}"
+
+    conn = None
+    try:
+        # Enforce physics: Timeout to prevent zombie connections
+        conn = await asyncpg.connect(dsn=scratch_url, timeout=15)
+        await conn.execute(f'CREATE SCHEMA "{schema_a}"')
+        await conn.execute(f'CREATE SCHEMA "{schema_b}"')
+
+        # Replay "from" state into schema_a
+        for sql in migrations_from:
+            rewritten_sql = _rewrite_for_schema(sql, schema_name, schema_a)
+            await conn.execute(f'SET search_path TO "{schema_a}", public')
+            await conn.execute(rewritten_sql)
+            await conn.execute("RESET search_path")
+
+        # Replay "to" state into schema_b
+        for sql in migrations_to:
+            rewritten_sql = _rewrite_for_schema(sql, schema_name, schema_b)
+            await conn.execute(f'SET search_path TO "{schema_b}", public')
+            await conn.execute(rewritten_sql)
+            await conn.execute("RESET search_path")
+
+        # Run migra via subprocess inside the worker
+        diff_sql = await run_migra_on_schemas(scratch_url, schema_a, schema_b)
+
+        if diff_sql is None:
+            return {"sql": "", "changes": [], "has_destructive_changes": False}
+
+        changes = _parse_sql_to_changes(diff_sql)
+        has_destructive = any(c.kind in _DESTRUCTIVE_KINDS for c in changes)
+
+        return {
+            "sql": diff_sql,
+            "has_destructive_changes": has_destructive,
+            "changes": [
+                {
+                    "kind": c.kind.value,
+                    "object_type": c.object_type,
+                    "object_name": c.object_name,
+                    "table_name": c.table_name,
+                    "detail": c.detail,
+                    "is_destructive": c.is_destructive,
+                    "sql": c.sql
+                } for c in changes
+            ]
+        }
+
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        # Guaranteed cleanup of ephemeral resources
+        if conn:
+            try:
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema_a}" CASCADE')
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema_b}" CASCADE')
+            except Exception:
+                pass
+            await conn.close()

@@ -96,7 +96,27 @@ def _decrypt_snapshot(token: bytes) -> dict:
 
 
 async def _snapshot_set(snapshot_id: str, fingerprint: dict[str, Any]) -> None:
+    """
+    Persist a schema snapshot. Enforces a strict 1-snapshot-per-connection 
+    physical limit to mathematically prevent Redis OOM under malicious load.
+    """
     redis = await _get_redis()
+    connection_id = fingerprint.get("connection_id")
+    
+    if connection_id:
+        # Look up if this connection already has an active snapshot
+        tracker_key = f"calyphant:active_snapshot:{connection_id}"
+        old_snapshot_id_raw = await redis.get(tracker_key)
+        
+        if old_snapshot_id_raw:
+            # Erase the old massive JSON payload first
+            old_snapshot_id = old_snapshot_id_raw.decode()
+            await redis.delete(f"{_SNAPSHOT_KEY_PREFIX}{old_snapshot_id}")
+            
+        # Register the new tracker
+        await redis.setex(tracker_key, _SNAPSHOT_TTL_SECONDS, snapshot_id)
+
+    # Encrypt and store the new payload
     encrypted = _encrypt_snapshot(fingerprint)
     await redis.setex(
         f"{_SNAPSHOT_KEY_PREFIX}{snapshot_id}",
@@ -277,8 +297,6 @@ async def capture_snapshot(
     workspace_id: UUID,
     schema_name: str = "public",
 ) -> str:
-    import asyncio
-
     from core.db import _session_factory
     if not _session_factory:
         raise RuntimeError("Database not initialised.")
@@ -289,12 +307,13 @@ async def capture_snapshot(
     if not db_url:
         raise ValueError("Connection not found or not in this workspace.")
 
-    snapshot = await asyncio.to_thread(introspect_database, db_url, schema_name)
+    # FIX: Directly await the async introspection function
+    snapshot = await introspect_database(db_url, schema_name)
 
     pg_conn: asyncpg.Connection | None = None
     try:
         pg_conn = await asyncpg.connect(dsn=db_url, timeout=15)
-        assert pg_conn is not None  # <-- Add this line to satisfy type checker
+        assert pg_conn is not None  
         table_fingerprint = await _build_table_fingerprint_with_conn(
             snapshot.tables, schema_name, pg_conn
         )
@@ -340,8 +359,6 @@ async def auto_generate_migration(
     label: str | None = None,
     schema_name: str = "public",
 ) -> MigrationRecord | None:
-    import asyncio
-
     fingerprint = await _snapshot_get(snapshot_id)
     if not fingerprint:
         raise ValueError(
@@ -362,14 +379,13 @@ async def auto_generate_migration(
     if not db_url:
         raise ValueError("Connection not found or not in this workspace.")
 
-    live_snapshot = await asyncio.to_thread(
-        introspect_database, db_url, schema_name
-    )
+    # FIX: Directly await the async introspection function
+    live_snapshot = await introspect_database(db_url, schema_name)
 
     pg_conn: asyncpg.Connection | None = None
     try:
         pg_conn = await asyncpg.connect(dsn=db_url, timeout=15)
-        assert pg_conn is not None  # <-- Add this line to satisfy type checker
+        assert pg_conn is not None  
         live_tables = await _build_table_fingerprint_with_conn(
             live_snapshot.tables, schema_name, pg_conn
         )
@@ -552,19 +568,11 @@ async def diff_at_versions_semantic(
     schema_name: str = "public",
 ) -> DiffResult:
     """
-    Full semantic diff using migra against a real scratch database.
-
-    Replays migrations into two temp schemas (schema_a and schema_b) on
-    scratch_url, then calls run_migra_on_schemas() which correctly sets
-    the libpq search_path option on both DSNs before invoking migra.
-
-    The original implementation passed search_path as a URL query
-    parameter (?options=-csearch_path%3D...) which migra ignores.
-    The correct approach is to embed it via the libpq options parameter
-    in a form that migra's psycopg driver decodes:
-        ?options=-c%20search_path%3D<schema>%2Cpublic
-    run_migra_on_schemas() handles this encoding.
+    Full semantic diff using migra. 
+    Offloaded to Celery to prevent API thread starvation.
     """
+    import asyncio  
+    
     all_migrations = await list_migrations(db, connection_id, limit=1000)
     if not all_migrations:
         return DiffResult(
@@ -588,73 +596,62 @@ async def diff_at_versions_semantic(
     elif to_version and to_version in version_to_pos:
         to_pos = version_to_pos[to_version]
 
-    schema_a = f"_calyphant_diff_a_{uuid4().hex[:8]}"
-    schema_b = f"_calyphant_diff_b_{uuid4().hex[:8]}"
+    source_label = from_version or str(from_order_index or "empty")
+    target_label = to_version or str(to_order_index or "latest")
 
-    conn: asyncpg.Connection | None = None
     try:
-        conn = await asyncpg.connect(dsn=scratch_url, timeout=15)
-        assert conn is not None  # <-- Add this line to make mypy happy
-        await conn.execute(f'CREATE SCHEMA "{schema_a}"')
-        await conn.execute(f'CREATE SCHEMA "{schema_b}"')
+        from worker.celery import execute_ephemeral_semantic_diff
+        
+        # 1. Dispatch to Celery background worker
+        # FIX: Added # type: ignore to satisfy Pylance's static analysis of Celery tasks
+        celery_task = execute_ephemeral_semantic_diff.delay(  # type: ignore
+            scratch_url=scratch_url,
+            migrations_up_to_from=[m.up_sql for m in all_migrations[: from_pos + 1]],
+            migrations_up_to_to=[m.up_sql for m in all_migrations[: to_pos + 1]],
+            schema_name=schema_name
+        )
+        
+        # 2. Wait with strict timeout (yields ASGI thread)
+        result_dict = await asyncio.to_thread(celery_task.get, timeout=60.0)
+        
+        if result_dict.get("error"):
+            return DiffResult(source_label=source_label, target_label=target_label, error=result_dict["error"])
 
-        # Replay "from" state into schema_a
-        for m in all_migrations[: from_pos + 1]:
-            sql = _rewrite_for_schema(m.up_sql, schema_name, schema_a)
-            try:
-                await conn.execute(f'SET search_path TO "{schema_a}", public')
-                await conn.execute(sql)
-            except Exception as exc:
-                logger.warning(
-                    f"Semantic diff: replay into schema_a failed for {m.version}: {exc}"
-                )
-            finally:
-                await conn.execute("RESET search_path")
-
-        # Replay "to" state into schema_b
-        for m in all_migrations[: to_pos + 1]:
-            sql = _rewrite_for_schema(m.up_sql, schema_name, schema_b)
-            try:
-                await conn.execute(f'SET search_path TO "{schema_b}", public')
-                await conn.execute(sql)
-            except Exception as exc:
-                logger.warning(
-                    f"Semantic diff: replay into schema_b failed for {m.version}: {exc}"
-                )
-            finally:
-                await conn.execute("RESET search_path")
-
-        # run_migra_on_schemas embeds search_path correctly in both DSNs
-        diff_sql = await run_migra_on_schemas(scratch_url, schema_a, schema_b)
-
-        source_label = from_version or str(from_order_index or "empty")
-        target_label = to_version or str(to_order_index or "latest")
-
-        if diff_sql is None:
-            return DiffResult(source_label=source_label, target_label=target_label)
-
-        changes = _parse_sql_to_changes(diff_sql)
-        has_destructive = any(c.kind in _DESTRUCTIVE_KINDS for c in changes)
+        from domains.schema.diff import SchemaChange, ChangeKind
+        rehydrated_changes = [
+            SchemaChange(
+                kind=ChangeKind(c["kind"]),
+                object_type=c["object_type"],
+                object_name=c["object_name"],
+                table_name=c["table_name"],
+                detail=c["detail"],
+                is_destructive=c["is_destructive"],
+                sql=c["sql"]
+            ) for c in result_dict.get("changes", [])
+        ]
 
         return DiffResult(
             source_label=source_label,
             target_label=target_label,
-            changes=changes,
-            sql=diff_sql,
-            has_destructive_changes=has_destructive,
+            changes=rehydrated_changes,
+            sql=result_dict.get("sql", ""),
+            has_destructive_changes=result_dict.get("has_destructive_changes", False),
         )
 
-    finally:
-        if conn:
-            try:
-                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema_a}" CASCADE')
-                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema_b}" CASCADE')
-            except Exception:
-                pass
-            try:
-                await conn.close()
-            except Exception:
-                pass
+    except asyncio.TimeoutError:
+        return DiffResult(
+            source_label=source_label, 
+            target_label=target_label, 
+            error="Semantic diff timed out. The worker queue is heavily loaded or the schema is too complex."
+        )
+    except Exception as exc:
+        from loguru import logger
+        logger.error(f"Semantic diff celery task failed: {exc}")
+        return DiffResult(
+            source_label=source_label, 
+            target_label=target_label, 
+            error=f"Diff engine failure: {str(exc)}"
+        )
 
 
 def _rewrite_for_schema(sql: str, from_schema: str, to_schema: str) -> str:
