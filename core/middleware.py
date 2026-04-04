@@ -21,6 +21,7 @@ import uuid
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from typing import Callable
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -88,6 +89,64 @@ def _make_limiter() -> Limiter:
 
 
 limiter = _make_limiter()
+
+
+class MaxBodySizeMiddleware:
+    """
+    Pure ASGI middleware to sever connections if the payload exceeds the limit.
+    This runs before FastAPI, Pydantic, or any body parsing begins.
+    Protects the async event loop from CPU-bound starvation.
+    """
+    def __init__(self, app: ASGIApp, max_size: int = 1048576):  # 1MB Hard Limit
+        self.app = app
+        self.max_size = max_size
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        # 1. Fast rejection based on Content-Length header
+        headers = dict(scope.get("headers", []))
+        if b"content-length" in headers:
+            try:
+                content_length = int(headers[b"content-length"])
+                if content_length > self.max_size:
+                    await self._send_413(send)
+                    return
+            except ValueError:
+                pass
+
+        # 2. Dynamic byte counting for chunked transfers
+        total_size = 0
+
+        async def receive_wrapper() -> dict:
+            nonlocal total_size
+            message = await receive()
+            if message["type"] == "http.request":
+                total_size += len(message.get("body", b""))
+                if total_size > self.max_size:
+                    # Abort the stream processing immediately
+                    raise RuntimeError("PAYLOAD_TOO_LARGE")
+            return message
+
+        try:
+            await self.app(scope, receive_wrapper, send)
+        except RuntimeError as exc:
+            if str(exc) == "PAYLOAD_TOO_LARGE":
+                await self._send_413(send)
+                return
+            raise
+
+    async def _send_413(self, send: Callable) -> None:
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [(b"content-type", b"application/json")]
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"detail": "Payload Too Large. Ingress connection severed."}'
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +243,6 @@ def register_middleware(app: FastAPI) -> None:
     Order matters — Starlette applies middleware in reverse registration order,
     so the last registered is the outermost (first to intercept requests).
     """
-    # CORS (registered first = outermost after reversal? No —
-    # CORSMiddleware uses app.add_middleware which prepends, so it ends up
-    # as the true outermost wrapper. That's correct for CORS preflight.)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.CORS_ORIGINS,
@@ -196,14 +252,13 @@ def register_middleware(app: FastAPI) -> None:
         expose_headers=["X-Request-ID", "X-Process-Time"],
     )
 
-    # Timing (inner)
     app.add_middleware(TimingMiddleware)
-
-    # Correlation ID (outer of the two custom middlewares)
     app.add_middleware(CorrelationIDMiddleware)
-
-    # Rate limiting
+    
     app.add_middleware(SlowAPIMiddleware)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore
 
-    logger.info("Middleware: registered (CORS, CorrelationID, Timing, RateLimit)")
+    # THE GATES: Registered LAST so it executes FIRST at the ASGI boundary.
+    app.add_middleware(MaxBodySizeMiddleware, max_size=1048576) # 1MB
+
+    logger.info("Middleware: registered (CORS, CorrelationID, Timing, RateLimit, MaxBodySize)")

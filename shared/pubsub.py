@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import json
 from uuid import UUID
+from pydantic import BaseModel, Field
 
 from loguru import logger
 
@@ -67,13 +68,30 @@ def _channel(workspace_id: UUID) -> str:
     return f"{_CHANNEL_PREFIX}{workspace_id}"
 
 
+
+class SignalEvent(BaseModel):
+    """
+    The only payload structure permitted on the Pub/Sub bus.
+    State must not be transferred over Redis or WebSockets.
+    
+    UI BEHAVIOR:
+    When the UI receives this payload over a WebSocket frame, it MUST trigger 
+    a rate-limited HTTP GET request to the appropriate endpoint using the 
+    entity_id to hydrate the updated state.
+    """
+    event: str = Field(..., max_length=64, description="Signal identifier e.g., 'schema_updated'")
+    workspace_id: UUID
+    entity_id: str | None = Field(default=None, max_length=64, description="Target entity to fetch via HTTP")
+    role: str | None = Field(default=None, max_length=32, description="Target context if needed")
+
+
 # ---------------------------------------------------------------------------
 # Publish
 # ---------------------------------------------------------------------------
 
-async def publish(workspace_id: UUID, event: dict) -> None:
+async def publish(workspace_id: UUID, event: SignalEvent) -> None:
     """
-    Publish a workspace event.
+    Publish a workspace signal.
 
     1. Publishes to Redis so all workers receive it via their subscriber.
     2. Also broadcasts directly to local ws_manager connections so the
@@ -91,7 +109,8 @@ async def publish(workspace_id: UUID, event: dict) -> None:
     try:
         from core.db import get_pubsub_redis
         redis = await get_pubsub_redis()
-        payload = json.dumps(event, default=str)
+        # Serialize the strict Pydantic model, not an arbitrary dict
+        payload = event.model_dump_json() 
         await redis.publish(_channel(workspace_id), payload)
     except Exception as exc:
         # Redis unavailable — local broadcast above already handled it.
@@ -135,9 +154,6 @@ async def _run_subscriber() -> None:
     """
     Inner subscriber loop. Subscribes to the wildcard pattern and
     dispatches events to ws_manager.broadcast_local().
-
-    Uses PSUBSCRIBE (pattern subscribe) so a single subscription covers
-    all workspace channels without needing to know workspace IDs upfront.
     """
     from core.db import get_pubsub_redis
     from domains.teams.service import ws_manager
@@ -145,7 +161,6 @@ async def _run_subscriber() -> None:
     try:
         redis = await get_pubsub_redis()
     except RuntimeError:
-        # Redis not available — log once and return so the caller retries
         logger.warning(
             "PubSub: Redis unavailable — subscriber will retry. "
             "Multi-worker WS broadcast is disabled until Redis reconnects."
@@ -153,7 +168,6 @@ async def _run_subscriber() -> None:
         await asyncio.sleep(_RECONNECT_DELAY)
         return
 
-    # Create a dedicated pubsub object on this client
     pubsub = redis.pubsub()
     pattern = f"{_CHANNEL_PREFIX}*"
     await pubsub.psubscribe(pattern)
@@ -166,18 +180,13 @@ async def _run_subscriber() -> None:
 
             msg_type = message.get("type")
 
-            # psubscribe confirmation — not a real message
-            if msg_type == "psubscribe":
-                continue
-
-            if msg_type != "pmessage":
+            if msg_type == "psubscribe" or msg_type != "pmessage":
                 continue
 
             channel: bytes | str = message.get("channel", b"")
             if isinstance(channel, bytes):
                 channel = channel.decode()
 
-            # Extract workspace_id from channel name
             if not channel.startswith(_CHANNEL_PREFIX):
                 continue
 
@@ -193,13 +202,13 @@ async def _run_subscriber() -> None:
                 raw = raw.decode()
 
             try:
-                event = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(f"PubSub: could not decode message on {channel}")
+                raw_dict = json.loads(raw)
+                event = SignalEvent(**raw_dict)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                logger.warning(f"PubSub: dropped invalid/oversized signal on {channel}: {exc}")
                 continue
 
             # Fan out to WebSocket clients connected to this worker
-            # broadcast_local skips Redis to avoid infinite loop
             await ws_manager.broadcast_local(workspace_id, event)
 
     except asyncio.CancelledError:

@@ -73,6 +73,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from core.auth import CurrentUser
 from core.db import get_db, get_db_context
 from shared.types import Base
+from shared.pubsub import SignalEvent
 
 
 # ---------------------------------------------------------------------------
@@ -568,16 +569,9 @@ async def notify_workspace_members(
 class WorkspaceConnectionManager:
     """
     Manages WebSocket connections for this worker process only.
-
-    broadcast_local — deliver to connections on THIS worker (no Redis)
-    broadcast       — full fan-out via Redis pub/sub (all workers)
-
-    Always call broadcast() from domain code. Only the pub/sub subscriber
-    calls broadcast_local() to avoid infinite loops.
     """
 
     def __init__(self) -> None:
-        # workspace_id (str) → set of active WebSocket connections
         self._connections: dict[str, set[WebSocket]] = {}
 
     async def connect(self, workspace_id: UUID, ws: WebSocket) -> None:
@@ -597,14 +591,14 @@ class WorkspaceConnectionManager:
             f"WS disconnected: workspace={workspace_id} remaining={remaining}"
         )
 
-    async def broadcast_local(self, workspace_id: UUID, event: dict[str, Any]) -> None:
+    async def broadcast_local(self, workspace_id: UUID, event: SignalEvent) -> None:
         """
-        Deliver event to all WebSocket connections on THIS worker process.
+        Deliver signal to all WebSocket connections on THIS worker process.
         Does NOT publish to Redis — use broadcast() for cross-worker delivery.
         """
         key = str(workspace_id)
         dead: set[WebSocket] = set()
-        payload = json.dumps(event, default=str)
+        payload = event.model_dump_json()
 
         for ws in list(self._connections.get(key, set())):
             try:
@@ -615,13 +609,10 @@ class WorkspaceConnectionManager:
         for ws in dead:
             self._connections.get(key, set()).discard(ws)
 
-    async def broadcast(self, workspace_id: UUID, event: dict[str, Any]) -> None:
+    async def broadcast(self, workspace_id: UUID, event: SignalEvent) -> None:
         """
         Full broadcast: publishes to Redis (all workers) AND delivers
         locally to connections on this worker.
-
-        This is the method domain code should always call.
-        Falls back to broadcast_local if Redis is unavailable.
         """
         from shared.pubsub import publish
         await publish(workspace_id, event)
@@ -695,20 +686,17 @@ router = APIRouter(prefix="/teams", tags=["teams"])
 class CreateWorkspaceRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
 
-
 class InviteRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr = Field(..., max_length=255)
     role: WorkspaceRole = WorkspaceRole.viewer
-
 
 class ChangeRoleRequest(BaseModel):
     role: WorkspaceRole
 
-
 class CreateShareLinkRequest(BaseModel):
     label: str = Field(default="Share link", max_length=120)
     expires_in_days: int | None = Field(default=None, ge=1, le=365)
-    max_uses: int | None = Field(default=None, ge=1)
+    max_uses: int | None = Field(default=None, ge=1, le=100000)
 
 
 async def _require_role(
@@ -759,7 +747,7 @@ async def delete_workspace_endpoint(
 
     asyncio.create_task(ws_manager.broadcast(
         workspace_id,
-        {"event": "workspace_deleted", "workspace_id": str(workspace_id)},
+        SignalEvent(event="workspace_deleted", workspace_id=workspace_id)
     ))
 
 
@@ -837,7 +825,12 @@ async def accept_workspace_invite(
 
     asyncio.create_task(ws_manager.broadcast(
         member.workspace_id,
-        {"event": "member_joined", "user_id": str(user.id), "role": member.role},
+        SignalEvent(
+            event="member_joined", 
+            workspace_id=member.workspace_id, 
+            entity_id=str(user.id), 
+            role=member.role
+        )
     ))
 
     asyncio.create_task(notify_workspace_members(
@@ -896,7 +889,11 @@ async def remove_workspace_member(
 
     asyncio.create_task(ws_manager.broadcast(
         workspace_id,
-        {"event": "member_left", "user_id": str(target_user_id)},
+        SignalEvent(
+            event="member_left", 
+            workspace_id=workspace_id, 
+            entity_id=str(target_user_id)
+        )
     ))
 
 
@@ -921,7 +918,11 @@ async def leave_workspace_endpoint(
 
     asyncio.create_task(ws_manager.broadcast(
         workspace_id,
-        {"event": "member_left", "user_id": str(user.id)},
+        SignalEvent(
+            event="member_left", 
+            workspace_id=workspace_id, 
+            entity_id=str(user.id)
+        )
     ))
 
 
