@@ -5,28 +5,27 @@ Tables router.
 
 Endpoints — Row CRUD:
   GET    /tables/{connection_id}                              — list tables
-  POST   /tables/{connection_id}/{table}/rows/query          — fetch rows (paginated)
-  GET    /tables/{connection_id}/{table}/stream              — SSE stream
-  POST   /tables/{connection_id}/{table}/rows                — insert row
-  PATCH  /tables/{connection_id}/{table}/rows/{pk}           — update row
-  DELETE /tables/{connection_id}/{table}/rows/{pk}           — delete row (two-phase)
-  POST   /tables/{connection_id}/{table}/rows/bulk-delete    — bulk delete (two-phase)
-  POST   /tables/{connection_id}/{table}/rows/bulk-update    — bulk update (two-phase)
-  POST   /tables/{connection_id}/{table}/rows/{pk}/undo      — undo last update
-  GET    /tables/{connection_id}/{table}/pk                  — detect primary key
+  POST   /tables/{connection_id}/{table}/rows/query           — fetch rows (paginated)
+  GET    /tables/{connection_id}/{table}/stream               — SSE stream
+  POST   /tables/{connection_id}/{table}/rows                 — insert row
+  PATCH  /tables/{connection_id}/{table}/rows/{pk}            — update row
+  DELETE /tables/{connection_id}/{table}/rows/{pk}            — delete row (two-phase)
+  POST   /tables/{connection_id}/{table}/rows/bulk-delete     — bulk delete (two-phase)
+  POST   /tables/{connection_id}/{table}/rows/bulk-update     — bulk update (two-phase)
+  POST   /tables/{connection_id}/{table}/rows/{pk}/undo       — undo last update
+  GET    /tables/{connection_id}/{table}/pk                   — detect primary key
 
 Endpoints — Row editing presence (SAFETY-10):
-  POST   /tables/{connection_id}/{table}/rows/{pk}/lock      — claim edit intent
-  DELETE /tables/{connection_id}/{table}/rows/{pk}/lock      — release edit intent
-  PUT    /tables/{connection_id}/{table}/rows/{pk}/lock      — renew (heartbeat)
-  GET    /tables/{connection_id}/{table}/locks               — list active locks
+  POST   /tables/{connection_id}/{table}/rows/{pk}/lock       — claim edit intent
+  DELETE /tables/{connection_id}/{table}/rows/{pk}/lock       — release edit intent
+  PUT    /tables/{connection_id}/{table}/rows/{pk}/lock       — renew (heartbeat)
+  GET    /tables/{connection_id}/{table}/locks                — list active locks
 
-Endpoints — Data Import:
-  POST   /tables/{connection_id}/import/parse                — parse file, return preview
-  POST   /tables/{connection_id}/import/execute              — execute confirmed import
-  GET    /tables/{connection_id}/{table}/export/csv          — export table as CSV
-  GET    /tables/{connection_id}/{table}/export/json         — export table as JSON
-  POST   /tables/{connection_id}/import/sheets               — list Excel sheets
+Endpoints — Data Import (Chunked Ingestion Architecture):
+  POST   /tables/{connection_id}/import/init                  — initialize import session & schema
+  POST   /tables/{connection_id}/import/chunk                 — ingest up to 5,000 rows
+  GET    /tables/{connection_id}/{table}/export/csv           — export table as CSV
+  GET    /tables/{connection_id}/{table}/export/json          — export table as JSON
 
 HTTP status mapping for concurrency errors
 ------------------------------------------
@@ -36,6 +35,13 @@ DuplicateRowError → 409 {"detail": {"message": str, "constraint": str, "db_det
 
 Changes
 -------
+DATA-INGESTION-REFACTOR
+    File parsing (CSV/JSON/Excel) and type inference have been shifted strictly 
+    to the frontend (Svelte client). The old `/import/parse` and `/import/execute` 
+    endpoints have been removed to prevent Python OOM crashes and Gzip bomb vectors.
+    Data is now ingested via a high-speed, chunked `/import/chunk` endpoint limited
+    to 5,000 rows per request.
+
 STREAM-LEAK-2
     The table SSE stream endpoint previously opened a raw asyncpg connection
     inside an async generator. On client disconnect the finally block might
@@ -50,28 +56,11 @@ SAFETY-11 (bulk_update dry-run)
     BulkUpdateRequest now includes confirmed: bool = False.
 
     When confirmed=False (new default):
-        Returns a preview of what would change without writing anything:
-          {
-            "confirmed": False,
-            "preview": [{
-              "pk": ...,
-              "status": "would_update" | "not_found" | "locked" | "stale",
-              "current": {...},
-              "proposed": {...},
-              "changes": {"col": {"from": old, "to": new}},
-              "lock_holder": {...} | None,
-              "stale_conflicts": [...]
-            }],
-            "summary": {"would_update": N, "not_found": N, "locked": N, "stale": N}
-          }
+        Returns a preview of what would change without writing anything.
 
     When confirmed=True:
         Executes the update (original behaviour). The 409 responses for
         RowLockConflict and StaleRowError remain unchanged.
-
-    Important: this is a BREAKING CHANGE for existing callers that call
-    bulk-update without setting confirmed=true. Existing callers must add
-    confirmed=true to retain the old execute-immediately behaviour.
 
 SAFETY-12 (undo)
     New endpoint: POST /tables/{connection_id}/{table}/rows/{pk}/undo
@@ -82,16 +71,9 @@ SAFETY-12 (undo)
 PK type coercion
 ----------------
 pk_value arrives as a plain string from the URL path (e.g. /rows/3).
-asyncpg is strict about types — passing "3" for an INTEGER column raises:
-  invalid input for query argument $1: '3' ('str' object cannot be
-  interpreted as an integer)
-
-_coerce_pk() queries information_schema.columns for the actual data type
-of the pk_column and casts the string accordingly before it reaches any
-asyncpg call. Supported casts: integer/bigint/smallint → int,
-numeric/decimal/real/double → float, uuid → uuid.UUID, everything else
-stays as str. Called at the top of every endpoint that takes a pk_value
-path parameter.
+asyncpg is strict about types. _coerce_pk() queries information_schema.columns 
+for the actual data type of the pk_column and casts the string accordingly before 
+it reaches any asyncpg call.
 """
 
 from __future__ import annotations
@@ -142,15 +124,8 @@ from domains.tables.editor import (
     update_row,
 )
 from domains.tables.importer import (
-    ConflictStrategy,
-    ColumnMapping,
-    build_column_mappings,
-    execute_import,
-    parse_file,
-    preview_import,
     rows_to_csv,
     rows_to_json,
-    MAX_FILE_SIZE_BYTES,
 )
 from domains.tables.presence import (
     claim_row_lock,
@@ -251,21 +226,27 @@ class BulkUpdateRequest(BaseModel):
 # Schemas — Import
 # ---------------------------------------------------------------------------
 
-class ColumnMappingRequest(BaseModel):
-    source_name: str
-    target_name: str
-    inferred_type: str
-    skip: bool = False
+class ImportInitRequest(BaseModel):
+    table_name: str = Field(..., pattern=r"^[a-zA-Z0-9_]+$")
+    schema_name: str = Field(default="public", pattern=r"^[a-zA-Z0-9_]+$")
+    columns: list[str]
+    total_expected_rows: int = Field(ge=1)
 
 
-class ImportExecuteRequest(BaseModel):
-    table_name: str
-    schema_name: str = "public"
-    column_mappings: list[ColumnMappingRequest]
-    conflict_strategy: ConflictStrategy = ConflictStrategy.skip
-    pk_column: str | None = None
-    create_table_if_missing: bool = True
-    parse_session_id: str
+class ImportChunkRequest(BaseModel):
+    import_session_id: UUID
+    chunk_index: int = Field(ge=0)
+    # HARD LIMIT: Maximum 5000 rows per HTTP request to prevent memory spikes
+    rows: list[dict[str, Any]] = Field(..., min_length=1, max_length=5000)
+
+    @model_validator(mode='after')
+    def validate_row_keys(self) -> "ImportChunkRequest":
+        # Defend against SQL injection in JSON keys
+        for row in self.rows:
+            for key in row.keys():
+                if not _ID_REGEX_COMPILED.match(key):
+                    raise ValueError(f"Invalid column name '{key}' in chunk payload.")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -1100,203 +1081,121 @@ async def list_row_locks_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Import routes
+# Import routes (Streaming / Chunked Architecture)
 # ---------------------------------------------------------------------------
 
-@router.post("/{connection_id}/import/parse")
-async def parse_import_file(
+@router.post("/{connection_id}/import/init", status_code=status.HTTP_200_OK)
+async def init_chunked_import(
     connection_id: UUID,
+    body: ImportInitRequest,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    file: UploadFile = File(..., description="CSV, JSON, or Excel file to import"),
-    table_name: str = Form(..., description="Target table name"),
-    schema_name: str = Form(default="public"),
-    sheet_name: str | None = Form(default=None, description="Excel sheet name (optional)"),
 ):
-    """Phase 1 of import: parse the uploaded file and return a preview."""
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum is {MAX_FILE_SIZE_BYTES // 1024 // 1024} MB.",
-        )
-
-    filename = file.filename or "upload"
-
-    try:
-        parsed = parse_file(data, filename, sheet_name=sheet_name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse file: {exc}")
-
-    if not parsed.rows:
-        raise HTTPException(status_code=400, detail="File is empty or contains no data rows.")
-
+    """Phase 1: Validates target table, retrieves column types, and initializes the session."""
+    from core.db import get_redis
+    
     pg_conn = await _pg(connection_id, user.workspace_id, db)
     try:
-        preview = await preview_import(pg_conn, parsed, table_name, schema_name)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        # Verify table exists and grab exact column data types for coercion
+        rows = await pg_conn.fetch(
+            """
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_schema = $1 AND table_name = $2
+            """,
+            body.schema_name, body.table_name,
+        )
+        if not rows:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Table '{body.schema_name}.{body.table_name}' not found. Please create it first."
+            )
+            
+        # Map existing columns to their postgres types
+        db_columns = {r["column_name"]: r["data_type"] for r in rows}
+        
+        # Ensure all columns sent by frontend actually exist in the DB table
+        for col in body.columns:
+            if col not in db_columns:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Column '{col}' does not exist in target table."
+                )
+
+        # We only store the types for the columns the frontend intends to send
+        column_types = {col: db_columns[col] for col in body.columns}
+
     finally:
         await pg_conn.close()
 
     session_id = str(uuid4())
     session_data = {
-        "rows": parsed.rows,
-        "column_names": parsed.column_names,
-        "total_rows": parsed.total_rows,
-        "format": parsed.format,
+        "table_name": body.table_name,
+        "schema_name": body.schema_name,
+        "columns": body.columns,
+        "column_types": column_types,
         "connection_id": str(connection_id),
-        "workspace_id": str(user.workspace_id),
-        "table_name": table_name,
-        "schema_name": schema_name,
+        "workspace_id": str(user.workspace_id)
     }
 
-    await _store_parse_session(session_id, session_data)
+    # Store lightweight state in Redis (TTL 1 hour)
+    redis = await get_redis()
+    await redis.setex(f"calyphant:import_session:{session_id}", 3600, json.dumps(session_data))
 
     return {
-        "parse_session_id": session_id,
-        "filename": filename,
-        "format": parsed.format,
-        "total_rows": parsed.total_rows,
-        "table_name": table_name,
-        "schema_name": schema_name,
-        "table_exists": preview.table_exists,
-        "column_mappings": [
-            {
-                "source_name": m.source_name,
-                "target_name": m.target_name,
-                "inferred_type": m.inferred_type,
-                "skip": m.skip,
-                "sample_values": [str(v) for v in m.sample_values],
-                "null_count": m.null_count,
-                "non_null_count": m.non_null_count,
-                "null_pct": round(
-                    m.null_count / (m.null_count + m.non_null_count) * 100, 1
-                ) if (m.null_count + m.non_null_count) > 0 else 0,
-            }
-            for m in preview.column_mappings
-        ],
-        "sample_rows": preview.sample_rows,
-        "table_columns": preview.table_columns,
-        "warnings": preview.warnings,
-        "session_expires_in_seconds": _PARSE_SESSION_TTL,
+        "import_session_id": session_id,
+        "chunk_size_limit": 5000,
+        "status": "ready_for_chunks"
     }
 
 
-@router.post("/{connection_id}/import/execute")
-async def execute_import_endpoint(
+@router.post("/{connection_id}/import/chunk", status_code=status.HTTP_202_ACCEPTED)
+async def process_import_chunk(
     connection_id: UUID,
-    body: ImportExecuteRequest,
+    body: ImportChunkRequest,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    """Phase 2 of import: execute the confirmed import."""
-    session = await _load_parse_session(body.parse_session_id)
-    if not session:
+    """Phase 2: Receives up to 5,000 rows, coerces types, and executes a high-speed bulk insert."""
+    from core.db import get_redis
+    from domains.tables.importer import execute_import_chunk
+    
+    redis = await get_redis()
+    raw_session = await redis.get(f"calyphant:import_session:{str(body.import_session_id)}")
+    
+    if not raw_session:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Import session not found or expired (30-minute TTL). "
-                "Please re-upload your file and start the import again."
-            ),
+            status_code=404, 
+            detail="Import session expired or invalid. Please re-initialize."
         )
-
-    if (
-        session.get("connection_id") != str(connection_id)
-        or session.get("workspace_id") != str(user.workspace_id)
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Import session does not belong to this connection.",
-        )
-
-    from domains.tables.importer import ParsedFile
-    parsed = ParsedFile(
-        rows=session["rows"],
-        column_names=session["column_names"],
-        total_rows=session["total_rows"],
-        format=session["format"],
-    )
-
-    mappings = [
-        ColumnMapping(
-            source_name=m.source_name,
-            target_name=m.target_name,
-            inferred_type=m.inferred_type,
-            skip=m.skip,
-        )
-        for m in body.column_mappings
-    ]
+        
+    session = json.loads(raw_session)
+    
+    # Security Check: Ensure chunk belongs to this exact user/connection
+    if session["connection_id"] != str(connection_id) or session["workspace_id"] != str(user.workspace_id):
+        raise HTTPException(status_code=403, detail="Session mismatch.")
 
     pg_conn = await _pg(connection_id, user.workspace_id, db)
     try:
-        result = await execute_import(
+        inserted = await execute_import_chunk(
             pg_conn=pg_conn,
-            parsed=parsed,
-            table_name=body.table_name,
-            schema=body.schema_name,
-            column_mappings=mappings,
-            conflict_strategy=body.conflict_strategy,
-            pk_column=body.pk_column,
-            create_table_if_missing=body.create_table_if_missing,
+            table_name=session["table_name"],
+            schema=session["schema_name"],
+            columns=session["columns"],
+            column_types=session["column_types"],
+            rows=body.rows,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Import failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Database insertion failed: {exc}")
     finally:
         await pg_conn.close()
 
-    await _delete_parse_session(body.parse_session_id)
-
     return {
-        "success": True,
-        "table_name": body.table_name,
-        "schema_name": body.schema_name,
-        "table_created": result.table_created,
-        "total": result.total,
-        "inserted": result.inserted,
-        "updated": result.updated,
-        "skipped": result.skipped,
-        "error_count": len(result.errors),
-        "errors": result.errors[:100],
-        "duration_ms": result.duration_ms,
-        "rows_per_second": (
-            round(result.total / (result.duration_ms / 1000))
-            if result.duration_ms > 0 else 0
-        ),
-    }
-
-
-@router.post("/{connection_id}/import/sheets")
-async def list_excel_sheets(
-    connection_id: UUID,
-    user: CurrentUser,
-    file: UploadFile = File(..., description="Excel file (.xlsx or .xls)"),
-):
-    """List all sheet names in an Excel file before import."""
-    filename = file.filename or ""
-    if not filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(
-            status_code=400,
-            detail="File must be an Excel file (.xlsx or .xls).",
-        )
-
-    data = await file.read()
-    try:
-        import io
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
-        sheets = wb.sheetnames
-        wb.close()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {exc}")
-
-    return {
-        "sheets": sheets,
-        "default_sheet": sheets[0] if sheets else None,
+        "chunk_index": body.chunk_index,
+        "inserted": inserted,
+        "status": "accepted"
     }
 
 
