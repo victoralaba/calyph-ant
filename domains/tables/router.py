@@ -249,6 +249,21 @@ class ImportExecuteRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Strict Identifiers (SQL Injection Armor)
+# ---------------------------------------------------------------------------
+from typing import Annotated
+from fastapi import Path, Query
+
+# UI CONSIDERATION: The frontend UI must strictly enforce that table names
+# and schema names only contain alphanumeric characters and underscores.
+# Do not allow users to input spaces, dashes, or special characters when 
+# creating or querying tables. If they do, the API will automatically reject
+# it with a 422 Unprocessable Entity before it ever touches the database.
+TablePath = Annotated[str, Path(pattern=r"^[a-zA-Z0-9_]+$")]
+SchemaQuery = Annotated[str, Query(default="public", pattern=r"^[a-zA-Z0-9_]+$")]
+
+
+# ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
 
@@ -926,19 +941,44 @@ async def get_primary_key(
 )
 async def claim_row_lock_endpoint(
     connection_id: UUID,
-    table_name: str,
+    table_name: TablePath,
     pk_value: str,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    schema_name: str = Query("public"),
+    schema_name: SchemaQuery = "public",
 ):
     """
-    Claim editing intent for a row. Returns conflict info if another
-    user has already claimed it.
+    Claim editing intent for a row with Hard Constraints (DoS Protection).
     """
     if not user.workspace_id:
         raise HTTPException(status_code=400, detail="Workspace ID is required.")
     
+    # --- DOS PROTECTION: The Physics of Scaling ---
+    # UI CONSIDERATION: If a user tries to bulk-edit and opens 50+ tabs, the UI MUST
+    # gracefully handle the 429 Too Many Requests response. Show a toast explaining
+    # that they have reached their concurrent editing limit and need to close some tabs.
+    MAX_CONCURRENT_LOCKS = 50
+    active_locks = await list_table_locks(
+        connection_id=connection_id,
+        schema=schema_name,
+        table=table_name,
+    )
+    
+    # Count how many locks this specific user currently holds on this table
+    user_lock_count = sum(
+        1 for lock in active_locks 
+        if lock and lock.get("user_id") == str(user.id)
+    )
+    if user_lock_count >= MAX_CONCURRENT_LOCKS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"You have reached the maximum limit of {MAX_CONCURRENT_LOCKS} "
+                "concurrent row locks. Please release some edits or refresh your active sessions."
+            )
+        )
+    # ----------------------------------------------
+
     result = await claim_row_lock(
         connection_id=connection_id,
         schema=schema_name,
@@ -1234,32 +1274,55 @@ async def list_excel_sheets(
 
 
 # ---------------------------------------------------------------------------
-# Export routes
+# Export routes (Zero-Memory Streaming Implementation)
 # ---------------------------------------------------------------------------
 
 @router.get("/{connection_id}/{table_name}/export/csv")
 async def export_table_csv(
     connection_id: UUID,
-    table_name: str,
+    table_name: TablePath,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    schema_name: str = Query("public"),
+    schema_name: SchemaQuery = "public",
     limit: int = Query(100_000, le=500_000),
 ):
-    """Export table data as CSV (up to 500,000 rows)."""
+    """Export table data as CSV via streaming to prevent Python OOM crashes."""
+    import csv
     import io
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
-    try:
-        query = TableQuery(table=table_name, schema=schema_name, limit=limit, offset=0)
-        result = await fetch_rows(pg_conn, query)
-        rows = result["rows"]
-        columns = result["columns"]
-    finally:
-        await pg_conn.close()
 
-    csv_bytes = rows_to_csv(rows, columns)
+    url = await _get_url(connection_id, user.workspace_id, db)
+    query = TableQuery(table=table_name, schema=schema_name, limit=limit, offset=0)
+
+    async def _stream_csv() -> AsyncGenerator[str, None]:
+        # Connect once and use a server-side cursor to sip the data
+        async with _managed_pg_conn(url) as pg_conn:
+            header_written = False
+            
+            async for chunk in stream_table(pg_conn, query, chunk_size=1000):
+                if not chunk["rows"]:
+                    continue
+                
+                output = io.StringIO()
+                # UI CONSIDERATION: The exported CSV uses standard comma separation.
+                # If users complain about Excel formatting on Windows, it is an Excel
+                # UTF-8 BOM issue, not a data issue. The data is structurally perfect.
+                writer = csv.DictWriter(output, fieldnames=chunk["rows"][0].keys())
+                
+                if not header_written:
+                    writer.writeheader()
+                    header_written = True
+                    
+                writer.writerows(chunk["rows"])
+                
+                # Yield the string chunk directly to the network socket
+                yield output.getvalue()
+                
+                # Truncate to keep memory footprint flat at exactly 1000 rows
+                output.seek(0)
+                output.truncate(0)
+
     return StreamingResponse(
-        io.BytesIO(csv_bytes),
+        _stream_csv(),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{table_name}.csv"'},
     )
@@ -1268,25 +1331,45 @@ async def export_table_csv(
 @router.get("/{connection_id}/{table_name}/export/json")
 async def export_table_json(
     connection_id: UUID,
-    table_name: str,
+    table_name: TablePath,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    schema_name: str = Query("public"),
+    schema_name: SchemaQuery = "public",
     limit: int = Query(100_000, le=500_000),
 ):
-    """Export table data as JSON array."""
-    import io
-    pg_conn = await _pg(connection_id, user.workspace_id, db)
-    try:
-        query = TableQuery(table=table_name, schema=schema_name, limit=limit, offset=0)
-        result = await fetch_rows(pg_conn, query)
-        rows = result["rows"]
-    finally:
-        await pg_conn.close()
+    """Export table data as JSON array via streaming to prevent Python OOM crashes."""
+    import json
 
-    json_bytes = rows_to_json(rows)
+    url = await _get_url(connection_id, user.workspace_id, db)
+    query = TableQuery(table=table_name, schema=schema_name, limit=limit, offset=0)
+
+    async def _stream_json() -> AsyncGenerator[str, None]:
+        yield "[\n"  # Open the JSON array
+        
+        first_chunk = True
+        async with _managed_pg_conn(url) as pg_conn:
+            async for chunk in stream_table(pg_conn, query, chunk_size=1000):
+                if not chunk["rows"]:
+                    continue
+                    
+                # Serialize chunk, then strip the outer brackets `[` and `]` 
+                # so we can stitch multiple JSON lists together into one continuous stream.
+                chunk_json = json.dumps(chunk["rows"], default=str)
+                inner_json = chunk_json[1:-1]
+                
+                if not inner_json.strip():
+                    continue
+
+                if not first_chunk:
+                    yield ",\n" + inner_json
+                else:
+                    yield inner_json
+                    first_chunk = False
+                    
+        yield "\n]"  # Close the JSON array
+
     return StreamingResponse(
-        io.BytesIO(json_bytes),
+        _stream_json(),
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{table_name}.json"'},
     )
