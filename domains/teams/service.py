@@ -569,6 +569,7 @@ async def notify_workspace_members(
 class WorkspaceConnectionManager:
     """
     Manages WebSocket connections for this worker process only.
+    Acts as the Source of Truth for the Dynamic Subscription Matrix.
     """
 
     def __init__(self) -> None:
@@ -577,24 +578,33 @@ class WorkspaceConnectionManager:
     async def connect(self, workspace_id: UUID, ws: WebSocket) -> None:
         await ws.accept()
         key = str(workspace_id)
+
+        # Evaluate if this worker needs to tell Redis to start routing this traffic
+        is_first_connection = key not in self._connections or len(self._connections[key]) == 0
+        
         self._connections.setdefault(key, set()).add(ws)
+        
+        if is_first_connection:
+            from shared.pubsub import subscribe_workspace
+            # Fire-and-forget task so we don't block the WebSocket handshake
+            asyncio.create_task(subscribe_workspace(workspace_id))
+
         logger.debug(
             f"WS connected: workspace={workspace_id} "
             f"total={len(self._connections[key])}"
         )
 
     def disconnect(self, workspace_id: UUID, ws: WebSocket) -> None:
+        """Synchronous cleanup called in the finally block of the router."""
         key = str(workspace_id)
-        self._connections.get(key, set()).discard(ws)
-        remaining = len(self._connections.get(key, set()))
-        logger.debug(
-            f"WS disconnected: workspace={workspace_id} remaining={remaining}"
-        )
+        if key in self._connections:
+            self._connections[key].discard(ws)
+            self._cleanup_if_empty(workspace_id)
 
     async def broadcast_local(self, workspace_id: UUID, event: SignalEvent) -> None:
         """
         Deliver signal to all WebSocket connections on THIS worker process.
-        Does NOT publish to Redis — use broadcast() for cross-worker delivery.
+        Does NOT publish to Redis. Automatically evicts dead TCP sockets.
         """
         key = str(workspace_id)
         dead: set[WebSocket] = set()
@@ -606,13 +616,29 @@ class WorkspaceConnectionManager:
             except Exception:
                 dead.add(ws)
 
-        for ws in dead:
-            self._connections.get(key, set()).discard(ws)
+        # Clean up sockets that died without a graceful close frame
+        if dead:
+            for ws in dead:
+                self._connections.get(key, set()).discard(ws)
+            self._cleanup_if_empty(workspace_id)
+
+    def _cleanup_if_empty(self, workspace_id: UUID) -> None:
+        """
+        Garbage collects the dictionary key and severs the Redis link 
+        if no active users remain for this workspace.
+        """
+        key = str(workspace_id)
+        conns = self._connections.get(key)
+        
+        if conns is not None and len(conns) == 0:
+            self._connections.pop(key, None)
+            from shared.pubsub import unsubscribe_workspace
+            asyncio.create_task(unsubscribe_workspace(workspace_id))
+            logger.debug(f"WS disconnected: workspace={workspace_id} (0 remaining. Redis unsubscribed.)")
 
     async def broadcast(self, workspace_id: UUID, event: SignalEvent) -> None:
         """
-        Full broadcast: publishes to Redis (all workers) AND delivers
-        locally to connections on this worker.
+        Full broadcast: routes through shared/pubsub.py for cluster-wide delivery.
         """
         from shared.pubsub import publish
         await publish(workspace_id, event)

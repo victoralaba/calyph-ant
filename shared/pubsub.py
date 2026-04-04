@@ -2,71 +2,52 @@
 """
 Redis-backed pub/sub for WebSocket broadcast coordination.
 
-Problem
--------
-`ws_manager` in domains/teams/service.py is an in-memory dict. With
-multiple uvicorn workers (or multiple replicas), each process has its
-own dict. A schema change event published by worker-1 never reaches
-WebSocket clients connected to worker-2.
+Dynamic Subscription Matrix
+---------------------------
+Unlike legacy wildcard fanouts (psubscribe), this module maintains a strict,
+in-memory registry of active workspaces relevant ONLY to this specific Uvicorn 
+worker. 
 
-Solution
---------
-Every event goes through Redis pub/sub:
+When the first user for Workspace A connects to Worker 1, Worker 1 issues a 
+precise SUBSCRIBE to Redis. When the last user disconnects, it issues an UNSUBSCRIBE.
+This prevents O(N) event parsing at scale.
 
-  Publisher  (any worker): publish(workspace_id, event)
-             → PUBLISH calyphant:ws:{workspace_id} <json>
-
-  Subscriber (every worker): a background task runs listen_and_broadcast()
-             → SUBSCRIBE calyphant:ws:*
-             → on message: fan out to local ws_manager connections
-
-This means every worker receives every event and delivers it to whichever
-clients happen to be connected to that worker. No event is ever lost as
-long as at least one subscriber is alive when the publish happens (Redis
-pub/sub is fire-and-forget — for durability under restarts, use Redis
-Streams, but pub/sub is sufficient for ephemeral UI notifications).
-
-Graceful degradation
---------------------
-If Redis is unavailable, publish() falls back to direct local broadcast
-via ws_manager. This means single-process deployments work without Redis,
-and multi-process deployments degrade to per-process delivery rather than
-crashing.
-
-Usage
------
-In main.py lifespan:
-
-    from shared.pubsub import start_pubsub_listener
-    listener_task = asyncio.create_task(start_pubsub_listener())
-
-In domain code, replace direct ws_manager.broadcast() with:
-
-    from shared.pubsub import publish
-    await publish(workspace_id, event_dict)
-
-The publish() function handles both Redis fanout (multi-worker) and
-direct local broadcast fallback (single-worker / Redis down).
+Resilience
+----------
+If Redis restarts, `_run_subscriber` reads `_local_subscriptions` and instantly
+re-subscribes to all active channels upon recovery. No signals are permanently lost.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from uuid import UUID
 from pydantic import BaseModel, Field
 
 from loguru import logger
 
-
 _CHANNEL_PREFIX = "calyphant:ws:"
+_CONTROL_CHANNEL = "calyphant:ws_control"
 _RECONNECT_DELAY = 2.0       # seconds between reconnect attempts
 _MAX_RECONNECT_DELAY = 30.0  # cap on exponential backoff
+
+# ---------------------------------------------------------------------------
+# State Management
+# ---------------------------------------------------------------------------
+
+# The Source of Truth for what this specific worker process cares about.
+# Required for surviving Redis connection drops.
+_local_subscriptions: set[str] = set()
+
+# Global reference to the active pubsub instance, enabling dynamic 
+# subscribe/unsubscribe while the listen() loop is running.
+_active_pubsub: Any = None 
 
 
 def _channel(workspace_id: UUID) -> str:
     return f"{_CHANNEL_PREFIX}{workspace_id}"
-
 
 
 class SignalEvent(BaseModel):
@@ -86,34 +67,54 @@ class SignalEvent(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Subscription Controls
+# ---------------------------------------------------------------------------
+
+async def subscribe_workspace(workspace_id: UUID) -> None:
+    """Invoked by ws_manager when the FIRST client for a workspace connects."""
+    channel = _channel(workspace_id)
+    _local_subscriptions.add(channel)
+    
+    if _active_pubsub:
+        try:
+            await _active_pubsub.subscribe(channel)
+            logger.debug(f"PubSub: Dynamically subscribed to {channel}")
+        except Exception as exc:
+            logger.warning(f"PubSub: Failed to subscribe dynamically: {exc}")
+
+
+async def unsubscribe_workspace(workspace_id: UUID) -> None:
+    """Invoked by ws_manager when the LAST client for a workspace disconnects."""
+    channel = _channel(workspace_id)
+    _local_subscriptions.discard(channel)
+    
+    if _active_pubsub:
+        try:
+            await _active_pubsub.unsubscribe(channel)
+            logger.debug(f"PubSub: Dynamically unsubscribed from {channel}")
+        except Exception as exc:
+            logger.warning(f"PubSub: Failed to unsubscribe dynamically: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Publish
 # ---------------------------------------------------------------------------
 
 async def publish(workspace_id: UUID, event: SignalEvent) -> None:
     """
-    Publish a workspace signal.
-
-    1. Publishes to Redis so all workers receive it via their subscriber.
-    2. Also broadcasts directly to local ws_manager connections so the
-       originating worker doesn't wait for the round-trip.
-
-    Falls back to local-only broadcast if Redis is unavailable.
+    Publish a workspace signal. Local delivery bypasses Redis entirely.
+    Redis handles multi-worker routing.
     """
     from domains.teams.service import ws_manager
 
-    # Always deliver locally — the originating worker should not wait for
-    # its own Redis message to arrive via the subscriber loop.
     await ws_manager.broadcast_local(workspace_id, event)
 
-    # Publish to Redis for other workers
     try:
         from core.db import get_pubsub_redis
         redis = await get_pubsub_redis()
-        # Serialize the strict Pydantic model, not an arbitrary dict
         payload = event.model_dump_json() 
         await redis.publish(_channel(workspace_id), payload)
     except Exception as exc:
-        # Redis unavailable — local broadcast above already handled it.
         logger.debug(f"PubSub: Redis publish failed (local broadcast only): {exc}")
 
 
@@ -122,19 +123,11 @@ async def publish(workspace_id: UUID, event: SignalEvent) -> None:
 # ---------------------------------------------------------------------------
 
 async def start_pubsub_listener() -> None:
-    """
-    Long-running background task that subscribes to all workspace channels
-    and fans out received messages to local WebSocket connections.
-
-    Reconnects automatically with exponential backoff on failure.
-    Should be started once per worker process during app lifespan.
-    """
     delay = _RECONNECT_DELAY
 
     while True:
         try:
             await _run_subscriber()
-            # _run_subscriber only returns on graceful shutdown
             break
         except asyncio.CancelledError:
             logger.info("PubSub: listener task cancelled — shutting down")
@@ -151,27 +144,25 @@ async def start_pubsub_listener() -> None:
 
 
 async def _run_subscriber() -> None:
-    """
-    Inner subscriber loop. Subscribes to the wildcard pattern and
-    dispatches events to ws_manager.broadcast_local().
-    """
+    global _active_pubsub
     from core.db import get_pubsub_redis
     from domains.teams.service import ws_manager
 
     try:
         redis = await get_pubsub_redis()
     except RuntimeError:
-        logger.warning(
-            "PubSub: Redis unavailable — subscriber will retry. "
-            "Multi-worker WS broadcast is disabled until Redis reconnects."
-        )
+        logger.warning("PubSub: Redis unavailable — retrying multi-worker broadcast layer.")
         await asyncio.sleep(_RECONNECT_DELAY)
         return
 
     pubsub = redis.pubsub()
-    pattern = f"{_CHANNEL_PREFIX}*"
-    await pubsub.psubscribe(pattern)
-    logger.info(f"PubSub: subscribed to pattern '{pattern}'")
+    _active_pubsub = pubsub
+
+    # 1. Boot up: Combine explicit workspace channels with a persistent control channel.
+    # The control channel ensures pubsub.listen() does not immediately exit if _local_subscriptions is empty.
+    channels_to_watch = list(_local_subscriptions) + [_CONTROL_CHANNEL]
+    await pubsub.subscribe(*channels_to_watch)
+    logger.info(f"PubSub: Subscribed to {len(channels_to_watch)} channels (including control)")
 
     try:
         async for message in pubsub.listen():
@@ -179,13 +170,16 @@ async def _run_subscriber() -> None:
                 continue
 
             msg_type = message.get("type")
-
-            if msg_type == "psubscribe" or msg_type != "pmessage":
+            # 2. Shift from pattern matching (pmessage) to strict channel targeting (message)
+            if msg_type != "message":
                 continue
 
             channel: bytes | str = message.get("channel", b"")
             if isinstance(channel, bytes):
                 channel = channel.decode()
+
+            if channel == _CONTROL_CHANNEL:
+                continue
 
             if not channel.startswith(_CHANNEL_PREFIX):
                 continue
@@ -194,7 +188,6 @@ async def _run_subscriber() -> None:
             try:
                 workspace_id = UUID(workspace_id_str)
             except ValueError:
-                logger.warning(f"PubSub: invalid workspace_id in channel: {channel}")
                 continue
 
             raw = message.get("data", b"")
@@ -205,10 +198,9 @@ async def _run_subscriber() -> None:
                 raw_dict = json.loads(raw)
                 event = SignalEvent(**raw_dict)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                logger.warning(f"PubSub: dropped invalid/oversized signal on {channel}: {exc}")
+                logger.warning(f"PubSub: dropped invalid signal on {channel}: {exc}")
                 continue
 
-            # Fan out to WebSocket clients connected to this worker
             await ws_manager.broadcast_local(workspace_id, event)
 
     except asyncio.CancelledError:
@@ -216,8 +208,8 @@ async def _run_subscriber() -> None:
     except Exception as exc:
         raise RuntimeError(f"PubSub subscriber loop failed: {exc}") from exc
     finally:
+        _active_pubsub = None
         try:
-            await pubsub.punsubscribe(pattern)
             await pubsub.aclose()
         except Exception:
             pass
