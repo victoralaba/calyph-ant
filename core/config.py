@@ -138,13 +138,19 @@ class Settings(BaseSettings):
     R2_BUCKET_NAME: str = "calyphant-backups"
 
     # ------------------------------------------------------------------
-    # AI
+    # AI (Consolidated Google Gemini Architecture)
     # ------------------------------------------------------------------
-    AI_PROVIDER: Literal["anthropic", "google"] = "anthropic"
-    ANTHROPIC_API_KEY: str = ""
-    ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
+    AI_AVAILABLE: bool = True
+
+    # Google AI Configuration
     GOOGLE_GENAI_API_KEY: str = ""
-    GOOGLE_GENAI_MODEL: str = "gemini-2.0-flash"
+    GOOGLE_GENAI_MODEL: str = "gemini-2.5-flash"  # Configurable in .env for easy upgrades
+    GOOGLE_GENAI_MODEL_THINKING: str = "gemini-2.5-flash-thinking"
+    
+    # AI Rate Limiting & Billing Weights
+    RATE_LIMIT_AI: str = "10/minute" # For core.middleware.limiter
+    QUOTA_COST_STANDARD: int = 1
+    QUOTA_COST_THINKING: int = 3  # Burns 3x quota when UI requests deep reasoning
 
     # ------------------------------------------------------------------
     # Flutterwave
@@ -180,8 +186,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_DEFAULT: str = "100/minute"
     RATE_LIMIT_AUTH: str = "10/minute"
-    RATE_LIMIT_AI: str = "20/minute"
-
+    # Note: RATE_LIMIT_AI is now defined in the AI section above.
+    
     # ------------------------------------------------------------------
     # CORS
     # ------------------------------------------------------------------

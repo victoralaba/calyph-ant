@@ -74,6 +74,7 @@ celery_app.conf.update(
         "worker.celery.expire_invites": {"queue": "maintenance"},
         "worker.celery.cleanup_old_backups": {"queue": "maintenance"},
         "worker.celery.execute_ephemeral_semantic_diff": {"queue": "maintenance"},
+        "worker.celery.sync_google_schema_cache": {"queue": "maintenance"},
         # Platform catalogue tasks
         "platform.catalogue.enrich_extension_async": {"queue": "maintenance"},
         "platform.catalogue.refresh_stale_entries": {"queue": "maintenance"},
@@ -463,8 +464,89 @@ def cleanup_old_backups():
     _run(_cleanup())
 
 
-# In worker/celery.py (Add to task_routes and beat_schedule if necessary, but default queue works)
+# ---------------------------------------------------------------------------
+# AI Schema Caching (Google Gemini Context)
+# ---------------------------------------------------------------------------
 
+@celery_app.task(name="worker.celery.sync_google_schema_cache")
+def sync_google_schema_cache(connection_id: str, workspace_id: str, schema_name: str = "public"):
+    """
+    Background task to extract target database schema and push it to Google's 
+    Cached Content API for zero-latency, zero-DB-hit AI queries.
+    
+    TTL is set to 24 hours. The frontend should trigger this task whenever 
+    a user successfully connects a database or clicks a "Sync Schema" button.
+    """
+    async def _sync():
+        import httpx
+        from uuid import UUID
+        from core.db import _session_factory, get_connection_url, get_redis
+        from domains.schema.introspection import introspect_database
+        from core.config import settings
+
+        if not getattr(settings, "AI_AVAILABLE", False) or not settings.GOOGLE_GENAI_API_KEY:
+            logger.info("Skipping Google Schema Cache: AI disabled or missing API key.")
+            return
+
+        if not _session_factory:
+            return
+
+        async with _session_factory() as db:
+            url = await get_connection_url(db, UUID(connection_id), UUID(workspace_id))
+            if not url:
+                return
+
+        # 1. Introspect Schema (Heavy lifting done in background)
+        try:
+            snapshot = await introspect_database(url, schema_name)
+            
+            # Format minimal DDL for the LLM
+            lines = [f"-- PostgreSQL Schema: {schema_name}"]
+            for table in snapshot.tables:
+                if table.kind not in ("table", "view"): continue
+                cols = ", ".join(f"{c.name} {c.data_type}" for c in table.columns)
+                lines.append(f"CREATE {table.kind.upper()} {table.name} ({cols});")
+                
+            schema_text = "\n".join(lines)
+            if not schema_text:
+                return
+                
+        except Exception as e:
+            logger.error(f"Failed to introspect DB for AI cache ({connection_id}): {e}")
+            return
+
+        # 2. Push to Google Cached Content API
+        try:
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/cachedContents?key={settings.GOOGLE_GENAI_API_KEY}"
+            payload = {
+                "model": f"models/{settings.GOOGLE_GENAI_MODEL}",
+                "contents": [{"role": "user", "parts": [{"text": schema_text}]}],
+                # 86400s = 24 hours. Gemini limits cache TTL.
+                "ttl": "86400s" 
+            }
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(api_url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                cache_name = data.get("name") # e.g., cachedContents/xxxxxxxx
+                
+                # 3. Store reference in Redis to be picked up by domains/ai/providers.py
+                if cache_name:
+                    redis = await get_redis()
+                    # Keep in sync with Google's TTL
+                    await redis.setex(f"schema_cache:google:{connection_id}", 86400, cache_name)
+                    logger.info(f"AI Schema Cached Successfully: {connection_id} -> {cache_name}")
+                    
+        except httpx.HTTPStatusError as e:
+             logger.error(f"Google Cache API Error: {e.response.text}")
+        except Exception as e:
+            logger.error(f"Failed to push schema to Google cache: {e}")
+
+    _run(_sync())
+
+
+# In worker/celery.py (Add to task_routes and beat_schedule if necessary, but default queue works)
 @celery_app.task(name="worker.celery.build_index_background")
 def build_index_background(
     connection_id: str,
