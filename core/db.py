@@ -310,11 +310,27 @@ async def get_connection_url(
 ) -> str | None:
     """
     Fetch and decrypt a stored connection URL.
-    Returns None if not found or not owned by the given workspace.
+    
+    Utilizes a Redis read-through cache using the workspace_id in the key 
+    to mathematically prevent IDOR while shielding the Postgres pool from 
+    high-frequency authorization checks across all domains.
     """
     from sqlalchemy import select
     from domains.connections.models import Connection
+    
+    cache_key = f"calyphant:conn_url:{workspace_id}:{connection_id}"
+    
+    # 1. Fast Path (Redis)
+    if _redis:
+        try:
+            cached_encrypted = await _redis.get(cache_key)
+            if cached_encrypted:
+                # Decrypt happens in-memory, keeping plaintext out of Redis
+                return decrypt_secret(cached_encrypted.decode("utf-8"))
+        except Exception as exc:
+            logger.warning(f"Redis cache read failed (falling back to DB): {exc}")
 
+    # 2. Slow Path (Postgres Engine of Truth)
     result = await db.execute(
         select(Connection.encrypted_url).where(
             Connection.id == connection_id,
@@ -323,8 +339,19 @@ async def get_connection_url(
         )
     )
     encrypted = result.scalar_one_or_none()
+    
     if not encrypted:
         return None
+
+    # 3. Cache Warming (TTL: 15 minutes)
+    # 15 minutes is aggressive enough to protect the DB, but short enough 
+    # that revoked/deleted connections cycle out rapidly.
+    if _redis:
+        try:
+            await _redis.setex(cache_key, 900, encrypted)
+        except Exception as exc:
+            logger.warning(f"Failed to write connection URL to cache: {exc}")
+
     return decrypt_secret(encrypted)
 
 

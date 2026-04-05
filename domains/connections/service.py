@@ -45,7 +45,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -55,6 +55,7 @@ import asyncpg
 from loguru import logger
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.engine.cursor import CursorResult
 import asyncio
 from tenacity import (
     retry,
@@ -711,12 +712,12 @@ async def delete_connection(
     workspace_id: UUID,
 ) -> bool:
     """Soft delete, but strictly scrub the cryptographic payload to prevent credential hoarding."""
-    from core.db import encrypt_secret
+    from core.db import encrypt_secret, get_redis
     
-    # Overwrite the actual credentials with a dead payload
     scrubbed_payload = encrypt_secret("SCRUBBED_ON_DELETE")
     
-    result = await db.execute(
+    # execute() returns a generic Result[Any]
+    raw_result = await db.execute(
         update(Connection)
         .where(
             Connection.id == connection_id,
@@ -727,8 +728,20 @@ async def delete_connection(
             encrypted_url=scrubbed_payload
         )
     )
+    
+    # Force cache invalidation immediately
+    try:
+        redis = await get_redis()
+        await redis.delete(f"calyphant:conn_url:{workspace_id}:{connection_id}")
+    except Exception as exc:
+        logger.warning(f"Failed to clear connection cache on delete: {exc}")
+
     await db.commit()
-    return result.rowcount > 0 #type: ignore
+    
+    # Strict Type Downcast: DML statements guarantee a CursorResult
+    cursor_result = cast(CursorResult[Any], raw_result)
+    
+    return cursor_result.rowcount > 0
 
 
 async def mark_connection_status(
