@@ -579,14 +579,12 @@ class WorkspaceConnectionManager:
         await ws.accept()
         key = str(workspace_id)
 
-        # Evaluate if this worker needs to tell Redis to start routing this traffic
         is_first_connection = key not in self._connections or len(self._connections[key]) == 0
         
         self._connections.setdefault(key, set()).add(ws)
         
         if is_first_connection:
             from shared.pubsub import subscribe_workspace
-            # Fire-and-forget task so we don't block the WebSocket handshake
             asyncio.create_task(subscribe_workspace(workspace_id))
 
         logger.debug(
@@ -595,7 +593,6 @@ class WorkspaceConnectionManager:
         )
 
     def disconnect(self, workspace_id: UUID, ws: WebSocket) -> None:
-        """Synchronous cleanup called in the finally block of the router."""
         key = str(workspace_id)
         if key in self._connections:
             self._connections[key].discard(ws)
@@ -603,30 +600,61 @@ class WorkspaceConnectionManager:
 
     async def broadcast_local(self, workspace_id: UUID, event: SignalEvent) -> None:
         """
-        Deliver signal to all WebSocket connections on THIS worker process.
-        Does NOT publish to Redis. Automatically evicts dead TCP sockets.
+        Deliver signal to WebSocket connections on THIS worker process.
+        Intercepts Control Signals to act as a Server-Side Kill Switch.
         """
         key = str(workspace_id)
         dead: set[WebSocket] = set()
         payload = event.model_dump_json()
 
+        # 1. INTERCEPT: Execute Server-Side Kill Switch
+        if event.event == "workspace_deleted":
+            # Nuke the entire workspace
+            for ws in list(self._connections.get(key, set())):
+                try:
+                    # UI CONSIDERATION: 4003 code indicates "Access Revoked".
+                    # The Svelte UI MUST NOT attempt to reconnect if it receives a 4003 close frame.
+                    await ws.close(code=4003, reason="Workspace deleted")
+                except Exception:
+                    pass
+                dead.add(ws)
+
+        elif event.event == "member_left" and event.entity_id:
+            # Sniper rifle: Nuke only the specific kicked user
+            for ws in list(self._connections.get(key, set())):
+                if getattr(ws.state, "auth_type", None) == "user" and getattr(ws.state, "auth_id", None) == event.entity_id:
+                    try:
+                        await ws.close(code=4003, reason="Access revoked")
+                    except Exception:
+                        pass
+                    dead.add(ws)
+
+        elif event.event == "share_link_revoked" and event.entity_id:
+            # Sniper rifle: Nuke only the specific revoked token
+            for ws in list(self._connections.get(key, set())):
+                if getattr(ws.state, "auth_type", None) == "link" and getattr(ws.state, "auth_token", None) == event.entity_id:
+                    try:
+                        await ws.close(code=4003, reason="Link revoked")
+                    except Exception:
+                        pass
+                    dead.add(ws)
+
+        # 2. DELIVER: Standard Broadcast to surviving connections
         for ws in list(self._connections.get(key, set())):
+            if ws in dead:
+                continue
             try:
                 await ws.send_text(payload)
             except Exception:
                 dead.add(ws)
 
-        # Clean up sockets that died without a graceful close frame
+        # 3. GARBAGE COLLECTION
         if dead:
             for ws in dead:
                 self._connections.get(key, set()).discard(ws)
             self._cleanup_if_empty(workspace_id)
 
     def _cleanup_if_empty(self, workspace_id: UUID) -> None:
-        """
-        Garbage collects the dictionary key and severs the Redis link 
-        if no active users remain for this workspace.
-        """
         key = str(workspace_id)
         conns = self._connections.get(key)
         
@@ -637,9 +665,6 @@ class WorkspaceConnectionManager:
             logger.debug(f"WS disconnected: workspace={workspace_id} (0 remaining. Redis unsubscribed.)")
 
     async def broadcast(self, workspace_id: UUID, event: SignalEvent) -> None:
-        """
-        Full broadcast: routes through shared/pubsub.py for cluster-wide delivery.
-        """
         from shared.pubsub import publish
         await publish(workspace_id, event)
 
@@ -652,9 +677,7 @@ class WorkspaceConnectionManager:
     def connection_count(self, workspace_id: UUID) -> int:
         return len(self._connections.get(str(workspace_id), set()))
 
-
 ws_manager = WorkspaceConnectionManager()
-
 
 # ---------------------------------------------------------------------------
 # WebSocket authentication helper
@@ -663,16 +686,13 @@ ws_manager = WorkspaceConnectionManager()
 async def _authenticate_ws_token(
     token: str,
     workspace_id: UUID,
-) -> bool:
+) -> dict[str, str] | None:
     """
-    Authenticate a WebSocket connection token.
+    Authenticate a WebSocket connection token and return its identity payload.
 
     Opens a short-lived DB session, verifies the token (JWT or share link),
-    then closes the session immediately. Returns True if authenticated.
-
-    This is intentionally a standalone coroutine (not a FastAPI dependency)
-    so the caller controls the session lifetime and can close it before
-    entering the long-lived event loop.
+    then closes the session immediately. Returns a dictionary identifying 
+    the connection type and ID, or None if invalid.
     """
     from core.auth import decode_token
 
@@ -684,8 +704,8 @@ async def _authenticate_ws_token(
         async with get_db_context() as db:
             role = await get_member_role(db, workspace_id, user_id)
 
-        # Session is now closed
-        return role is not None
+        if role is not None:
+            return {"type": "user", "id": str(user_id)}
 
     except Exception:
         pass  # Not a valid JWT — try share link
@@ -695,11 +715,13 @@ async def _authenticate_ws_token(
         async with get_db_context() as db:
             link = await resolve_share_link(db, token)
 
-        # Session is now closed
-        return link is not None and link.workspace_id == workspace_id
+        if link is not None and link.workspace_id == workspace_id:
+            return {"type": "link", "token": token}
 
     except Exception:
-        return False
+        pass
+        
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1053,17 @@ async def revoke_workspace_share_link(
     revoked = await revoke_share_link(db, workspace_id, token)
     if not revoked:
         raise HTTPException(status_code=404, detail="Share link not found.")
+        
+    # Send the Kill Signal to Redis. 
+    # Any worker holding a socket for this token will sever it instantly.
+    asyncio.create_task(ws_manager.broadcast(
+        workspace_id,
+        SignalEvent(
+            event="share_link_revoked", 
+            workspace_id=workspace_id, 
+            entity_id=token  # We pass the token as the entity_id to target the exact sockets
+        )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1049,26 +1082,6 @@ async def workspace_websocket(
     --------------
     Token is passed as the `token` query parameter. Both JWT access tokens
     and share link tokens are accepted.
-
-    Critical design: this handler does NOT use Depends(get_db).
-    The DB session is opened only for the authentication check, then
-    closed immediately. The event loop (while True) holds ZERO database
-    connections — it only waits on WebSocket messages and sends pings.
-
-    This means 1000 connected WebSocket clients consume 0 idle Postgres
-    connections, vs 1000 with the old Depends(get_db) approach.
-
-    Events emitted to clients
-    -------------------------
-    schema_changed, migration_applied, migration_rolled_back,
-    migration_failed, member_joined, member_left, workspace_deleted,
-    connection_status_changed, row_lock_claimed, row_lock_released
-
-    Cross-worker delivery
-    ---------------------
-    Events published via ws_manager.broadcast() are routed through
-    Redis pub/sub so all worker processes deliver the event to their
-    connected clients. See shared/pubsub.py.
     """
     token = websocket.query_params.get("token")
     if not token:
@@ -1076,11 +1089,17 @@ async def workspace_websocket(
         return
 
     # --- Authentication: open session, verify, CLOSE before event loop ---
-    authenticated = await _authenticate_ws_token(token, workspace_id)
-    if not authenticated:
+    auth_data = await _authenticate_ws_token(token, workspace_id)
+    if not auth_data:
+        # UI CONSIDERATION: The Svelte UI MUST NOT attempt to reconnect if 
+        # the initial handshake fails with 4003. It means the token is dead.
         await websocket.close(code=4003)
         return
-    # DB session is now fully closed. No Postgres connection held from here.
+        
+    # Tag the TCP socket with its identity so the Kill Switch can find it later
+    websocket.state.auth_type = auth_data["type"]
+    websocket.state.auth_id = auth_data.get("id")
+    websocket.state.auth_token = auth_data.get("token")
 
     await ws_manager.connect(workspace_id, websocket)
 
@@ -1100,7 +1119,6 @@ async def workspace_websocket(
                     await ws_manager.send_to(websocket, {"type": "pong"})
 
             except asyncio.TimeoutError:
-                # Send server-side ping to detect dead connections
                 await ws_manager.send_to(websocket, {"type": "ping"})
 
             except WebSocketDisconnect:
