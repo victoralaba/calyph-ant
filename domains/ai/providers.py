@@ -4,16 +4,11 @@ AI domain — Powered strictly by Google Gemini.
 
 Architecture Notes:
 - Module-level httpx.AsyncClient prevents TCP port exhaustion.
-- Quota is burned post-flight via BackgroundTasks to eliminate critical-path latency.
+- Quota is burned ATOMICALLY via Redis Lua scripts pre-flight to prevent race conditions.
 - Database introspection is BANNED here. The router expects a Google Prompt Cache URI
-  to be present in Redis (generated asynchronously by the worker). 
-
-UI Contract & Behaviors:
-- The UI MUST handle Server-Sent Events (SSE) for the /sql and /explain endpoints.
-- If the schema cache is missing, the endpoint returns 400. The UI MUST catch this 
-  and prompt the user to manually trigger a background schema sync before trying again.
-- Toggling the 'use_thinking_model' flag in the request body will drain the user's
-  daily quota 3x faster. The UI should display this cost clearly.
+  to be present in Redis (generated asynchronously by the worker).
+- Strict workspace-connection IDOR gating enforced via Dependencies.
+- Strict L7 proxy bypass mechanics (Buffer blowouts & Heartbeats) for SSE streams.
 """
 
 from __future__ import annotations
@@ -24,14 +19,15 @@ from typing import AsyncGenerator, Any
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.config import settings
-from core.db import get_redis
+from core.db import get_redis, get_db, get_connection_url
 from core.middleware import limiter
 
 # ---------------------------------------------------------------------------
@@ -43,14 +39,26 @@ _ai_client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=100, max_connections=500)
 )
 
+# Standardized Proxy Disarmament Headers
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",       # Bypasses Nginx buffering
+    "Content-Encoding": "none",      # Forbids proxies from gzip buffering
+    "Connection": "keep-alive",
+    "Transfer-Encoding": "chunked",  # Explicit streaming declaration
+}
+
 # ---------------------------------------------------------------------------
-# Tier-Weighted Economics & Quota
+# Tier-Weighted Economics & Atomic Quota
 # ---------------------------------------------------------------------------
 _QUOTA_KEY_PREFIX = "ai_quota"
 _QUOTA_TTL_SECONDS = 25 * 3600
 
-async def verify_quota_preflight(user_id: UUID, tier: str, requested_cost: int) -> None:
-    """Fast, non-blocking check to ensure user has enough quota."""
+async def consume_quota_atomic(user_id: UUID, tier: str, requested_cost: int) -> None:
+    """
+    Atomic check-and-deduct using a Redis Lua Script.
+    Mathematically guarantees quota limits even under extreme concurrent load.
+    """
     from domains.billing.flutterwave import get_limits
     limits = get_limits(tier)
     daily_limit: int = limits.get("ai_requests_per_day", 5)
@@ -61,37 +69,49 @@ async def verify_quota_preflight(user_id: UUID, tier: str, requested_cost: int) 
     try:
         redis = await get_redis()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        used_raw = await redis.get(f"{_QUOTA_KEY_PREFIX}:{user_id}:{today}")
-        used = int(used_raw) if used_raw else 0
+        key = f"{_QUOTA_KEY_PREFIX}:{user_id}:{today}"
         
-        if used + requested_cost > daily_limit:
+        # Atomic LUA Script: Check limit and increment in one continuous operation
+        lua_script = """
+        local current = redis.call("GET", KEYS[1])
+        local used = tonumber(current) or 0
+        local cost = tonumber(ARGV[1])
+        local limit = tonumber(ARGV[2])
+        local ttl = tonumber(ARGV[3])
+
+        if used + cost > limit then
+            return {0, limit - used}
+        end
+
+        local new_used = redis.call("INCRBY", KEYS[1], cost)
+        if new_used == cost then
+            redis.call("EXPIRE", KEYS[1], ttl)
+        end
+        return {1, limit - new_used}
+        """
+        
+        # Cast all variadic arguments to strings to satisfy the redis-py type signature.
+        # type: ignore is applied to bypass the flawed return type stub in redis.asyncio
+        result: Any = await redis.eval(  # type: ignore
+            lua_script, 
+            1, 
+            key, 
+            str(requested_cost), 
+            str(daily_limit), 
+            str(_QUOTA_TTL_SECONDS)
+        )
+        
+        success, remaining = result[0], result[1]
+        
+        if success == 0:
             raise HTTPException(
                 status_code=429, 
-                detail=f"Insufficient AI quota. Requested: {requested_cost}, Remaining: {daily_limit - used}. Upgrade plan to increase limits."
+                detail=f"Insufficient AI quota. Requested: {requested_cost}, Remaining: {remaining}. Upgrade plan to increase limits."
             )
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning(f"AI quota preflight check skipped (Redis unavailable): {exc}")
-
-
-def burn_quota_postflight(user_id: UUID, cost: int) -> None:
-    """Executes in the background AFTER the response has shipped to the UI."""
-    import asyncio
-    async def _burn():
-        try:
-            redis = await get_redis()
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            key = f"{_QUOTA_KEY_PREFIX}:{user_id}:{today}"
-            
-            current = await redis.incrby(key, cost)
-            if current == cost:  # First hit today, set expiry
-                await redis.expire(key, _QUOTA_TTL_SECONDS)
-        except Exception as exc:
-            logger.error(f"Failed to burn post-flight AI quota for {user_id}: {exc}")
-            
-    # Fire and forget in the background task loop
-    asyncio.create_task(_burn())
+        logger.warning(f"AI quota atomic check skipped (Redis unavailable): {exc}")
 
 
 async def _get_ai_quota_status(user_id: UUID, tier: str) -> dict[str, Any]:
@@ -132,23 +152,41 @@ async def _get_ai_quota_status(user_id: UUID, tier: str) -> dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# Cache Retrieval
+# Authorization & Cache Retrieval
 # ---------------------------------------------------------------------------
+def require_workspace(user: CurrentUser) -> UUID:
+    """Dependency to ensure the current user has an active workspace."""
+    if not user.workspace_id:
+        raise HTTPException(status_code=403, detail="Workspace context is required.")
+    return user.workspace_id
+
+async def verify_connection_ownership(
+    connection_id: UUID,
+    workspace_id: UUID = Depends(require_workspace),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    Prevents Insecure Direct Object Reference (IDOR).
+    Forces a database check to ensure the workspace actually owns the connection.
+    """
+    url = await get_connection_url(db, connection_id, workspace_id)
+    if not url:
+        raise HTTPException(status_code=403, detail="Forbidden. Connection does not belong to the active workspace.")
+
+
 async def get_cached_schema_name(connection_id: UUID) -> str | None:
     """
     Fetches the Google `cachedContents/xxx` identifier from Redis.
-    Zero PostgreSQL introspection.
     """
     try:
         redis = await get_redis()
-        # The background worker MUST populate this key using the Google File API / Cached Content API
         cache_ref = await redis.get(f"schema_cache:google:{connection_id}")
         return cache_ref.decode("utf-8") if cache_ref else None
     except Exception:
         return None
 
 # ---------------------------------------------------------------------------
-# Request Models
+# Request Models (Strict Memory Boundaries)
 # ---------------------------------------------------------------------------
 class BaseAIRequest(BaseModel):
     use_thinking_model: bool = Field(
@@ -160,10 +198,10 @@ class NlToSqlRequest(BaseAIRequest):
     natural_language: str = Field(..., min_length=1, max_length=2000)
 
 class ExplainSqlRequest(BaseAIRequest):
-    sql: str = Field(..., min_length=1)
+    sql: str = Field(..., min_length=1, max_length=15000)
 
 class OptimizeRequest(BaseAIRequest):
-    sql: str = Field(..., min_length=1)
+    sql: str = Field(..., min_length=1, max_length=15000)
 
 # ---------------------------------------------------------------------------
 # Router & Endpoints
@@ -186,13 +224,12 @@ async def get_quota_status(user: CurrentUser):
     return await _get_ai_quota_status(user.id, user.tier)
 
 
-@router.post("/{connection_id}/sql")
+@router.post("/{connection_id}/sql", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def stream_natural_language_to_sql(
     connection_id: UUID,
     body: NlToSqlRequest,
     user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ):
     """
     Translates Natural Language to SQL and streams the result back to the UI via SSE.
@@ -201,7 +238,7 @@ async def stream_natural_language_to_sql(
         raise HTTPException(status_code=503, detail="AI features are currently disabled.")
 
     cost = settings.QUOTA_COST_THINKING if body.use_thinking_model else settings.QUOTA_COST_STANDARD
-    await verify_quota_preflight(user.id, user.tier, cost)
+    await consume_quota_atomic(user.id, user.tier, cost)
     
     schema_cache_name = await get_cached_schema_name(connection_id)
     if not schema_cache_name:
@@ -223,6 +260,9 @@ async def stream_natural_language_to_sql(
     }
 
     async def _stream_gemini() -> AsyncGenerator[str, None]:
+        # Force proxies to flush the initial connection headers immediately
+        yield f": {' ' * 4096}\n\n"
+        
         url = f"/v1beta/models/{model}:streamGenerateContent?key={settings.GOOGLE_GENAI_API_KEY}&alt=sse"
         
         try:
@@ -237,24 +277,28 @@ async def stream_natural_language_to_sql(
                             event = json.loads(raw)
                             text = event.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             if text:
-                                yield text
+                                yield f"data: {json.dumps({'type': 'chunk', 'text': text})}\n\n"
                         except (json.JSONDecodeError, IndexError, KeyError):
                             continue
+                # Terminate the stream cleanly for the UI
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        
         except httpx.HTTPStatusError as e:
             logger.error(f"Gemini API Error: {e.response.text}")
-            yield f"-- Error generating SQL. The AI provider rejected the request."
+            yield f"data: {json.dumps({'type': 'error', 'error': 'The AI provider rejected the request.'})}\n\n"
+        except Exception as e:
+            logger.error(f"Gemini Stream Failure: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': 'Upstream connection failed.'})}\n\n"
 
-    background_tasks.add_task(burn_quota_postflight, user.id, cost)
-    return StreamingResponse(_stream_gemini(), media_type="text/event-stream")
+    return StreamingResponse(_stream_gemini(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
-@router.post("/{connection_id}/explain")
+@router.post("/{connection_id}/explain", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def explain_sql(
     connection_id: UUID,
     body: ExplainSqlRequest,
     user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ):
     """
     Explains a SQL query in plain English via SSE Stream.
@@ -263,7 +307,7 @@ async def explain_sql(
         raise HTTPException(status_code=503, detail="AI features are currently disabled.")
 
     cost = settings.QUOTA_COST_THINKING if body.use_thinking_model else settings.QUOTA_COST_STANDARD
-    await verify_quota_preflight(user.id, user.tier, cost)
+    await consume_quota_atomic(user.id, user.tier, cost)
 
     model = settings.GOOGLE_GENAI_MODEL_THINKING if body.use_thinking_model else settings.GOOGLE_GENAI_MODEL
     
@@ -277,6 +321,7 @@ async def explain_sql(
     }
 
     async def _stream_gemini() -> AsyncGenerator[str, None]:
+        yield f": {' ' * 4096}\n\n"
         url = f"/v1beta/models/{model}:streamGenerateContent?key={settings.GOOGLE_GENAI_API_KEY}&alt=sse"
         try:
             async with _ai_client.stream("POST", url, json=payload) as response:
@@ -290,24 +335,26 @@ async def explain_sql(
                             event = json.loads(raw)
                             text = event.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                             if text:
-                                yield text
+                                yield f"data: {json.dumps({'type': 'chunk', 'text': text})}\n\n"
                         except (json.JSONDecodeError, IndexError, KeyError):
                             continue
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except httpx.HTTPStatusError as e:
             logger.error(f"Gemini API Error: {e.response.text}")
-            yield "Error explaining SQL."
+            yield f"data: {json.dumps({'type': 'error', 'error': 'Error explaining SQL.'})}\n\n"
+        except Exception as e:
+            logger.error(f"Gemini Stream Failure: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': 'Upstream connection failed.'})}\n\n"
 
-    background_tasks.add_task(burn_quota_postflight, user.id, cost)
-    return StreamingResponse(_stream_gemini(), media_type="text/event-stream")
+    return StreamingResponse(_stream_gemini(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
-@router.post("/{connection_id}/optimize")
+@router.post("/{connection_id}/optimize", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def optimize_query(
     connection_id: UUID,
     body: OptimizeRequest,
     user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ):
     """
     Analyzes SQL and returns specific indexing and rewrite suggestions.
@@ -317,7 +364,7 @@ async def optimize_query(
         raise HTTPException(status_code=503, detail="AI features are currently disabled.")
 
     cost = settings.QUOTA_COST_THINKING if body.use_thinking_model else settings.QUOTA_COST_STANDARD
-    await verify_quota_preflight(user.id, user.tier, cost)
+    await consume_quota_atomic(user.id, user.tier, cost)
 
     schema_cache_name = await get_cached_schema_name(connection_id)
     if not schema_cache_name:
@@ -347,9 +394,6 @@ async def optimize_query(
         response.raise_for_status()
         data = response.json()
         raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
-        
-        # Enqueue burn task
-        background_tasks.add_task(burn_quota_postflight, user.id, cost)
         
         return {
             "suggestions": json.loads(raw_text),
