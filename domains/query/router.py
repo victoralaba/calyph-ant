@@ -58,7 +58,7 @@ from uuid import UUID
 import asyncio
 import asyncpg
 from asyncpg.pool import PoolConnectionProxy  # <-- ADD THIS IMPORT
-from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -185,6 +185,7 @@ async def execute_query(
 
 @router.post("/{connection_id}/stream")
 async def stream_query(
+    request: Request,
     connection_id: UUID,
     body: StreamRequest,
     user: CurrentUser,
@@ -197,15 +198,19 @@ async def stream_query(
     Engineered with strict L7 proxy bypass mechanics (Buffer blowouts & Heartbeats).
     """
     url = await _get_url(connection_id, workspace_id, db)
+    
 
     async def _generate_events(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> AsyncGenerator[str, None]:
         # 1. The Buffer Blowout (The 4KB Exploit)
-        # Force aggressive proxies (like Cloudflare) to immediately flush their 
-        # internal memory buffers by padding the initial connection with whitespace.
         yield f": {' ' * 4096}\n\n"
         
+        # 2. Extract PID natively (Cleaner than parsing SSE dictionary chunks)
+        raw_pid = await pg_conn.fetchval("SELECT pg_backend_pid()")
+        pid: int = int(raw_pid) if raw_pid is not None else 0
+        
+        from loguru import logger
+        
         try:
-            # Initialize the core database stream
             stream = service.stream_query(
                 pg_conn,
                 body.sql,
@@ -213,25 +218,34 @@ async def stream_query(
                 execution_timeout_seconds=body.execution_timeout_seconds,
             )
             
-            # 2. The Void Ping Multiplexer
-            # We manually iterate the async generator so we can inject heartbeats.
-            # If a complex query takes 25 seconds to return the first row, we 
-            # ping the proxy every 10 seconds to prevent a 504 Gateway Timeout.
             stream_iter = aiter(stream)
             while True:
+                # 3. THE SEAL: Disconnect Verification
+                if await request.is_disconnected():
+                    logger.warning(f"Client disconnected mid-stream. Assassinating PID: {pid}")
+                    if pid > 0:
+                        await service.cancel_query(url, pid)
+                    break
+
                 try:
                     event = await asyncio.wait_for(anext(stream_iter), timeout=10.0)
                     yield f"data: {json.dumps(event, default=str)}\n\n"
                 except asyncio.TimeoutError:
-                    # The Void Ping: An SSE comment. Invisible to the frontend, 
-                    # but proves to the edge proxy that the TCP socket is alive.
+                    # The Void Ping
                     yield ": heartbeat\n\n"
                 except StopAsyncIteration:
                     break
                     
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        except asyncio.CancelledError:
+            # 4. THE SEAL: Framework-level Task Cancellation (e.g. Uvicorn timeout)
+            logger.warning(f"Stream task forcefully cancelled by ASGI. Assassinating PID: {pid}")
+            if pid > 0:
+                await service.cancel_query(url, pid)
+            raise
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
 
     async def _safe_stream() -> AsyncGenerator[str, None]:
         pool = await service.pool_manager.get_pool(connection_id, url)

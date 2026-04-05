@@ -200,122 +200,102 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
 class WorkspacePoolManager:
     """
     Global registry for tenant-specific PostgreSQL connection pools.
-    Engineered for O(1) critical path lookup, isolated background GC, 
-    and strict thundering-herd prevention without cache poisoning.
+    Engineered for O(1) critical path lookup, isolated background GC without
+    blocking sweepers, and strict Thundering Herd prevention via Task caching.
     """
     def __init__(self, ttl_seconds: int = 600):
-        # Stores: connection_id -> {"pool": asyncpg.Pool, "last_used": float}
-        self._pools: dict[UUID, dict[str, Any]] = {}
+        # Maps connection_id -> asyncio.Task[asyncpg.Pool]
+        self._pool_tasks: dict[UUID, asyncio.Task] = {}
         
-        # Protects dictionary mutations (add/remove), NOT I/O operations
-        self._dict_lock = asyncio.Lock()
-        
-        # Per-connection locks to prevent the Thundering Herd
-        self._conn_locks: dict[UUID, asyncio.Lock] = {}
+        # Maps connection_id -> asyncio.TimerHandle (for decentralized eviction)
+        self._eviction_timers: dict[UUID, asyncio.TimerHandle] = {}
         
         self._ttl_seconds = ttl_seconds
-        self._sweeper_task: asyncio.Task | None = None
-
-    async def _ensure_sweeper(self) -> None:
-        """Lazily boots the heartbeat sweeper on the first request."""
-        if self._sweeper_task is None:
-            async with self._dict_lock:
-                if self._sweeper_task is None:
-                    self._sweeper_task = asyncio.create_task(self._sweep_loop())
-
-    async def _sweep_loop(self) -> None:
-        """
-        The automated garbage collector.
-        Runs entirely out-of-band. Never blocks a user's request.
-        """
-        while True:
-            try:
-                await asyncio.sleep(60)  # Heartbeat: 60 seconds
-                now = time.monotonic()
-                stale_pools = []
-
-                async with self._dict_lock:
-                    stale_cids = [
-                        cid for cid, state in self._pools.items()
-                        if (now - state["last_used"]) > self._ttl_seconds
-                    ]
-                    
-                    for cid in stale_cids:
-                        state = self._pools.pop(cid)
-                        stale_pools.append(state["pool"])
-                        # Clean up the specific connection lock
-                        self._conn_locks.pop(cid, None)
-
-                # Close stale pools safely OUTSIDE the lock to avoid blocking traffic
-                for pool in stale_pools:
-                    try:
-                        await pool.close()
-                    except Exception as exc:
-                        logger.warning(f"Failed to close stale workspace pool: {exc}")
-                        
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error(f"Workspace pool sweeper encountered an error: {exc}")
 
     async def get_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
-        await self._ensure_sweeper()
+        # 1. Fast Heartbeat Refresh
+        timer = self._eviction_timers.pop(connection_id, None)
+        if timer is not None:
+            timer.cancel()
 
-        # -------------------------------------------------------------------
-        # 1. Fast Path (O(1) lookup without locking)
-        # Python dicts are safe for simple reads in async contexts.
-        # -------------------------------------------------------------------
-        state = self._pools.get(connection_id)
-        if state is not None:
-            state["last_used"] = time.monotonic()
-            return state["pool"]
+        # 2. Thundering Herd Protection (Native asyncio)
+        task = self._pool_tasks.get(connection_id)
+        if task is None:
+            task = asyncio.create_task(self._build_pool(connection_id, url))
+            self._pool_tasks[connection_id] = task
 
-        # -------------------------------------------------------------------
-        # 2. Prevent Thundering Herd via Per-Connection Locking
-        # -------------------------------------------------------------------
-        async with self._dict_lock:
-            if connection_id not in self._conn_locks:
-                self._conn_locks[connection_id] = asyncio.Lock()
-            conn_lock = self._conn_locks[connection_id]
+        try:
+            pool = await task
+        except Exception:
+            # NO GHOST LOCKS: Instantly purge failed connection tasks
+            self._pool_tasks.pop(connection_id, None)
+            raise
 
-        # -------------------------------------------------------------------
-        # 3. Double-Checked Locking
-        # -------------------------------------------------------------------
-        async with conn_lock:
-            # Check if another concurrent request built it while we waited
-            state = self._pools.get(connection_id)
-            if state is not None:
-                state["last_used"] = time.monotonic()
-                return state["pool"]
+        # 3. Schedule Decentralized Eviction
+        loop = asyncio.get_running_loop()
+        self._eviction_timers[connection_id] = loop.call_later(
+            self._ttl_seconds,
+            self._schedule_eviction,
+            connection_id,
+            pool
+        )
 
-            # -------------------------------------------------------------------
-            # 4. The Critical I/O Block
-            # 
-            # UI CONTRACT: If the target database is sleeping or starting up, 
-            # this await will block for up to 15 seconds (statement_timeout).
-            # The frontend Svelte client MUST NOT abort the HTTP request early.
-            # The UI should display a persistent "Waking up database..." or 
-            # "Connecting..." state until this resolves or fails.
-            # -------------------------------------------------------------------
+        return pool
+
+    async def _build_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
+        """
+        The single critical I/O block for pool creation.
+        """
+        return await get_workspace_pool(url)
+
+    def _schedule_eviction(self, connection_id: UUID, pool: asyncpg.Pool) -> None:
+        """
+        Triggered natively by the event loop when the TTL expires.
+        """
+        self._eviction_timers.pop(connection_id, None)
+        asyncio.create_task(self._evict_pool_if_idle(connection_id, pool))
+
+    async def _evict_pool_if_idle(self, connection_id: UUID, pool: asyncpg.Pool) -> None:
+        """
+        The true idleness check. Safely closes the pool or extends its life
+        if a stream is still active.
+        """
+        if pool.get_idle_size() == pool.get_size():
+            # Pool is idle. Safe to tear down.
+            self._pool_tasks.pop(connection_id, None)
             try:
-                pool = await get_workspace_pool(url)
-            except Exception:
-                # THE CURE FOR POISON: 
-                # If the task throws (e.g. InvalidPasswordError), the exception 
-                # bubbles up to the router. The pool is NEVER cached. 
-                # The next request will instantly try again.
-                raise
+                await pool.close()
+            except Exception as exc:
+                logger.warning(f"Failed to cleanly close idle workspace pool: {exc}")
+        else:
+            # A query or stream is still holding a connection. Extend TTL.
+            loop = asyncio.get_running_loop()
+            self._eviction_timers[connection_id] = loop.call_later(
+                self._ttl_seconds,
+                self._schedule_eviction,
+                connection_id,
+                pool
+            )
 
-            # -------------------------------------------------------------------
-            # 5. Cache Successful Pool
-            # -------------------------------------------------------------------
-            async with self._dict_lock:
-                self._pools[connection_id] = {
-                    "pool": pool,
-                    "last_used": time.monotonic()
-                }
+    async def close_all(self) -> None:
+        """
+        The Master Kill Switch.
+        Awaits all pending pool creations and cleanly closes every active pool.
+        Called exclusively by the FastAPI lifespan shutdown hook.
+        """
+        for timer in self._eviction_timers.values():
+            timer.cancel()
+        self._eviction_timers.clear()
 
-            return pool
+        tasks = list(self._pool_tasks.values())
+        self._pool_tasks.clear()
+
+        for task in tasks:
+            try:
+                pool = await task
+                await pool.close()
+            except Exception as exc:
+                logger.error(f"Error during graceful shutdown of workspace pool: {exc}")
 
 # Initialize the global singleton manager
 pool_manager = WorkspacePoolManager()

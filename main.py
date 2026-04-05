@@ -32,6 +32,7 @@ from core.db import init_db, init_redis, close_db
 from core.exceptions import register_exception_handlers
 from core.middleware import init_sentry, register_middleware
 from shared.telemetry import init_telemetry
+from domains.query.service import pool_manager
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,10 @@ async def lifespan(app: FastAPI):
         await pubsub_task
     except asyncio.CancelledError:
         pass
+
+    logger.info("SIGTERM received. Initiating graceful shutdown of all PostgreSQL workspace pools...")
+    await pool_manager.close_all()
+    logger.info("All workspace pools successfully closed. Network boundary secured.")
 
     await close_db()
     logger.info(f"{settings.APP_NAME} shutdown complete")
