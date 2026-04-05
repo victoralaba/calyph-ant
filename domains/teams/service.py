@@ -73,7 +73,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from core.auth import CurrentUser
 from core.db import get_db, get_db_context
 from shared.types import Base
-from shared.pubsub import SignalEvent
+from shared.pubsub import SignalEvent, ws_ingress_throttle
 
 
 # ---------------------------------------------------------------------------
@@ -1103,6 +1103,9 @@ async def workspace_websocket(
 
     await ws_manager.connect(workspace_id, websocket)
 
+    # Unique throttle key based on user ID or share link token
+    throttle_key = f"ws_{auth_data.get('id') or auth_data.get('token')}"
+
     try:
         while True:
             try:
@@ -1110,6 +1113,22 @@ async def workspace_websocket(
                     websocket.receive_text(),
                     timeout=30.0,
                 )
+
+                # ==========================================================
+                # INGRESS SHIELD: Execute Zero-I/O Throttle
+                # Position: MUST be immediately after receive, before json.loads
+                # ==========================================================
+                is_allowed = await ws_ingress_throttle.consume(throttle_key)
+                if not is_allowed:
+                    logger.warning(f"Malicious WS Flood blocked for key: {throttle_key}")
+                    # UI CONSIDERATION: 1008 is Policy Violation. 
+                    # The Svelte UI MUST interpret this as a severe rate limit.
+                    # Do NOT reconnect immediately. Implement an exponential backoff 
+                    # starting at no less than 5 seconds.
+                    await websocket.close(code=1008, reason="Rate limit exceeded")
+                    return
+                # ==========================================================
+
                 try:
                     data = json.loads(msg)
                 except (json.JSONDecodeError, TypeError):
