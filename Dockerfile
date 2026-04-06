@@ -16,8 +16,8 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e ".[dev]"
 
-# Install migra separately (needs psycopg2 which needs libpq-dev)
-RUN pip install --no-cache-dir migra psycopg2-binary
+# ARCHITECTURE FIX: Compile psycopg2 from source for ARM64 stability
+RUN pip install --no-cache-dir migra psycopg2
 
 # Copy source
 COPY . .
