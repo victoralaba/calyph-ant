@@ -2,37 +2,9 @@
 """
 Monitoring domain.
 
-Collects and exposes database health and performance metrics:
-- Table and index sizes
-- Row count estimates
-- Active connections and locks
-- Slow query log via pg_stat_statements
-- Index usage stats (unused index detection)
-- Cache hit ratios
-- Bloat estimates
-
-Permission-aware degradation
------------------------------
-All collectors now catch asyncpg.InsufficientPrivilegeError and return
-a structured "restricted" response rather than raising a 500. This is
-critical because cloud-managed databases (Neon, Supabase, Railway) often
-use restricted default roles that lack access to pg_locks, pg_stat_activity,
-and pg_stat_statements.
-
-Each endpoint that may require elevated privileges returns a consistent
-shape:
-  {
-    "data": [...] | null,
-    "restricted": bool,
-    "restriction_message": str | null,
-    "required_role": str | null,
-  }
-
-The overview endpoint aggregates availability and sets
-"monitoring_available": false when most stats are restricted.
-
-Feature 22: AI-powered index recommendations + one-click apply.
-(unchanged from original)
+Collects and exposes database health and performance metrics.
+Now securely routed through the WorkspacePoolManager to prevent 
+connection exhaustion under heavy load.
 """
 
 from __future__ import annotations
@@ -40,15 +12,19 @@ from __future__ import annotations
 import json
 from typing import Any
 from uuid import UUID
+from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from asyncpg.pool import PoolConnectionProxy
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
 
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
-from loguru import logger
+from core.middleware import limiter
+from domains.query.service import pool_manager
 
 
 # ---------------------------------------------------------------------------
@@ -56,14 +32,12 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 def _restricted(message: str, required_role: str | None = None) -> dict[str, Any]:
-    """Standard shape returned when a monitoring query fails due to privileges."""
     return {
         "data": None,
         "restricted": True,
         "restriction_message": message,
         "required_role": required_role,
     }
-
 
 def _ok(data: Any) -> dict[str, Any]:
     return {
@@ -74,18 +48,39 @@ def _ok(data: Any) -> dict[str, Any]:
     }
 
 def require_workspace(user: CurrentUser) -> UUID:
-    """Dependency to ensure the current user has an active workspace."""
     if not user.workspace_id:
         raise HTTPException(status_code=403, detail="Workspace context is required.")
     return user.workspace_id
 
 
 # ---------------------------------------------------------------------------
+# Connection Context Manager
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def _pg(connection_id: UUID, workspace_id: UUID, db: AsyncSession):
+    """
+    Acquires a pooled connection from the WorkspacePoolManager.
+    Automatically releases it back to the pool when the route finishes.
+    """
+    url = await get_connection_url(db, connection_id, workspace_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    
+    try:
+        pool = await pool_manager.get_pool(connection_id, url)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database pool unreachable: {exc}")
+
+    async with pool.acquire() as conn:
+        yield conn
+
+
+# ---------------------------------------------------------------------------
 # Collectors
 # ---------------------------------------------------------------------------
 
-async def get_overview(pg_conn: asyncpg.Connection) -> dict[str, Any]:
-    """High-level dashboard summary — single round trip via CTEs."""
+async def get_overview(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> dict[str, Any]:
     try:
         row = await pg_conn.fetchrow(
             """
@@ -138,7 +133,6 @@ async def get_overview(pg_conn: asyncpg.Connection) -> dict[str, Any]:
         return result
 
     except asyncpg.InsufficientPrivilegeError as exc:
-        # Fallback: collect what we can without privileged views
         try:
             minimal = await pg_conn.fetchrow(
                 """
@@ -172,8 +166,7 @@ async def get_overview(pg_conn: asyncpg.Connection) -> dict[str, Any]:
                 "restriction_message": str(exc),
             }
 
-
-async def get_table_sizes(pg_conn: asyncpg.Connection, schema: str = "public") -> dict[str, Any]:
+async def get_table_sizes(pg_conn: asyncpg.Connection | PoolConnectionProxy, schema: str = "public") -> dict[str, Any]:
     try:
         rows = await pg_conn.fetch(
             """
@@ -197,13 +190,11 @@ async def get_table_sizes(pg_conn: asyncpg.Connection, schema: str = "public") -
         return _ok([dict(r) for r in rows])
     except asyncpg.InsufficientPrivilegeError as exc:
         return _restricted(
-            f"Cannot read table sizes: {exc.args[0]}. "
-            "Requires SELECT on pg_class and pg_namespace.",
+            f"Cannot read table sizes: {exc.args[0]}. Requires SELECT on pg_class and pg_namespace.",
             required_role="pg_monitor or superuser",
         )
 
-
-async def get_index_stats(pg_conn: asyncpg.Connection, schema: str = "public") -> dict[str, Any]:
+async def get_index_stats(pg_conn: asyncpg.Connection | PoolConnectionProxy, schema: str = "public") -> dict[str, Any]:
     try:
         rows = await pg_conn.fetch(
             """
@@ -231,23 +222,15 @@ async def get_index_stats(pg_conn: asyncpg.Connection, schema: str = "public") -
         return _ok([dict(r) for r in rows])
     except asyncpg.InsufficientPrivilegeError as exc:
         return _restricted(
-            f"Cannot read index statistics: {exc.args[0]}. "
-            "Grant the pg_monitor role for index usage stats.",
+            f"Cannot read index statistics: {exc.args[0]}.",
             required_role="pg_monitor or superuser",
         )
 
-
 async def get_slow_queries(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     min_duration_ms: float = 100.0,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """
-    Fetch slow queries from pg_stat_statements.
-
-    Returns a structured restricted response (not a dict with "error" key)
-    when pg_stat_statements is not installed or the role lacks access.
-    """
     try:
         rows = await pg_conn.fetch(
             """
@@ -275,31 +258,17 @@ async def get_slow_queries(
             limit,
         )
         return _ok([dict(r) for r in rows])
-
     except asyncpg.UndefinedTableError:
-        return _restricted(
-            "pg_stat_statements extension is not installed. "
-            "Enable it via the Extensions manager to track slow queries.",
-            required_role=None,
-        )
+        return _restricted("pg_stat_statements extension is not installed.", required_role=None)
     except asyncpg.InsufficientPrivilegeError as exc:
         return _restricted(
-            f"Cannot read pg_stat_statements: {exc.args[0]}. "
-            "Grant pg_monitor role or enable pg_stat_statements with "
-            "pg_stat_statements.track = 'all' and appropriate permissions.",
+            f"Cannot read pg_stat_statements: {exc.args[0]}.",
             required_role="pg_monitor or superuser",
         )
     except Exception as exc:
-        # Catches the case where pg_stat_statements exists but the view
-        # is in a different schema or has a different structure
-        logger.warning(f"get_slow_queries unexpected error: {exc}")
-        return _restricted(
-            f"Could not read slow query data: {exc}",
-            required_role="pg_monitor or superuser",
-        )
+        return _restricted(f"Could not read slow query data: {exc}", required_role="pg_monitor")
 
-
-async def get_active_locks(pg_conn: asyncpg.Connection) -> dict[str, Any]:
+async def get_active_locks(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> dict[str, Any]:
     try:
         rows = await pg_conn.fetch(
             """
@@ -326,14 +295,9 @@ async def get_active_locks(pg_conn: asyncpg.Connection) -> dict[str, Any]:
         )
         return _ok([dict(r) for r in rows])
     except asyncpg.InsufficientPrivilegeError as exc:
-        return _restricted(
-            f"Cannot read lock information: {exc.args[0]}. "
-            "Grant the pg_monitor role to view active locks.",
-            required_role="pg_monitor or superuser",
-        )
+        return _restricted(f"Cannot read lock information: {exc.args[0]}.", required_role="pg_monitor")
 
-
-async def get_connection_stats(pg_conn: asyncpg.Connection) -> dict[str, Any]:
+async def get_connection_stats(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> dict[str, Any]:
     try:
         row = await pg_conn.fetchrow(
             """
@@ -350,14 +314,9 @@ async def get_connection_stats(pg_conn: asyncpg.Connection) -> dict[str, Any]:
         )
         return _ok(dict(row) if row else {})
     except asyncpg.InsufficientPrivilegeError as exc:
-        return _restricted(
-            f"Cannot read connection statistics: {exc.args[0]}. "
-            "Grant the pg_monitor role to view pg_stat_activity.",
-            required_role="pg_monitor or superuser",
-        )
+        return _restricted(f"Cannot read connection statistics: {exc.args[0]}.", required_role="pg_monitor")
 
-
-async def get_cache_stats(pg_conn: asyncpg.Connection) -> dict[str, Any]:
+async def get_cache_stats(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> dict[str, Any]:
     try:
         row = await pg_conn.fetchrow(
             """
@@ -379,14 +338,9 @@ async def get_cache_stats(pg_conn: asyncpg.Connection) -> dict[str, Any]:
         )
         return _ok(dict(row) if row else {})
     except asyncpg.InsufficientPrivilegeError as exc:
-        return _restricted(
-            f"Cannot read buffer cache statistics: {exc.args[0]}. "
-            "Grant the pg_monitor role for cache hit ratios.",
-            required_role="pg_monitor or superuser",
-        )
+        return _restricted(f"Cannot read buffer cache statistics: {exc.args[0]}.", required_role="pg_monitor")
 
-
-async def get_bloat_estimates(pg_conn: asyncpg.Connection, schema: str = "public") -> dict[str, Any]:
+async def get_bloat_estimates(pg_conn: asyncpg.Connection | PoolConnectionProxy, schema: str = "public") -> dict[str, Any]:
     try:
         rows = await pg_conn.fetch(
             """
@@ -423,18 +377,14 @@ async def get_bloat_estimates(pg_conn: asyncpg.Connection, schema: str = "public
         )
         return _ok([dict(r) for r in rows])
     except asyncpg.InsufficientPrivilegeError as exc:
-        return _restricted(
-            f"Cannot estimate bloat: {exc.args[0]}. "
-            "Grant the pg_monitor role for bloat estimates.",
-            required_role="pg_monitor or superuser",
-        )
+        return _restricted(f"Cannot estimate bloat: {exc.args[0]}.", required_role="pg_monitor")
 
 
 # ---------------------------------------------------------------------------
-# Feature 22: AI-powered index recommendations
+# AI Recommendations
 # ---------------------------------------------------------------------------
 
-async def _get_schema_context(pg_conn: asyncpg.Connection, schema: str) -> str:
+async def _get_schema_context(pg_conn: asyncpg.Connection | PoolConnectionProxy, schema: str) -> str:
     rows = await pg_conn.fetch(
         """
         SELECT
@@ -456,8 +406,7 @@ async def _get_schema_context(pg_conn: asyncpg.Connection, schema: str) -> str:
     lines = [f"  {r['table_name']}({r['columns']})" for r in rows]
     return "\n".join(lines) or "No tables found."
 
-
-async def _get_existing_indexes(pg_conn: asyncpg.Connection, schema: str) -> str:
+async def _get_existing_indexes(pg_conn: asyncpg.Connection | PoolConnectionProxy, schema: str) -> str:
     rows = await pg_conn.fetch(
         """
         SELECT indexname, tablename, indexdef
@@ -471,14 +420,12 @@ async def _get_existing_indexes(pg_conn: asyncpg.Connection, schema: str) -> str
     lines = [f"  {r['tablename']}: {r['indexname']}" for r in rows]
     return "\n".join(lines) or "No indexes."
 
-
 async def generate_index_recommendations(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     schema: str = "public",
     slow_query_threshold_ms: float = 100.0,
 ) -> list[dict[str, Any]]:
-    from core.config import settings
-    from domains.ai.providers import get_provider
+    from domains.ai.providers import get_provider  # type: ignore
 
     slow_query_result = await get_slow_queries(pg_conn, slow_query_threshold_ms, limit=15)
     slow_queries: list[dict] = []
@@ -504,10 +451,7 @@ async def generate_index_recommendations(
                 f"cache_hit={q['cache_hit_pct']}%\n   {str(q['query'])[:200]}\n"
             )
     else:
-        slow_q_text = (
-            "No slow query data available "
-            "(pg_stat_statements not installed or role lacks pg_monitor)."
-        )
+        slow_q_text = "No slow query data available."
 
     unused_text = ""
     if unused_indexes:
@@ -537,9 +481,6 @@ Each element must have exactly these fields:
 Rules:
 - Only recommend indexes that don't already exist.
 - Prefer composite indexes over multiple single-column indexes.
-- For foreign keys without indexes, always recommend — high impact.
-- For columns in WHERE clauses of slow queries, recommend — medium/high impact.
-- Unused indexes: flag for dropping with sql = "DROP INDEX CONCURRENTLY ...".
 - Maximum 8 recommendations total.
 - If no recommendations, return empty array [].
 """
@@ -586,21 +527,10 @@ Generate index recommendations:"""
 
 router = APIRouter(prefix="/monitoring", tags=["monitoring"])
 
-
 class ApplyRecommendationRequest(BaseModel):
     sql: str = Field(..., description="CREATE INDEX or DROP INDEX SQL from recommendation")
     label: str = Field(..., description="Human-readable label for the migration record")
     apply_immediately: bool = Field(default=False)
-
-
-async def _pg(connection_id: UUID, workspace_id: UUID, db: AsyncSession) -> asyncpg.Connection:
-    url = await get_connection_url(db, connection_id, workspace_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    try:
-        return await asyncpg.connect(dsn=url, timeout=15)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
 
 
 @router.get("/{connection_id}/overview")
@@ -610,12 +540,8 @@ async def overview(
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         return await get_overview(pg_conn)
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/tables")
 async def table_sizes(
@@ -625,16 +551,11 @@ async def table_sizes(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_table_sizes(pg_conn, schema_name)
-        # Backwards-compatible: unwrap for clients that expect {"tables": [...]}
         if not result.get("restricted"):
             return {"tables": result["data"], "restricted": False}
         return {"tables": [], **result}
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/indexes")
 async def index_stats(
@@ -644,15 +565,11 @@ async def index_stats(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_index_stats(pg_conn, schema_name)
         if not result.get("restricted"):
             return {"indexes": result["data"], "restricted": False}
         return {"indexes": [], **result}
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/queries")
 async def slow_queries(
@@ -663,15 +580,11 @@ async def slow_queries(
     min_ms: float = Query(100.0),
     limit: int = Query(20, le=100),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_slow_queries(pg_conn, min_ms, limit)
         if not result.get("restricted"):
             return {"queries": result["data"], "restricted": False}
         return {"queries": [], **result}
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/locks")
 async def active_locks(
@@ -680,33 +593,24 @@ async def active_locks(
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_active_locks(pg_conn)
         if not result.get("restricted"):
             return {"locks": result["data"], "restricted": False}
         return {"locks": [], **result}
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/connections")
 async def connection_stats(
     connection_id: UUID,
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
-
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_connection_stats(pg_conn)
         if not result.get("restricted"):
             return result["data"]
         return result
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/cache")
 async def cache_stats(
@@ -715,15 +619,11 @@ async def cache_stats(
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_cache_stats(pg_conn)
         if not result.get("restricted"):
             return result["data"]
         return result
-    finally:
-        await pg_conn.close()
-
 
 @router.get("/{connection_id}/bloat")
 async def bloat_estimates(
@@ -733,18 +633,17 @@ async def bloat_estimates(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
         result = await get_bloat_estimates(pg_conn, schema_name)
         if not result.get("restricted"):
             return {"bloat": result["data"], "restricted": False}
         return {"bloat": [], **result}
-    finally:
-        await pg_conn.close()
 
 
 @router.post("/{connection_id}/recommendations")
+@limiter.limit("3/minute")
 async def get_index_recommendations(
+    request: Request,
     connection_id: UUID,
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
@@ -752,17 +651,15 @@ async def get_index_recommendations(
     schema_name: str = Query("public"),
     min_ms: float = Query(100.0),
 ):
-    pg_conn = await _pg(connection_id, workspace_id, db)
-    try:
-        recommendations = await generate_index_recommendations(
-            pg_conn, schema=schema_name, slow_query_threshold_ms=min_ms
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Recommendation generation failed: {exc}")
-    finally:
-        await pg_conn.close()
+    async with _pg(connection_id, workspace_id, db) as pg_conn:
+        try:
+            recommendations = await generate_index_recommendations(
+                pg_conn, schema=schema_name, slow_query_threshold_ms=min_ms
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Recommendation generation failed: {exc}")
 
     return {
         "connection_id": str(connection_id),
@@ -805,10 +702,7 @@ async def apply_recommendation(
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "message": str(exc),
-                "code": "INSUFFICIENT_PRIVILEGES",
-            },
+            detail={"message": str(exc), "code": "INSUFFICIENT_PRIVILEGES"},
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to create migration: {exc}")
@@ -827,19 +721,17 @@ async def apply_recommendation(
     apply_error: str | None = None
 
     if body.apply_immediately:
-        pg_conn = await _pg(connection_id, workspace_id, db)
-        try:
-            await apply_migration(pg_conn, db, record.id)
-            applied = True
-        except asyncpg.InsufficientPrivilegeError as exc:
-            apply_error = (
-                f"Insufficient privileges: {exc.args[0]}. "
-                "The connected role needs DDL privileges to apply this index."
-            )
-        except Exception as exc:
-            apply_error = str(exc)
-        finally:
-            await pg_conn.close()
+        async with _pg(connection_id, workspace_id, db) as pg_conn:
+            try:
+                await apply_migration(pg_conn, db, record.id)
+                applied = True
+            except asyncpg.InsufficientPrivilegeError as exc:
+                apply_error = (
+                    f"Insufficient privileges: {exc.args[0]}. "
+                    "The connected role needs DDL privileges to apply this index."
+                )
+            except Exception as exc:
+                apply_error = str(exc)
 
     return {
         "migration_id": str(record.id),

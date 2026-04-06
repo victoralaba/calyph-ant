@@ -49,6 +49,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
+from asyncpg.pool import PoolConnectionProxy
 from loguru import logger
 from sqlalchemy import DateTime, ForeignKey, String, Text, Boolean, Integer, UniqueConstraint
 from sqlalchemy import select, update
@@ -633,7 +634,7 @@ async def _create_migration_attempt(
 
 
 async def apply_migration(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     db: AsyncSession,
     migration_id: UUID,
     force_apply: bool = False,
@@ -722,7 +723,7 @@ async def apply_migration(
 
 
 async def rollback_migration(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     db: AsyncSession,
     migration_id: UUID,
 ) -> MigrationRecord:
@@ -769,7 +770,7 @@ async def rollback_migration(
 
 
 async def apply_pending(
-    pg_conn: asyncpg.Connection,
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     db: AsyncSession,
     connection_id: UUID,
     force_apply: bool = False,
