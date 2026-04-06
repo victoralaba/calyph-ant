@@ -39,11 +39,12 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, AsyncGenerator
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -345,7 +346,7 @@ async def diff_live_against_calyph(
 
 
 # ---------------------------------------------------------------------------
-# Export — full schema
+# Export — full schema (Streamed)
 # ---------------------------------------------------------------------------
 
 @router.get("/{connection_id}/export")
@@ -358,198 +359,160 @@ async def export_schema_sql(
 ):
     """
     Export the full schema as SQL statements.
-
-    Notes:
-    - Postgres does NOT support CREATE TYPE IF NOT EXISTS.
-    - Functions/triggers are listed as comment stubs only.
-      Use pg_dump --schema-only for complete procedural code export.
+    
+    UI EXPECTATION:
+    - This endpoint NO LONGER returns JSON. It returns a raw `application/sql` file stream.
+    - Do NOT call `response.json()` in Svelte. Svelte MUST use `response.blob()` 
+      to trigger a file download, or `response.text()` if previewing.
+    - Metadata and export statistics (table count, db name) have been moved to HTTP 
+      Response Headers (e.g., `X-Export-Stats-Tables`) so they are still accessible to the UI.
     """
     url = await _get_url(connection_id, workspace_id, db)
+    
+    # We still fetch the structural blueprint into memory, but we will NOT hold 
+    # the massive generated SQL strings in memory.
     snapshot = await introspection.introspect_database(url, schema_name)
-
-    lines = [
-        f"-- Calyphant schema export",
-        f"-- Database: {snapshot.database}",
-        f"-- PostgreSQL: {snapshot.pg_version}",
-        f"-- Schema: {schema_name}",
-        f"-- Note: run inside a transaction and ROLLBACK to preview safely.",
-        "",
-    ]
-
-    # Extensions
-    if snapshot.extensions:
-        lines.append("-- Extensions")
-        for ext in snapshot.extensions:
-            lines.append(
-                f"CREATE EXTENSION IF NOT EXISTS \"{ext['name']}\" "
-                f"WITH SCHEMA {schema_name};"
-            )
-        lines.append("")
-
-    # Enums — no IF NOT EXISTS support in Postgres
-    if snapshot.enums:
-        lines.append("-- Enum types")
-        lines.append(
-            "-- Note: CREATE TYPE does not support IF NOT EXISTS. "
-            "Drop types first or wrap in exception handling for idempotent runs."
-        )
-        for enum in snapshot.enums:
-            vals = ", ".join(
-                f"'{v.replace(chr(39), chr(39)+chr(39))}'"
-                for v in enum.values
-            )
-            lines.append(
-                f'CREATE TYPE "{enum.schema}"."{enum.name}" AS ENUM ({vals});'
-            )
-        lines.append("")
-
-    # Standalone sequences
-    standalone_seqs = [
-        s for s in snapshot.sequences
-        if not any(
-            any(
-                col.default and "nextval" in (col.default or "").lower()
-                and s.name in (col.default or "")
-                for col in t.columns
-            )
-            for t in snapshot.tables
-            if t.kind == "table"
-        )
-    ]
-    if standalone_seqs:
-        lines.append("-- Sequences")
-        for seq in standalone_seqs:
-            lines.append(
-                f'CREATE SEQUENCE IF NOT EXISTS "{seq.schema}"."{seq.name}" '
-                f"AS {seq.data_type} "
-                f"START {seq.start} INCREMENT {seq.increment};"
-            )
-        lines.append("")
-
-    # Base tables
+    
     base_tables = [t for t in snapshot.tables if t.kind == "table"]
-    if base_tables:
-        lines.append("-- Tables")
-    for table in base_tables:
-        col_parts = []
-        pk_cols = table.primary_key or []
-        single_pk_col = pk_cols[0] if len(pk_cols) == 1 else None
-
-        for col in table.columns:
-            default = f" DEFAULT {col.default}" if col.default else ""
-            null = "" if col.nullable else " NOT NULL"
-            pk = " PRIMARY KEY" if (col.is_primary_key and single_pk_col) else ""
-            col_parts.append(f'    "{col.name}" {col.data_type}{pk}{null}{default}')
-
-        if len(pk_cols) > 1:
-            pk_list = ", ".join(f'"{c}"' for c in pk_cols)
-            col_parts.append(f"    PRIMARY KEY ({pk_list})")
-
-        for fk in table.foreign_keys:
-            cols = ", ".join(f'"{c}"' for c in fk.columns)
-            refs = ", ".join(f'"{c}"' for c in fk.referred_columns)
-            ref_schema = fk.referred_schema or schema_name
-            fk_name = fk.name or f"fk_{table.name}_{'_'.join(fk.columns)}"
-            col_parts.append(
-                f'    CONSTRAINT "{fk_name}" FOREIGN KEY ({cols}) '
-                f'REFERENCES "{ref_schema}"."{fk.referred_table}" ({refs})'
-            )
-
-        for cc in table.check_constraints:
-            col_parts.append(
-                f'    CONSTRAINT "{cc.name}" CHECK ({cc.sqltext})'
-            )
-
-        cols_sql = ",\n".join(col_parts)
-        lines.append(f'CREATE TABLE IF NOT EXISTS "{table.schema}"."{table.name}" (')
-        lines.append(cols_sql)
-        lines.append(");")
-        lines.append("")
-
-        for uc in table.unique_constraints:
-            uc_cols = ", ".join(f'"{c}"' for c in uc.get("column_names", []))
-            uc_name = (
-                uc.get("name")
-                or f"uq_{table.name}_{'_'.join(uc.get('column_names', []))}"
-            )
-            if uc_cols:
-                lines.append(
-                    f'ALTER TABLE "{table.schema}"."{table.name}" '
-                    f'ADD CONSTRAINT "{uc_name}" UNIQUE ({uc_cols});'
-                )
-
-        for idx in table.indexes:
-            cols = ", ".join(f'"{c}"' for c in idx.columns)
-            unique = "UNIQUE " if idx.unique else ""
-            where = f" WHERE {idx.predicate}" if idx.predicate else ""
-            lines.append(
-                f'CREATE {unique}INDEX IF NOT EXISTS "{idx.name}" '
-                f'ON "{table.schema}"."{table.name}" '
-                f"USING {idx.method} ({cols}){where};"
-            )
-        lines.append("")
-
-    # Views
     views = [t for t in snapshot.tables if t.kind == "view"]
-    if views:
-        lines.append("-- Views")
-        for view in views:
-            if view.view_definition:
-                defn = view.view_definition.rstrip(";").strip()
-                lines.append(
-                    f'CREATE OR REPLACE VIEW "{view.schema}"."{view.name}" AS\n{defn};'
-                )
-            else:
-                lines.append(
-                    f"-- VIEW: \"{view.schema}\".\"{view.name}\" "
-                    f"({len(view.columns)} columns) — definition unavailable"
-                )
-            lines.append("")
-
-    # Materialized views
     mat_views = [t for t in snapshot.tables if t.kind == "materialized_view"]
-    if mat_views:
-        lines.append("-- Materialized views")
-        for mv in mat_views:
-            if mv.view_definition:
-                defn = mv.view_definition.rstrip(";").strip()
-                lines.append(
-                    f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{mv.schema}"."{mv.name}" AS\n{defn};'
-                )
-                for idx in mv.indexes:
-                    cols = ", ".join(f'"{c}"' for c in idx.columns)
-                    unique = "UNIQUE " if idx.unique else ""
-                    where = f" WHERE {idx.predicate}" if idx.predicate else ""
-                    lines.append(
-                        f'CREATE {unique}INDEX IF NOT EXISTS "{idx.name}" '
-                        f'ON "{mv.schema}"."{mv.name}" '
-                        f"USING {idx.method} ({cols}){where};"
-                    )
-            else:
-                lines.append(
-                    f"-- MATERIALIZED VIEW: \"{mv.schema}\".\"{mv.name}\" "
-                    f"({len(mv.columns)} columns) — definition unavailable"
-                )
-            lines.append("")
 
-    lines.append("-- Functions and triggers")
-    lines.append(
-        "-- Full function/trigger body export is not supported here. "
-        "Use pg_dump --schema-only for a complete export including procedural code."
-    )
-    lines.append("")
+    async def stream_sql() -> AsyncGenerator[str, None]:
+        # Yield lines directly to the TCP stream. Let the Garbage Collector handle memory.
+        yield f"-- Calyphant schema export\n"
+        yield f"-- Database: {snapshot.database}\n"
+        yield f"-- PostgreSQL: {snapshot.pg_version}\n"
+        yield f"-- Schema: {schema_name}\n"
+        yield f"-- Note: run inside a transaction and ROLLBACK to preview safely.\n\n"
 
-    return {
-        "sql": "\n".join(lines),
-        "database": snapshot.database,
-        "stats": {
-            "tables": len(base_tables),
-            "views": len(views),
-            "materialized_views": len(mat_views),
-            "enums": len(snapshot.enums),
-            "extensions": len(snapshot.extensions),
-        },
+        # Extensions
+        if snapshot.extensions:
+            yield "-- Extensions\n"
+            for ext in snapshot.extensions:
+                yield f"CREATE EXTENSION IF NOT EXISTS \"{ext['name']}\" WITH SCHEMA {schema_name};\n"
+            yield "\n"
+
+        # Enums
+        if snapshot.enums:
+            yield "-- Enum types\n"
+            yield "-- Note: CREATE TYPE does not support IF NOT EXISTS. Drop types first or wrap in exception handling for idempotent runs.\n"
+            for enum in snapshot.enums:
+                vals = ", ".join(f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in enum.values)
+                yield f'CREATE TYPE "{enum.schema}"."{enum.name}" AS ENUM ({vals});\n'
+            yield "\n"
+
+        # Sequences
+        standalone_seqs = [
+            s for s in snapshot.sequences
+            if not any(
+                any(
+                    col.default and "nextval" in (col.default or "").lower()
+                    and s.name in (col.default or "")
+                    for col in t.columns
+                )
+                for t in snapshot.tables if t.kind == "table"
+            )
+        ]
+        if standalone_seqs:
+            yield "-- Sequences\n"
+            for seq in standalone_seqs:
+                yield f'CREATE SEQUENCE IF NOT EXISTS "{seq.schema}"."{seq.name}" AS {seq.data_type} START {seq.start} INCREMENT {seq.increment};\n'
+            yield "\n"
+
+        # Base tables
+        if base_tables:
+            yield "-- Tables\n"
+        for table in base_tables:
+            col_parts = []
+            pk_cols = table.primary_key or []
+            single_pk_col = pk_cols[0] if len(pk_cols) == 1 else None
+
+            for col in table.columns:
+                default = f" DEFAULT {col.default}" if col.default else ""
+                null = "" if col.nullable else " NOT NULL"
+                pk = " PRIMARY KEY" if (col.is_primary_key and single_pk_col) else ""
+                col_parts.append(f'    "{col.name}" {col.data_type}{pk}{null}{default}')
+
+            if len(pk_cols) > 1:
+                pk_list = ", ".join(f'"{c}"' for c in pk_cols)
+                col_parts.append(f"    PRIMARY KEY ({pk_list})")
+
+            for fk in table.foreign_keys:
+                cols = ", ".join(f'"{c}"' for c in fk.columns)
+                refs = ", ".join(f'"{c}"' for c in fk.referred_columns)
+                ref_schema = fk.referred_schema or schema_name
+                fk_name = fk.name or f"fk_{table.name}_{'_'.join(fk.columns)}"
+                col_parts.append(
+                    f'    CONSTRAINT "{fk_name}" FOREIGN KEY ({cols}) '
+                    f'REFERENCES "{ref_schema}"."{fk.referred_table}" ({refs})'
+                )
+
+            for cc in table.check_constraints:
+                col_parts.append(f'    CONSTRAINT "{cc.name}" CHECK ({cc.sqltext})')
+
+            cols_sql = ",\n".join(col_parts)
+            yield f'CREATE TABLE IF NOT EXISTS "{table.schema}"."{table.name}" (\n'
+            yield f"{cols_sql}\n"
+            yield ");\n\n"
+
+            for uc in table.unique_constraints:
+                uc_cols = ", ".join(f'"{c}"' for c in uc.get("column_names", []))
+                uc_name = uc.get("name") or f"uq_{table.name}_{'_'.join(uc.get('column_names', []))}"
+                if uc_cols:
+                    yield f'ALTER TABLE "{table.schema}"."{table.name}" ADD CONSTRAINT "{uc_name}" UNIQUE ({uc_cols});\n'
+
+            for idx in table.indexes:
+                cols = ", ".join(f'"{c}"' for c in idx.columns)
+                unique = "UNIQUE " if idx.unique else ""
+                where = f" WHERE {idx.predicate}" if idx.predicate else ""
+                yield f'CREATE {unique}INDEX IF NOT EXISTS "{idx.name}" ON "{table.schema}"."{table.name}" USING {idx.method} ({cols}){where};\n'
+            yield "\n"
+
+        # Views
+        if views:
+            yield "-- Views\n"
+            for view in views:
+                if view.view_definition:
+                    defn = view.view_definition.rstrip(";").strip()
+                    yield f'CREATE OR REPLACE VIEW "{view.schema}"."{view.name}" AS\n{defn};\n\n'
+                else:
+                    yield f"-- VIEW: \"{view.schema}\".\"{view.name}\" ({len(view.columns)} columns) — definition unavailable\n\n"
+
+        # Materialized views
+        if mat_views:
+            yield "-- Materialized views\n"
+            for mv in mat_views:
+                if mv.view_definition:
+                    defn = mv.view_definition.rstrip(";").strip()
+                    yield f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{mv.schema}"."{mv.name}" AS\n{defn};\n'
+                    for idx in mv.indexes:
+                        cols = ", ".join(f'"{c}"' for c in idx.columns)
+                        unique = "UNIQUE " if idx.unique else ""
+                        where = f" WHERE {idx.predicate}" if idx.predicate else ""
+                        yield f'CREATE {unique}INDEX IF NOT EXISTS "{idx.name}" ON "{mv.schema}"."{mv.name}" USING {idx.method} ({cols}){where};\n'
+                else:
+                    yield f"-- MATERIALIZED VIEW: \"{mv.schema}\".\"{mv.name}\" ({len(mv.columns)} columns) — definition unavailable\n"
+                yield "\n"
+
+        yield "-- Functions and triggers\n"
+        yield "-- Full function/trigger body export is not supported here. Use pg_dump --schema-only for a complete export including procedural code.\n\n"
+
+    # Inject the stats into the HTTP headers
+    # `Content-Disposition` prompts the browser to handle this natively as a file download.
+    headers = {
+        "Content-Disposition": f'attachment; filename="schema_{snapshot.database}_{schema_name}.sql"',
+        "X-Export-Database": str(snapshot.database),
+        "X-Export-Stats-Tables": str(len(base_tables)),
+        "X-Export-Stats-Views": str(len(views)),
+        "X-Export-Stats-MatViews": str(len(mat_views)),
+        "X-Export-Stats-Enums": str(len(snapshot.enums)),
     }
+
+    return StreamingResponse(
+        stream_sql(), 
+        media_type="application/sql", 
+        headers=headers
+    )
 
 
 # ---------------------------------------------------------------------------
