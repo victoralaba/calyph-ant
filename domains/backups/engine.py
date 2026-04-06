@@ -504,11 +504,15 @@ async def generate_r2_download_url(key: str, expires_in: int = 3600) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def stream_sql_backup_to_r2(url: str, key: str, schema_only: bool = False, timeout_sec: int = 600) -> tuple[int, str]:
+async def stream_sql_backup_to_r2(
+    url: str, 
+    key: str, 
+    schema_only: bool = False, 
+    timeout_sec: int = 14400  # Elevated from 600s to 4 hours. Celery time_limit takes precedence.
+) -> tuple[int, str]:
     """
     Streams pg_dump stdout directly into a zlib compressor and out to an R2 multipart upload.
     Peak memory footprint: ~5MB (Boto3 part size) regardless of database size.
-    Returns: (total_size_bytes, sha256_checksum)
     """
     client = _r2_client()
     upload = await asyncio.to_thread(
@@ -531,25 +535,51 @@ async def stream_sql_backup_to_r2(url: str, key: str, schema_only: bool = False,
         env={"PGPASSWORD": _extract_password(url), **_safe_env()},
     )
 
-    # Type safety enforcement
     assert proc.stdout is not None, "Failed to open stdout pipe to pg_dump"
     assert proc.stderr is not None, "Failed to open stderr pipe to pg_dump"
+
+    # --- THE MUSCLE: Type-Locking for Static Analysis ---
+    # Bind to strictly-typed local variables so Pylance doesn't lose 
+    # the type narrowing inside the async closure boundary.
+    pg_dump_stdout = proc.stdout
+    pg_dump_stderr = proc.stderr
+    # ----------------------------------------------------
 
     compressor = zlib.compressobj(wbits=31)
     buffer = bytearray()
     part_num = 1
 
     try:
-        while True:
-            chunk = await proc.stdout.read(1024 * 1024)
-            if not chunk:
-                break
-                
-            compressed_chunk = compressor.compress(chunk)
-            if compressed_chunk:
-                buffer.extend(compressed_chunk)
+        # Wrap the entire pumping mechanism in the elevated physics timeout
+        async def _pump():
+            nonlocal total_size, part_num
+            while True:
+                # Use the strictly-typed local variable
+                chunk = await pg_dump_stdout.read(1024 * 1024)
+                if not chunk:
+                    break
+                    
+                compressed_chunk = compressor.compress(chunk)
+                if compressed_chunk:
+                    buffer.extend(compressed_chunk)
 
-            if len(buffer) >= 5 * 1024 * 1024:
+                if len(buffer) >= 5 * 1024 * 1024:
+                    hasher.update(buffer)
+                    total_size += len(buffer)
+                    res = await asyncio.to_thread(
+                        client.upload_part,
+                        Bucket=settings.R2_BUCKET_NAME, Key=key,
+                        PartNumber=part_num, UploadId=upload_id, Body=bytes(buffer),
+                    )
+                    parts.append({"PartNumber": part_num, "ETag": res["ETag"]})
+                    part_num += 1
+                    buffer.clear()
+
+            tail = compressor.flush()
+            if tail:
+                buffer.extend(tail)
+
+            if len(buffer) > 0:
                 hasher.update(buffer)
                 total_size += len(buffer)
                 res = await asyncio.to_thread(
@@ -558,27 +588,14 @@ async def stream_sql_backup_to_r2(url: str, key: str, schema_only: bool = False,
                     PartNumber=part_num, UploadId=upload_id, Body=bytes(buffer),
                 )
                 parts.append({"PartNumber": part_num, "ETag": res["ETag"]})
-                part_num += 1
-                buffer.clear()
 
-        tail = compressor.flush()
-        if tail:
-            buffer.extend(tail)
+            await proc.wait()
+            if proc.returncode != 0:
+                # Use the strictly-typed local variable
+                stderr_bytes = await pg_dump_stderr.read()
+                raise RuntimeError(f"pg_dump failed: {stderr_bytes.decode()}")
 
-        if len(buffer) > 0:
-            hasher.update(buffer)
-            total_size += len(buffer)
-            res = await asyncio.to_thread(
-                client.upload_part,
-                Bucket=settings.R2_BUCKET_NAME, Key=key,
-                PartNumber=part_num, UploadId=upload_id, Body=bytes(buffer),
-            )
-            parts.append({"PartNumber": part_num, "ETag": res["ETag"]})
-
-        await proc.wait()
-        if proc.returncode != 0:
-            stderr_bytes = await proc.stderr.read()
-            raise RuntimeError(f"pg_dump failed: {stderr_bytes.decode()}")
+        await asyncio.wait_for(_pump(), timeout=timeout_sec)
 
         await asyncio.to_thread(
             client.complete_multipart_upload,
@@ -598,8 +615,11 @@ async def stream_sql_backup_to_r2(url: str, key: str, schema_only: bool = False,
             pass
         raise e
 
-
-async def stream_r2_to_psql(url: str, key: str, timeout_sec: int = 600) -> dict[str, Any]:
+async def stream_r2_to_psql(
+    url: str, 
+    key: str, 
+    timeout_sec: int = 14400 # Elevated from 600s to 4 hours. Celery time_limit takes precedence.
+) -> dict[str, Any]:
     """
     Streams gzipped SQL directly from R2, decompresses on the fly, 
     and writes to psql stdin. Zero temporary files. Zero RAM buffering.
@@ -618,15 +638,11 @@ async def stream_r2_to_psql(url: str, key: str, timeout_sec: int = 600) -> dict[
         env={"PGPASSWORD": _extract_password(url), **_safe_env()},
     )
 
-    # Type safety enforcement
     assert proc.stdin is not None, "Failed to open stdin pipe to psql"
     assert proc.stdout is not None, "Failed to open stdout pipe to psql"
     assert proc.stderr is not None, "Failed to open stderr pipe to psql"
 
-    # Bind to strictly-typed local variables so Pylance doesn't lose 
-    # the type narrowing inside the closure.
     psql_stdin = proc.stdin 
-
     decompressor = zlib.decompressobj(wbits=31)
 
     async def pump_data():
@@ -650,15 +666,16 @@ async def stream_r2_to_psql(url: str, key: str, timeout_sec: int = 600) -> dict[
     pump_task = asyncio.create_task(pump_data())
 
     try:
+        # Replaced the tight 600s timeout with our physics-based ceiling
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
-        raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
+        raise RuntimeError(f"psql restore timed out after {timeout_sec}s. Target database may be too large or network is stalling.")
     
-    await pump_task  # Ensure pumping is finished
+    await pump_task  
         
     stderr_text = stderr.decode()
     errors = [
@@ -1688,15 +1705,30 @@ async def create_backup_endpoint(
 ):
     """
     [UI CONSIDERATION]
-    This endpoint now returns an HTTP 202 Accepted immediately. 
-    The returned BackupRecord object will have status="pending".
-    The UI MUST poll `GET /backups/{connection_id}` to update the visual state 
-    when the background worker moves the status to "completed" or "failed".
+    This endpoint enforces strict concurrency locking. 
+    If a user clicks "Backup" while one is already running/pending, it returns a 409 Conflict.
+    The UI MUST disable the "Trigger Backup" button if the most recent backup in the 
+    list has a status of 'pending' or 'running'.
     """
     if not user.workspace_id:
         raise HTTPException(status_code=400, detail="User has no workspace.")
     if body.format not in ("calyph", "sql"):
         raise HTTPException(status_code=400, detail="format must be 'calyph' or 'sql'")
+
+    # --- THE MUSCLE: Admission Control / Concurrency Lock ---
+    # Do not allow queuing if the worker is already processing a backup for this connection.
+    active_query = select(BackupRecord.id).where(
+        BackupRecord.connection_id == connection_id,
+        BackupRecord.status.in_(["pending", "running"])
+    )
+    active_backup = (await db.execute(active_query)).first()
+    
+    if active_backup:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail="A backup is already in progress for this connection. Wait for it to complete."
+        )
+    # --------------------------------------------------------
 
     # Resolve schema so the UI sees it immediately on the pending record
     from domains.backups.engine import _resolve_schema_version
@@ -1743,12 +1775,42 @@ async def restore_backup_endpoint(
 ):
     """
     [UI CONSIDERATION]
-    Restores and conflict detection now execute entirely in the background.
-    This endpoint establishes a state machine in Redis and returns a Job ID.
-    The UI MUST poll `GET /backups/restore/{job_id}/status` to get the Phase 1
-    Conflict Report or the Phase 2 Execution Results.
+    The UI MUST disable the "Restore" button if the connection is currently 
+    running a backup or another restore. This endpoint will reject concurrent 
+    heavy mutations with a 409.
     """
     assert user.workspace_id is not None
+    
+    # --- THE MUSCLE: System-Wide Mutation Lock ---
+    # A connection can only handle one physical mutation (Backup or Restore) at a time.
+    active_query = select(BackupRecord.id).where(
+        BackupRecord.connection_id == connection_id,
+        BackupRecord.status.in_(["pending", "running", "restoring"]) # Add restoring state check
+    )
+    active_job = (await db.execute(active_query)).first()
+    
+    if active_job:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail="Database is currently locked by another active backup or restore operation."
+        )
+
+    # Check if a restore job is already registered in Redis for this connection
+    from core.db import get_redis
+    redis = await get_redis()
+    
+    # We create a lightweight lock key specifically for the connection's restore state
+    lock_key = f"active_restore_lock:{connection_id}"
+    is_locked = await redis.get(lock_key)
+    
+    if is_locked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail="A restore operation is already initializing. Please wait."
+        )
+    # Set a 5-minute expiry on the lock in case the worker crashes before clearing it
+    await redis.setex(lock_key, 300, "locked")
+    # ---------------------------------------------
     
     job_id = str(uuid4())
     state = {
@@ -1758,8 +1820,6 @@ async def restore_backup_endpoint(
         "error": None
     }
 
-    from core.db import get_redis
-    redis = await get_redis()
     await redis.setex(f"restore_job:{job_id}", 3600, json.dumps(state))
 
     from worker.celery import execute_background_restore
@@ -1879,15 +1939,34 @@ async def create_or_update_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Create or update the backup schedule for a connection.
-    One schedule per connection — subsequent calls update the existing one.
+    [UI CONSIDERATION]
+    The UI schedule builder MUST NOT allow users to select frequencies lower than 1 hour.
+    If they manually inject a sub-hour cron expression via API, this will return a 400.
     """
     assert user.workspace_id is not None
-    # Validate cron expression
+    
+    # --- THE MUSCLE: Physics-Based Schedule Guard ---
     try:
-        next_run = compute_next_run(body.cron)
+        from croniter import croniter
+        now = datetime.now(timezone.utc)
+        
+        # We test the gap between the first and second hypothetical runs
+        it = croniter(body.cron, now)
+        run_1 = it.get_next(datetime)
+        run_2 = it.get_next(datetime)
+        
+        interval_seconds = (run_2 - run_1).total_seconds()
+        
+        if interval_seconds < 3600:
+            raise HTTPException(
+                status_code=400, 
+                detail="Schedules cannot run more frequently than once per hour to prevent resource exhaustion."
+            )
+            
+        next_run = run_1
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {exc}")
+    # ------------------------------------------------
 
     result = await db.execute(
         select(BackupSchedule).where(BackupSchedule.connection_id == connection_id)

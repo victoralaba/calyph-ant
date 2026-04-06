@@ -31,6 +31,7 @@ from kombu import Queue
 import socket
 import subprocess
 import time
+import threading
 from typing import Any, Dict
 
 try:
@@ -669,18 +670,32 @@ def _wait_for_db(host: str, port: int, timeout: int = 15) -> bool:
     return False
 
 
-@shared_task(bind=True, time_limit=90, soft_time_limit=75)
+# --- THE MUSCLE: Hardware Concurrency Semaphore ---
+# Limit the worker to a maximum of 3 concurrent Docker Postgres containers.
+# If 10 requests come in, 3 run, 7 wait safely without triggering an OOM kill.
+DOCKER_SEMAPHORE = threading.Semaphore(3)
+
+@shared_task(bind=True, time_limit=120, soft_time_limit=90)
 def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: str = "public") -> Dict[str, Any]:
     """
     Spawns an ephemeral Postgres container, applies the source SQL, 
     runs migra against the target DB, and parses the AST.
+    Guarded by a thread semaphore to prevent node OOM crashes.
     """
     if not docker_client:
         return {"sql": "", "changes": [], "has_destructive_changes": False, "error": "Docker daemon is not available on the worker node."}
 
     container = None
+    
+    # Acquire hardware lock. Block until a slot opens up.
+    logger.info("Waiting for available Docker capacity slot...")
+    acquired = DOCKER_SEMAPHORE.acquire(timeout=60)
+    
+    if not acquired:
+        return {"sql": "", "changes": [], "has_destructive_changes": False, "error": "System is currently at maximum capacity for schema computations. Try again in a few moments."}
+
     try:
-        logger.info("Spawning ephemeral Postgres container for diff...")
+        logger.info("Slot acquired. Spawning ephemeral Postgres container for diff...")
         
         # 1. Boot the ephemeral container with strict resource limits
         container = docker_client.containers.run(
@@ -689,7 +704,7 @@ def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: st
             remove=True,  # The Guillotine: Auto-delete volume and container on stop
             environment={"POSTGRES_PASSWORD": "ephemeral_pass"},
             ports={'5432/tcp': None},  # Bind to a random available host port
-            mem_limit="512m",          # Blast radius containment
+            mem_limit="256m",          # Reduced from 512m. AST diffs don't need half a gig of RAM.
             nano_cpus=500000000        # 0.5 CPU limit
         )
         
@@ -723,7 +738,6 @@ def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: st
         
         changes = _parse_sql_to_changes(sql_output)
         
-        # Serialize dataclasses to pure Python dicts for Celery/Redis transport
         serialized_changes = [
             {
                 "kind": c.kind.value,
@@ -759,6 +773,9 @@ def execute_ephemeral_diff(self, source_sql: str, target_db_url: str, schema: st
                 container.kill()
             except Exception:
                 pass
+        
+        # Release hardware lock regardless of success or failure
+        DOCKER_SEMAPHORE.release()
 
 
 @celery_app.task(name="worker.celery.execute_background_ephemeral_diff")
