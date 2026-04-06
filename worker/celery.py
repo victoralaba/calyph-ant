@@ -54,6 +54,11 @@ celery_app = Celery(
     include=["worker.celery"],
 )
 
+
+# ---------------------------------------------------------------------------
+# App instance
+# ---------------------------------------------------------------------------
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -66,17 +71,23 @@ celery_app.conf.update(
     task_routes={
         "worker.celery.keep_alive_ping": {"queue": "keep_alive"},
         "worker.celery.run_all_keep_alive_pings": {"queue": "keep_alive"},
+        
         "worker.celery.scheduled_backup": {"queue": "backups"},
         "worker.celery.execute_background_backup": {"queue": "backups"},
         "worker.celery.execute_background_restore": {"queue": "backups"},
-        "worker.celery.scheduled_backup": {"queue": "backups"},
+        
+        "worker.celery.execute_ephemeral_semantic_diff": {"queue": "ephemeral_compute"},
+        "worker.celery.execute_background_ephemeral_diff": {"queue": "ephemeral_compute"},
+        "worker.celery.execute_background_diff": {"queue": "ephemeral_compute"},
+        
         "worker.celery.dispatch_scheduled_backups": {"queue": "maintenance"},
         "worker.celery.drain_slow_queries": {"queue": "maintenance"},
         "worker.celery.expire_invites": {"queue": "maintenance"},
         "worker.celery.cleanup_old_backups": {"queue": "maintenance"},
-        "worker.celery.execute_ephemeral_semantic_diff": {"queue": "maintenance"},
         "worker.celery.sync_google_schema_cache": {"queue": "maintenance"},
-        # Platform catalogue tasks
+        "worker.celery.garbage_collect_scratch_schemas": {"queue": "maintenance"},
+        "worker.celery.reap_zombie_mutations": {"queue": "maintenance"}, # The Watchdog
+        
         "platform.catalogue.enrich_extension_async": {"queue": "maintenance"},
         "platform.catalogue.refresh_stale_entries": {"queue": "maintenance"},
     },
@@ -84,6 +95,7 @@ celery_app.conf.update(
         Queue("keep_alive"),
         Queue("backups"),
         Queue("maintenance"),
+        Queue("ephemeral_compute"),
         Queue("default"),
     ),
     task_default_queue="default",
@@ -96,42 +108,40 @@ celery_app.conf.update(
 # ---------------------------------------------------------------------------
 
 celery_app.conf.beat_schedule = {
-    # Ping all keep-alive-enabled connections every 4 minutes
     "keep-alive-pings": {
         "task": "worker.celery.run_all_keep_alive_pings",
         "schedule": crontab(minute="*/4"),
     },
-    # Check for due backup schedules every minute
     "dispatch-scheduled-backups": {
         "task": "worker.celery.dispatch_scheduled_backups",
         "schedule": crontab(minute="*"),
     },
-    # Clean up expired invites daily at 02:00 UTC
     "expire-invites": {
         "task": "worker.celery.expire_invites",
         "schedule": crontab(hour=2, minute=0),
     },
-    # Enforce backup retention limits daily at 03:00 UTC
     "cleanup-old-backups": {
         "task": "worker.celery.cleanup_old_backups",
         "schedule": crontab(hour=3, minute=0),
     },
-    # Drain slow query stats every 15 minutes
     "drain-slow-queries": {
         "task": "worker.celery.drain_slow_queries",
         "schedule": crontab(minute="*/15"),
     },
-    # Refresh stale extension catalogue entries nightly at 04:00 UTC
     "refresh-extension-catalogue": {
         "task": "platform.catalogue.refresh_stale_entries",
         "schedule": crontab(hour=4, minute=0),
     },
-    # Sweep orphaned scratch schemas every 5 minutes
     "garbage-collect-scratch-schemas": {
         "task": "worker.celery.garbage_collect_scratch_schemas",
         "schedule": crontab(minute="*/5"),
     },
+    "reap-zombie-mutations": {
+        "task": "worker.celery.reap_zombie_mutations",
+        "schedule": crontab(minute=0), 
+    },
 }
+
 
 # ---------------------------------------------------------------------------
 # Register platform catalogue tasks
@@ -479,6 +489,73 @@ def cleanup_old_backups():
     _run(_cleanup())
 
 
+@celery_app.task(name="worker.celery.reap_zombie_mutations")
+def reap_zombie_mutations():
+    """
+    The Safe Reaper (Watchdog).
+    Runs hourly. Sweeps the database for any physical mutations (Backups)
+    that have been stuck in 'pending', 'running', or 'restoring' for more 
+    than 24 hours. A 24-hour runtime is a mathematical impossibility for our 
+    system physics; it guarantees the executing worker node experienced a hard 
+    crash. We must forcefully terminate the record to lift the system-wide 
+    UX lock and unbrick the connection.
+    """
+    async def _reap():
+        from core.db import _session_factory, get_redis
+        from domains.backups.engine import BackupRecord
+        from sqlalchemy import select
+        from datetime import datetime, timezone, timedelta
+        
+        if not _session_factory:
+            return
+
+        redis = await get_redis()
+        # The absolute physics ceiling. Anything older than this is a zombie.
+        cutoff_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
+
+        async with _session_factory() as db:
+            # 1. Identify Zombies
+            zombie_query = select(BackupRecord).where(
+                BackupRecord.status.in_(["pending", "running", "restoring"]),
+                BackupRecord.created_at < cutoff_threshold
+            )
+            result = await db.execute(zombie_query)
+            zombies = result.scalars().all()
+
+            if not zombies:
+                return
+
+            reaped_count = 0
+            for zombie in zombies:
+                # 2. Terminate with prejudice
+                zombie.status = "failed"
+                zombie.error = "Terminated by System Watchdog: Worker heartbeat lost or process exceeded maximum theoretical physics timeout."
+                zombie.completed_at = datetime.now(timezone.utc)
+                
+                """
+                [UI CONSIDERATION]
+                Because we are force-failing the record out-of-band, the UI will 
+                automatically pick this up on the next list_backups refresh. 
+                The 'Trigger Backup' and 'Restore' buttons will automatically unlock 
+                since the system-wide mutation lock in the API checks for active status.
+                """
+
+                # 3. Clear transient Redis locks just in case
+                lock_key = f"active_restore_lock:{zombie.connection_id}"
+                await redis.delete(lock_key)
+                
+                reaped_count += 1
+
+            await db.commit()
+            logger.critical(f"WATCHDOG TRIGGERED: Reaped {reaped_count} zombie mutation(s). System locks cleared.")
+
+    _run(_reap())
+
+
+# ---------------------------------------------------------------------------
+# AI Schema Caching (Google Gemini Context)
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # AI Schema Caching (Google Gemini Context)
 # ---------------------------------------------------------------------------
@@ -513,7 +590,10 @@ def sync_google_schema_cache(connection_id: str, workspace_id: str, schema_name:
 
         # 1. Introspect Schema (Heavy lifting done in background)
         try:
-            snapshot = await introspect_database(url, schema_name)
+            # --- THE FIX: PASS UUID(connection_id) AS FIRST ARGUMENT ---
+            # Satisfies domains/schema/introspection.py connection pooling signature
+            snapshot = await introspect_database(UUID(connection_id), url, schema_name)
+            # -----------------------------------------------------------
             
             # Format minimal DDL for the LLM
             lines = [f"-- PostgreSQL Schema: {schema_name}"]
