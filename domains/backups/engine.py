@@ -526,13 +526,14 @@ async def stream_sql_backup_to_r2(
     args = ["pg_dump", "--no-password"]
     if schema_only:
         args.append("--schema-only")
-    args.append(url)
+        
+    pg_env = _get_pg_env(url)
     
     proc = await asyncio.create_subprocess_exec(
-        *args,
+        *args,  # Notice `url` is no longer passed as an argument
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+        env={**_safe_env(), **pg_env},
     )
 
     assert proc.stdout is not None, "Failed to open stdout pipe to pg_dump"
@@ -630,12 +631,14 @@ async def stream_r2_to_psql(
     )
     body_stream = obj["Body"]
 
+    pg_env = _get_pg_env(url)
+
     proc = await asyncio.create_subprocess_exec(
-        "psql", "--no-password", "--set", "ON_ERROR_STOP=off", url,
+        "psql", "--no-password", "--set", "ON_ERROR_STOP=off",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+        env={**_safe_env(), **pg_env},
     )
 
     assert proc.stdin is not None, "Failed to open stdin pipe to psql"
@@ -688,6 +691,24 @@ async def stream_r2_to_psql(
         "error_count": len(errors),
         "errors": errors[:50],
         "stdout": stdout.decode()[:2000],
+    }
+
+
+def _get_pg_env(url: str) -> dict:
+    """
+    Decomposes a database URL into secure environment variables to prevent 
+    CLI injection attacks when spawning pg_dump or psql.
+    """
+    from urllib.parse import urlparse
+    import os
+    p = urlparse(url)
+    return {
+        "PGHOST": p.hostname or "localhost",
+        "PGPORT": str(p.port or 5432),
+        "PGUSER": p.username or "postgres",
+        "PGPASSWORD": p.password or "",
+        "PGDATABASE": p.path.lstrip("/") if p.path else "postgres",
+        "PATH": os.environ.get("PATH", ""),
     }
 
 
@@ -1013,6 +1034,19 @@ async def create_backup(
 
         record.status = "completed"
         record.completed_at = datetime.now(timezone.utc)
+        
+        # --- THE MUSCLE: Atomic Storage Tracking ---
+        # Increment the Redis byte tracker upon successful write.
+        # FIXED: Extracting to a local variable with a fallback to 0 to bypass Pylance ORM confusion
+        actual_size: int = record.size_bytes or 0
+        if actual_size > 0:
+            try:
+                from core.db import get_redis
+                redis = await get_redis()
+                await redis.incrby(f"workspace_storage_bytes:{workspace_id}", actual_size)
+            except Exception as redis_exc:
+                logger.error(f"Failed to increment Redis storage tracker: {redis_exc}")
+        # -----------------------------------------
 
     except Exception as exc:
         record.status = "failed"
@@ -1705,18 +1739,68 @@ async def create_backup_endpoint(
 ):
     """
     [UI CONSIDERATION]
-    This endpoint enforces strict concurrency locking. 
-    If a user clicks "Backup" while one is already running/pending, it returns a 409 Conflict.
-    The UI MUST disable the "Trigger Backup" button if the most recent backup in the 
-    list has a status of 'pending' or 'running'.
+    1. Concurrency: The UI MUST disable the "Trigger Backup" button if the most 
+       recent backup in the list has a status of 'pending' or 'running'.
+    2. Tenant Isolation: If this returns 429, inform the user that other databases 
+       in their workspace are backing up and they must wait.
+    3. Quotas: If this returns 402, the UI MUST immediately prompt the user 
+       with an upgrade modal or suggest deleting old backups. Do not fail silently.
     """
     if not user.workspace_id:
         raise HTTPException(status_code=400, detail="User has no workspace.")
     if body.format not in ("calyph", "sql"):
         raise HTTPException(status_code=400, detail="format must be 'calyph' or 'sql'")
 
-    # --- THE MUSCLE: Admission Control / Concurrency Lock ---
-    # Do not allow queuing if the worker is already processing a backup for this connection.
+    # --- THE MUSCLE: O(1) Storage Quota Guard ---
+    from domains.billing.flutterwave import get_limits
+    from core.db import get_redis
+    from sqlalchemy import func
+    
+    limits = get_limits(user.tier)
+    max_storage_bytes = limits.get("max_backup_storage_bytes")
+    
+    if max_storage_bytes is not None:
+        redis = await get_redis()
+        storage_key = f"workspace_storage_bytes:{user.workspace_id}"
+        current_storage_raw = await redis.get(storage_key)
+        
+        current_storage: int
+        if current_storage_raw is None:
+            storage_query = select(func.coalesce(func.sum(BackupRecord.size_bytes), 0)).where(
+                BackupRecord.workspace_id == user.workspace_id,
+                BackupRecord.status == "completed"
+            )
+            current_storage = int((await db.execute(storage_query)).scalar_one() or 0)
+            await redis.set(storage_key, current_storage)
+        else:
+            current_storage = int(current_storage_raw)
+            
+        if current_storage >= int(max_storage_bytes):
+            max_gb = int(max_storage_bytes) / 1024**3
+            cur_gb = current_storage / 1024**3
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED, 
+                detail=f"Storage limit reached ({cur_gb:.2f}GB / {max_gb:.2f}GB). Please upgrade your tier or delete old backups."
+            )
+    # --------------------------------------------
+
+    # --- THE MUSCLE: Workspace Concurrency Cap (Tenant Isolation) ---
+    max_concurrent_jobs = limits.get("max_concurrent_backup_jobs", 2)
+    
+    workspace_active_query = select(func.count(BackupRecord.id)).where(
+        BackupRecord.workspace_id == user.workspace_id,
+        BackupRecord.status.in_(["pending", "running"])
+    )
+    active_workspace_jobs = (await db.execute(workspace_active_query)).scalar_one()
+    
+    if active_workspace_jobs >= max_concurrent_jobs:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Workspace limit reached: You have {active_workspace_jobs} active backup jobs. Please wait for them to finish."
+        )
+    # ---------------------------------------------------------------
+
+    # --- THE MUSCLE: Connection Admission Control / Concurrency Lock ---
     active_query = select(BackupRecord.id).where(
         BackupRecord.connection_id == connection_id,
         BackupRecord.status.in_(["pending", "running"])
@@ -1854,6 +1938,11 @@ async def download_backup(
     db: AsyncSession = Depends(get_db),
     part: int = Query(1, ge=1, description="Part number to download (default: 1)"),
 ):
+    """
+    [UI CONSIDERATION]
+    If this endpoint returns a 402 Payment Required, the UI should alert the user
+    that they have exhausted their monthly download bandwidth limit and prompt an upgrade.
+    """
     assert user.workspace_id is not None
     record = await db.get(BackupRecord, backup_id)
     if not record or record.workspace_id != user.workspace_id:
@@ -1866,11 +1955,45 @@ async def download_backup(
             detail=f"Backup has {record.part_count} part(s). Requested part {part}.",
         )
 
+    # --- THE MUSCLE: Egress Quota Guard ---
+    from domains.billing.flutterwave import get_limits
+    from core.db import get_redis
+
+    limits = get_limits(user.tier)
+    max_egress_bytes = limits.get("max_monthly_egress_bytes") # e.g., 50GB for free tier
+
+    if max_egress_bytes is not None and record.size_bytes:
+        redis = await get_redis()
+        
+        # Track egress on a rolling monthly basis: workspace_egress:uuid:2026-04
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        egress_key = f"workspace_egress_bytes:{user.workspace_id}:{current_month}"
+
+        current_egress_raw = await redis.get(egress_key)
+        current_egress = int(current_egress_raw) if current_egress_raw else 0
+
+        # Approximate part size. If it's a 1-part backup, it's the full size.
+        part_size = record.size_bytes // record.part_count
+
+        if current_egress + part_size > max_egress_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Monthly bandwidth limit reached. You have consumed {(current_egress / 1024**3):.2f}GB."
+            )
+
+        # Track the download before issuing the presigned URL. Expire key after 31 days.
+        await redis.incrby(egress_key, part_size)
+        await redis.expire(egress_key, 2678400) # 31 days in seconds
+    # ---------------------------------------
+
     key = _r2_key(
         user.workspace_id, connection_id, backup_id, record.format,
         part if record.part_count > 1 else None,
     )
+    
+    from domains.backups.engine import generate_r2_download_url
     url = await generate_r2_download_url(key)
+    
     return {
         "url": url,
         "expires_in": 3600,
@@ -1923,9 +2046,21 @@ async def delete_backup(
         except Exception as exc:
             logger.warning(f"Failed to delete R2 object {key}: {exc}")
 
+    # --- THE MUSCLE: Atomic Storage Reclamation ---
+    if record.size_bytes:
+        try:
+            from core.db import get_redis
+            redis = await get_redis()
+            # Decrement, but ensure it never goes below 0 due to out-of-band DB changes
+            current = await redis.decrby(f"workspace_storage_bytes:{user.workspace_id}", record.size_bytes)
+            if current < 0:
+                await redis.set(f"workspace_storage_bytes:{user.workspace_id}", 0)
+        except Exception as redis_exc:
+            logger.error(f"Failed to decrement Redis storage tracker: {redis_exc}")
+    # ----------------------------------------------
+
     await db.delete(record)
     await db.commit()
-
 
 # ---------------------------------------------------------------------------
 # Schedule endpoints (Gap 10-4)
@@ -1940,27 +2075,41 @@ async def create_or_update_schedule(
 ):
     """
     [UI CONSIDERATION]
-    The UI schedule builder MUST NOT allow users to select frequencies lower than 1 hour.
-    If they manually inject a sub-hour cron expression via API, this will return a 400.
+    1. Feature Flag: The UI MUST NOT display the schedule builder for Free tier users.
+       If they bypass the UI and hit this endpoint, it returns 403.
+    2. Dropdowns over Free-text: Do not let users write raw cron. Use a dropdown 
+       (e.g., "Daily", "Weekly"). The API determines if they have rights to the 
+       frequency requested based on tier.
     """
     assert user.workspace_id is not None
     
-    # --- THE MUSCLE: Physics-Based Schedule Guard ---
+    # --- THE MUSCLE: Tier-Based Schedule Guard ---
+    from domains.billing.flutterwave import get_limits
+    limits = get_limits(user.tier)
+    
+    if not limits.get("can_schedule_backups", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Automated scheduling is not available on your current plan. Please upgrade."
+        )
+
     try:
         from croniter import croniter
         now = datetime.now(timezone.utc)
         
-        # We test the gap between the first and second hypothetical runs
         it = croniter(body.cron, now)
         run_1 = it.get_next(datetime)
         run_2 = it.get_next(datetime)
         
         interval_seconds = (run_2 - run_1).total_seconds()
         
-        if interval_seconds < 3600:
+        # Determine the physical hard limit based on tier
+        min_interval = limits.get("min_backup_interval_seconds", 86400) # Default to 24h
+        
+        if interval_seconds < min_interval:
             raise HTTPException(
-                status_code=400, 
-                detail="Schedules cannot run more frequently than once per hour to prevent resource exhaustion."
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Your current plan enforces a minimum scheduled interval of {int(min_interval/3600)} hour(s)."
             )
             
         next_run = run_1
@@ -2004,7 +2153,6 @@ async def create_or_update_schedule(
         "next_run": schedule.next_run.isoformat() if schedule.next_run else None,
         "enabled": schedule.enabled,
     }
-
 
 @router.get("/{connection_id}/schedule")
 async def get_schedule(

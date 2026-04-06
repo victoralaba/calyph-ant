@@ -409,7 +409,7 @@ def expire_invites():
 def cleanup_old_backups():
     """Delete backups that exceed the user's tier retention limit."""
     async def _cleanup():
-        from core.db import _session_factory
+        from core.db import _session_factory, get_redis
         from domains.backups.engine import BackupRecord, _r2_client
         from domains.billing.flutterwave import get_limits
         from domains.users.service import User
@@ -419,6 +419,9 @@ def cleanup_old_backups():
 
         if not _session_factory:
             return
+            
+        redis = await get_redis()
+        
         async with _session_factory() as db:
             users = (await db.execute(select(User.id, User.tier))).all()
 
@@ -456,6 +459,17 @@ def cleanup_old_backups():
                             )
                         except Exception as exc:
                             logger.warning(f"Failed to delete R2 object {key}: {exc}")
+                            
+                    # --- THE MUSCLE: Background Storage Reclamation ---
+                    if backup.size_bytes:
+                        try:
+                            current = await redis.decrby(f"workspace_storage_bytes:{user_id}", backup.size_bytes)
+                            if current < 0:
+                                await redis.set(f"workspace_storage_bytes:{user_id}", 0)
+                        except Exception as redis_exc:
+                            logger.error(f"Failed to decrement Redis on cleanup: {redis_exc}")
+                    # --------------------------------------------------
+                    
                     await db.delete(backup)
                     deleted += 1
 
