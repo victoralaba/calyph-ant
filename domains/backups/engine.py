@@ -66,13 +66,14 @@ from __future__ import annotations
 import asyncio
 import decimal
 import gzip
+import zlib
 import hashlib
 import json
 import os
 import tempfile
 import time
 from datetime import date, datetime, time as dt_time, timezone
-from typing import Any
+from typing import Any, AsyncGenerator
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -251,6 +252,37 @@ def _json_default(obj: Any) -> Any:
 # ---------------------------------------------------------------------------
 # .calyph format helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# .calyph format helpers - STREAMING REFACTOR
+# ---------------------------------------------------------------------------
+
+
+async def stream_parse_calyph(byte_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[dict[str, Any], None]:
+    """
+    Consumes an async byte stream from R2, decompresses on the fly, 
+    and yields JSON blocks line-by-line. 
+    Memory footprint: size of the largest single row, not the chunk.
+    """
+    decompressor = zlib.decompressobj(wbits=31)
+    buffer = ""
+
+    async for chunk in byte_stream:
+        uncompressed = decompressor.decompress(chunk)
+        if uncompressed:
+            buffer += uncompressed.decode('utf-8')
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if line.strip():
+                    yield json.loads(line)
+
+    tail = decompressor.flush()
+    if tail:
+        buffer += tail.decode('utf-8')
+        for line in buffer.split("\n"):
+            if line.strip():
+                yield json.loads(line)
+
 
 def _calyph_header(
     database: str,
@@ -436,6 +468,27 @@ async def download_from_r2(key: str) -> bytes:
         raise ValueError(f"Backup not found in storage: {exc}") from exc
 
 
+async def stream_from_r2(key: str, chunk_size: int = 1024 * 1024) -> AsyncGenerator[bytes, None]:
+    """
+    Opens a stream from R2 and yields raw compressed byte chunks.
+    Does not buffer the file in memory.
+    """
+    client = _r2_client()
+    try:
+        obj = await asyncio.to_thread(
+            client.get_object, Bucket=settings.R2_BUCKET_NAME, Key=key
+        )
+        body = obj["Body"]
+        while True:
+            # Read blocking stream in thread
+            chunk = await asyncio.to_thread(body.read, chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    except ClientError as exc:
+        raise ValueError(f"Backup not found in storage: {exc}") from exc
+
+
 async def generate_r2_download_url(key: str, expires_in: int = 3600) -> str:
     client = _r2_client()
     return await asyncio.to_thread(
@@ -447,10 +500,25 @@ async def generate_r2_download_url(key: str, expires_in: int = 3600) -> str:
 
 
 # ---------------------------------------------------------------------------
-# pg_dump (SQL format)
+# pg_dump (SQL format) - STREAMING REFACTOR
 # ---------------------------------------------------------------------------
 
-async def pg_dump_sql(url: str, schema_only: bool = False, timeout_sec: int = 300) -> bytes:
+
+async def stream_sql_backup_to_r2(url: str, key: str, schema_only: bool = False, timeout_sec: int = 600) -> tuple[int, str]:
+    """
+    Streams pg_dump stdout directly into a zlib compressor and out to an R2 multipart upload.
+    Peak memory footprint: ~5MB (Boto3 part size) regardless of database size.
+    Returns: (total_size_bytes, sha256_checksum)
+    """
+    client = _r2_client()
+    upload = await asyncio.to_thread(
+        client.create_multipart_upload, Bucket=settings.R2_BUCKET_NAME, Key=key
+    )
+    upload_id = upload["UploadId"]
+    parts = []
+    hasher = hashlib.sha256()
+    total_size = 0
+
     args = ["pg_dump", "--no-password"]
     if schema_only:
         args.append("--schema-only")
@@ -462,61 +530,148 @@ async def pg_dump_sql(url: str, schema_only: bool = False, timeout_sec: int = 30
         stderr=asyncio.subprocess.PIPE,
         env={"PGPASSWORD": _extract_password(url), **_safe_env()},
     )
+
+    # Type safety enforcement
+    assert proc.stdout is not None, "Failed to open stdout pipe to pg_dump"
+    assert proc.stderr is not None, "Failed to open stderr pipe to pg_dump"
+
+    compressor = zlib.compressobj(wbits=31)
+    buffer = bytearray()
+    part_num = 1
+
+    try:
+        while True:
+            chunk = await proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+                
+            compressed_chunk = compressor.compress(chunk)
+            if compressed_chunk:
+                buffer.extend(compressed_chunk)
+
+            if len(buffer) >= 5 * 1024 * 1024:
+                hasher.update(buffer)
+                total_size += len(buffer)
+                res = await asyncio.to_thread(
+                    client.upload_part,
+                    Bucket=settings.R2_BUCKET_NAME, Key=key,
+                    PartNumber=part_num, UploadId=upload_id, Body=bytes(buffer),
+                )
+                parts.append({"PartNumber": part_num, "ETag": res["ETag"]})
+                part_num += 1
+                buffer.clear()
+
+        tail = compressor.flush()
+        if tail:
+            buffer.extend(tail)
+
+        if len(buffer) > 0:
+            hasher.update(buffer)
+            total_size += len(buffer)
+            res = await asyncio.to_thread(
+                client.upload_part,
+                Bucket=settings.R2_BUCKET_NAME, Key=key,
+                PartNumber=part_num, UploadId=upload_id, Body=bytes(buffer),
+            )
+            parts.append({"PartNumber": part_num, "ETag": res["ETag"]})
+
+        await proc.wait()
+        if proc.returncode != 0:
+            stderr_bytes = await proc.stderr.read()
+            raise RuntimeError(f"pg_dump failed: {stderr_bytes.decode()}")
+
+        await asyncio.to_thread(
+            client.complete_multipart_upload,
+            Bucket=settings.R2_BUCKET_NAME, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+        return total_size, hasher.hexdigest()
+
+    except Exception as e:
+        await asyncio.to_thread(
+            client.abort_multipart_upload,
+            Bucket=settings.R2_BUCKET_NAME, Key=key, UploadId=upload_id
+        )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise e
+
+
+async def stream_r2_to_psql(url: str, key: str, timeout_sec: int = 600) -> dict[str, Any]:
+    """
+    Streams gzipped SQL directly from R2, decompresses on the fly, 
+    and writes to psql stdin. Zero temporary files. Zero RAM buffering.
+    """
+    client = _r2_client()
+    obj = await asyncio.to_thread(
+        client.get_object, Bucket=settings.R2_BUCKET_NAME, Key=key
+    )
+    body_stream = obj["Body"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "psql", "--no-password", "--set", "ON_ERROR_STOP=off", url,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={"PGPASSWORD": _extract_password(url), **_safe_env()},
+    )
+
+    # Type safety enforcement
+    assert proc.stdin is not None, "Failed to open stdin pipe to psql"
+    assert proc.stdout is not None, "Failed to open stdout pipe to psql"
+    assert proc.stderr is not None, "Failed to open stderr pipe to psql"
+
+    # Bind to strictly-typed local variables so Pylance doesn't lose 
+    # the type narrowing inside the closure.
+    psql_stdin = proc.stdin 
+
+    decompressor = zlib.decompressobj(wbits=31)
+
+    async def pump_data():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body_stream.read, 1024 * 1024)
+                if not chunk:
+                    break
+                uncompressed = decompressor.decompress(chunk)
+                if uncompressed:
+                    psql_stdin.write(uncompressed)
+                    await psql_stdin.drain()
+            
+            tail = decompressor.flush()
+            if tail:
+                psql_stdin.write(tail)
+                await psql_stdin.drain()
+        finally:
+            psql_stdin.close()
+
+    pump_task = asyncio.create_task(pump_data())
+
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise RuntimeError(f"pg_dump timed out after {timeout_sec}s.")
-        
-    if proc.returncode != 0:
-        raise RuntimeError(f"pg_dump failed: {stderr.decode()}")
-    return gzip.compress(stdout)
-
-
-async def psql_restore(url: str, sql_gz: bytes, timeout_sec: int = 600) -> dict[str, Any]:
-    """
-    Restore a gzipped SQL dump via psql subprocess.
-    Executes without localized semaphores; concurrency is safely managed by Celery worker limits.
-    """
-    sql_bytes = gzip.decompress(sql_gz)
-
-    with tempfile.NamedTemporaryFile(suffix=".sql", delete=False) as f:
-        f.write(sql_bytes)
-        tmp_path = f.name
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "psql",
-            "--no-password",
-            "--set", "ON_ERROR_STOP=off",
-            "--file", tmp_path,
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={"PGPASSWORD": _extract_password(url), **_safe_env()},
-        )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-        except asyncio.TimeoutError:
             proc.kill()
-            await proc.communicate()
-            raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
-            
-        stderr_text = stderr.decode()
-        errors = [
-            line for line in stderr_text.splitlines()
-            if line.strip().upper().startswith("ERROR")
-        ]
-        return {
-            "success": proc.returncode == 0,
-            "return_code": proc.returncode,
-            "error_count": len(errors),
-            "errors": errors[:50],
-            "stdout": stdout.decode()[:2000],
-        }
-    finally:
-        os.unlink(tmp_path)
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(f"psql restore timed out after {timeout_sec}s.")
+    
+    await pump_task  # Ensure pumping is finished
+        
+    stderr_text = stderr.decode()
+    errors = [
+        line for line in stderr_text.splitlines()
+        if line.strip().upper().startswith("ERROR")
+    ]
+    return {
+        "success": proc.returncode == 0,
+        "return_code": proc.returncode,
+        "error_count": len(errors),
+        "errors": errors[:50],
+        "stdout": stdout.decode()[:2000],
+    }
 
 
 def _extract_password(url: str) -> str:
@@ -834,13 +989,13 @@ async def create_backup(
             record.checksum = first_checksum
 
         else:
-            data = await pg_dump_sql(url, schema_only=schema_only)
+            # Replaced blocking pg_dump_sql with the new stream transformer
             key = _r2_key(workspace_id, connection_id, record.id, "sql")
-            await upload_to_r2(key, data)
+            size, checksum = await stream_sql_backup_to_r2(url, key, schema_only=schema_only)
             record.r2_key = key
-            record.size_bytes = len(data)
+            record.size_bytes = size
             record.part_count = 1
-            record.checksum = hashlib.sha256(data).hexdigest()
+            record.checksum = checksum
 
         record.status = "completed"
         record.completed_at = datetime.now(timezone.utc)
@@ -965,6 +1120,10 @@ async def _delete_restore_session(session_id: str) -> None:
 # Restore
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
 async def restore_backup(
     db: AsyncSession,
     pg_conn: asyncpg.Connection,
@@ -975,23 +1134,11 @@ async def restore_backup(
     restore_session_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Two-phase restore.
-
-    Phase 1 — strategy is None (or not provided):
-        Scans for conflicts, stores session in Redis, returns conflict_report.
-        Nothing is written.
-
-    Phase 2 — strategy is "skip", "overwrite", or "review":
-        Executes restore using the chosen strategy.
-        restore_session_id must match a valid Phase 1 result.
-        For "review", per_row_overrides maps table_name → {pk_str: "skip"|"overwrite"}.
-
-    Atomicity guarantee:
-        Data is committed inside pg_conn.transaction() (user's DB).
-        The post-restore migration record is written to Calyphant's DB
-        with up to 3 retries + exponential backoff.
-        On exhausted retries, a RestoreDeadLetter row is written so the
-        successful restore is never lost from the audit trail.
+    [UI CONSIDERATION]
+    The UI payload expectations remain exactly the same. The API contract is unchanged.
+    The internal mechanics now stream R2 parts sequentially, meaning a 10GB database 
+    will take longer to restore but will never crash the server. The UI should rely 
+    exclusively on the background polling endpoint to manage the user waiting state.
     """
     record = await db.get(BackupRecord, backup_id)
     if not record or record.workspace_id != workspace_id:
@@ -1000,16 +1147,18 @@ async def restore_backup(
         raise ValueError(f"Backup is not in completed state: {record.status}")
 
     # -----------------------------------------------------------------------
-    # SQL format restore (Gap 10-3)
+    # SQL format restore
     # -----------------------------------------------------------------------
     if record.format == "sql":
         if not record.r2_key:
             raise ValueError("Backup has no stored data.")
-        data = await download_from_r2(record.r2_key)
         url = await get_validated_workspace_url(db, record.connection_id, workspace_id)
         if not url:
             raise ValueError("Connection not found.")
-        result = await psql_restore(url, data)
+            
+        # Swap out in-memory psql_restore for the stream
+        result = await stream_r2_to_psql(url, record.r2_key)
+        
         if result["success"]:
             record.status = "restored"
             await db.commit()
@@ -1026,31 +1175,41 @@ async def restore_backup(
         }
 
     # -----------------------------------------------------------------------
-    # .calyph restore
+    # .calyph restore - STREAMING REFACTOR
     # -----------------------------------------------------------------------
 
-    # Load all parts
-    all_table_data: dict[str, list[dict]] = {}
-    schema_block: dict = {}
-    parsed_meta: dict = {}
-
-    for part_idx in range(1, record.part_count + 1):
-        part_num = part_idx if record.part_count > 1 else None
-        key = _r2_key(workspace_id, record.connection_id, backup_id, "calyph", part_num)
-        data = await download_from_r2(key)
-        parsed = parse_calyph_backup(data)
-        if not schema_block:
-            schema_block = parsed["schema"]
-            parsed_meta = parsed
-        for tname, rows in parsed["table_data"].items():
-            all_table_data.setdefault(tname, []).extend(rows)
-
-    # Phase 1 — conflict scan
+    # Phase 1 — Conflict Scan Pipeline
     if strategy is None:
-        conflict_report = await _detect_conflicts(pg_conn, all_table_data, schema_block)
-        has_conflicts = any(
-            t["conflicting_count"] > 0 for t in conflict_report.values()
-        )
+        conflict_report: dict[str, Any] = {}
+        schema_block: dict = {}
+
+        # Pipeline: Download Part -> Parse -> Scan Conflicts -> Discard Part
+        for part_idx in range(1, record.part_count + 1):
+            part_num = part_idx if record.part_count > 1 else None
+            key = _r2_key(workspace_id, record.connection_id, backup_id, "calyph", part_num)
+            
+            data = await download_from_r2(key)
+            parsed = parse_calyph_backup(data)
+            
+            if not schema_block:
+                schema_block = parsed["schema"]
+
+            chunk_report = await _detect_conflicts(pg_conn, parsed["table_data"], schema_block)
+            
+            # Merge chunk report into master report
+            for tname, stats in chunk_report.items():
+                if tname not in conflict_report:
+                    conflict_report[tname] = {"new_rows": 0, "conflicting_count": 0, "conflicting_pks": []}
+                
+                conflict_report[tname]["new_rows"] += stats["new_rows"]
+                conflict_report[tname]["conflicting_count"] += stats["conflicting_count"]
+                
+                # Cap tracked PKs to prevent massive payload sizes in Redis
+                if len(conflict_report[tname]["conflicting_pks"]) < 100:
+                    space = 100 - len(conflict_report[tname]["conflicting_pks"])
+                    conflict_report[tname]["conflicting_pks"].extend(stats["conflicting_pks"][:space])
+
+        has_conflicts = any(t["conflicting_count"] > 0 for t in conflict_report.values())
         session_id = str(uuid4())
         session_payload = {
             "backup_id": str(backup_id),
@@ -1073,18 +1232,13 @@ async def restore_backup(
             ),
         }
 
-    # Phase 2 — execute
+    # Phase 2 — Execution Pipeline
     if not restore_session_id:
-        raise ValueError(
-            "restore_session_id is required for Phase 2. "
-            "Call restore first without strategy to obtain it."
-        )
+        raise ValueError("restore_session_id is required for Phase 2.")
+        
     session = await _load_restore_session(restore_session_id)
     if not session or session.get("backup_id") != str(backup_id):
-        raise ValueError(
-            "restore_session_id is invalid or expired (30-minute TTL). "
-            "Re-run Phase 1 to get a new session."
-        )
+        raise ValueError("restore_session_id is invalid or expired.")
 
     if strategy not in ("skip", "overwrite", "review"):
         raise ValueError("strategy must be 'skip', 'overwrite', or 'review'.")
@@ -1092,94 +1246,98 @@ async def restore_backup(
     conflict_report = session["conflict_report"]
     restored_tables: list[str] = []
     skipped_rows: dict[str, int] = {}
+    schema_version_applied = None
+    schema_order_index_applied = 0
 
-    # Build a set of conflicting PKs per table for quick lookup
     conflict_pks_by_table: dict[str, set[str]] = {
         tname: set(info.get("conflicting_pks", []))
         for tname, info in conflict_report.items()
     }
 
     # Execute inside a single transaction on the user's DB.
-    # No data loss: if anything fails here, the whole thing rolls back.
     async with pg_conn.transaction():
-        for table_name, rows in all_table_data.items():
-            if not rows:
-                continue
+        # Pipeline: Download Part -> Parse -> Execute Rows -> Discard Part
+        for part_idx in range(1, record.part_count + 1):
+            part_num = part_idx if record.part_count > 1 else None
+            key = _r2_key(workspace_id, record.connection_id, backup_id, "calyph", part_num)
+            
+            data = await download_from_r2(key)
+            parsed = parse_calyph_backup(data)
+            
+            if schema_version_applied is None:
+                schema_version_applied = parsed.get("schema_version")
+                schema_order_index_applied = parsed.get("schema_order_index", 0)
 
-            table_meta = schema_block.get("tables", {}).get(table_name, {})
-            pk_cols = table_meta.get("primary_key", [])
-            pk_col = pk_cols[0] if pk_cols else None
-            conflict_pks = conflict_pks_by_table.get(table_name, set())
-            cols = list(rows[0].keys())
-            col_sql = ", ".join(f'"{c}"' for c in cols)
+            schema_block = parsed["schema"]
 
-            skipped_rows[table_name] = 0
-
-            for row in rows:
-                pk_val = str(row.get(pk_col, "")) if pk_col else None
-                is_conflict = pk_val in conflict_pks if pk_val else False
-
-                # Determine action for this row
-                if not is_conflict:
-                    action = "overwrite"
-                elif strategy == "skip":
-                    action = "skip"
-                elif strategy == "overwrite":
-                    action = "overwrite"
-                elif strategy == "review":
-                    per_table = (per_row_overrides or {}).get(table_name, {})
-                    action = per_table.get(pk_val or "", "skip")
-                else:
-                    action = "skip"
-
-                if action == "skip":
-                    skipped_rows[table_name] += 1
+            for table_name, rows in parsed["table_data"].items():
+                if not rows:
                     continue
+                    
+                if table_name not in restored_tables:
+                    restored_tables.append(table_name)
+                if table_name not in skipped_rows:
+                    skipped_rows[table_name] = 0
 
-                vals = list(row.values())
-                placeholders = ", ".join(f"${i+1}" for i in range(len(vals)))
+                table_meta = schema_block.get("tables", {}).get(table_name, {})
+                pk_cols = table_meta.get("primary_key", [])
+                pk_col = pk_cols[0] if pk_cols else None
+                conflict_pks = conflict_pks_by_table.get(table_name, set())
+                cols = list(rows[0].keys())
+                col_sql = ", ".join(f'"{c}"' for c in cols)
 
-                if action == "overwrite" and is_conflict:
-                    # UPDATE existing row
-                    set_parts = [
-                        f'"{c}" = ${i+1}'
-                        for i, c in enumerate(cols)
-                        if c != pk_col
-                    ]
-                    if set_parts and pk_col:
-                        pk_idx = cols.index(pk_col) + 1
-                        update_vals = [v for c, v in zip(cols, vals) if c != pk_col]
-                        update_vals.append(row[pk_col])
-                        await pg_conn.execute(
-                            f'UPDATE "public"."{table_name}" '
-                            f'SET {", ".join(set_parts)} '
-                            f'WHERE "{pk_col}" = ${len(update_vals)}',
-                            *update_vals,
-                        )
+                for row in rows:
+                    pk_val = str(row.get(pk_col, "")) if pk_col else None
+                    is_conflict = pk_val in conflict_pks if pk_val else False
+
+                    # Determine action for this row
+                    if not is_conflict:
+                        action = "overwrite"
+                    elif strategy == "skip":
+                        action = "skip"
+                    elif strategy == "overwrite":
+                        action = "overwrite"
+                    elif strategy == "review":
+                        per_table = (per_row_overrides or {}).get(table_name, {})
+                        action = per_table.get(pk_val or "", "skip")
                     else:
-                        # No PK to update by — insert and let DB handle
+                        action = "skip"
+
+                    if action == "skip":
+                        skipped_rows[table_name] += 1
+                        continue
+
+                    vals = list(row.values())
+                    placeholders = ", ".join(f"${i+1}" for i in range(len(vals)))
+
+                    if action == "overwrite" and is_conflict:
+                        set_parts = [f'"{c}" = ${i+1}' for i, c in enumerate(cols) if c != pk_col]
+                        if set_parts and pk_col:
+                            update_vals = [v for c, v in zip(cols, vals) if c != pk_col]
+                            update_vals.append(row[pk_col])
+                            await pg_conn.execute(
+                                f'UPDATE "public"."{table_name}" '
+                                f'SET {", ".join(set_parts)} '
+                                f'WHERE "{pk_col}" = ${len(update_vals)}',
+                                *update_vals,
+                            )
+                        else:
+                            await pg_conn.execute(
+                                f'INSERT INTO "public"."{table_name}" ({col_sql}) '
+                                f'VALUES ({placeholders}) ON CONFLICT DO NOTHING',
+                                *vals,
+                            )
+                    else:
                         await pg_conn.execute(
                             f'INSERT INTO "public"."{table_name}" ({col_sql}) '
-                            f'VALUES ({placeholders}) ON CONFLICT DO NOTHING',
+                            f'VALUES ({placeholders})',
                             *vals,
                         )
-                else:
-                    await pg_conn.execute(
-                        f'INSERT INTO "public"."{table_name}" ({col_sql}) '
-                        f'VALUES ({placeholders})',
-                        *vals,
-                    )
 
-            restored_tables.append(table_name)
-
-    # Data is now committed. Update record status.
     record.status = "restored"
     await db.commit()
-
     await _delete_restore_session(restore_session_id)
 
-    # Post-restore migration record — retried with backoff.
-    # On failure, writes to restore_dead_letters — never silently lost.
     restore_migration = await _create_restore_migration_safe(
         db=db,
         record=record,
@@ -1192,12 +1350,11 @@ async def restore_backup(
         "strategy": strategy,
         "restored_tables": restored_tables,
         "skipped_rows": skipped_rows,
-        "schema_version": parsed_meta.get("schema_version"),
-        "schema_order_index": parsed_meta.get("schema_order_index", 0),
+        "schema_version": schema_version_applied,
+        "schema_order_index": schema_order_index_applied,
         "restore_migration_id": str(restore_migration.id) if restore_migration else None,
         "audit_warning": restore_migration is None,
     }
-
 
 async def _create_restore_migration_safe(
     db: AsyncSession,
@@ -1281,7 +1438,7 @@ async def _create_restore_migration_safe(
 
 
 # ---------------------------------------------------------------------------
-# Backup schema diff  (unchanged from original — delegates to schema diff)
+# Backup schema diff
 # ---------------------------------------------------------------------------
 
 async def diff_backups(
@@ -1292,13 +1449,6 @@ async def diff_backups(
 ) -> dict[str, Any]:
     """
     Diff the embedded DDL schema of two .calyph backups.
-
-    Only the schema blocks are compared — row data is never touched.
-    If both backups have schema_version set, delegates to migration
-    history diff.  Otherwise performs a structural DDL diff.
-
-    The diff_source field in the response is always "schema_only" to
-    make clear that no row data is involved.
     """
     record_a = await db.get(BackupRecord, backup_a_id)
     record_b = await db.get(BackupRecord, backup_b_id)
@@ -1314,21 +1464,29 @@ async def diff_backups(
     assert record_a is not None
     assert record_b is not None
 
-    # Ensure a is the older one
     if record_a.schema_order_index > record_b.schema_order_index:
         record_a, record_b = record_b, record_a
         backup_a_id, backup_b_id = backup_b_id, backup_a_id
 
-    # Load only part 1 from each backup (schema block is identical across parts)
-    key_a = _r2_key(workspace_id, record_a.connection_id, backup_a_id, "calyph",
-                    1 if record_a.part_count > 1 else None)
-    key_b = _r2_key(workspace_id, record_b.connection_id, backup_b_id, "calyph",
-                    1 if record_b.part_count > 1 else None)
+    # --- STREAMING SURGICAL EXTRACTION ---
+    async def _extract_schema_only(record: BackupRecord, b_id: UUID) -> dict:
+        key = _r2_key(workspace_id, record.connection_id, b_id, "calyph",
+                      1 if record.part_count > 1 else None)
+        schema_block = None
+        
+        async for block in stream_parse_calyph(stream_from_r2(key)):
+            if "calyph_schema_version" in block:
+                schema_block = block
+                break
+                
+        if not schema_block:
+            raise ValueError(f"Failed to extract schema from backup {b_id}")
+        return schema_block
 
-    data_a = await download_from_r2(key_a)
-    data_b = await download_from_r2(key_b)
-    parsed_a = parse_calyph_backup(data_a)
-    parsed_b = parse_calyph_backup(data_b)
+    schema_a = await _extract_schema_only(record_a, backup_a_id)
+    schema_b = await _extract_schema_only(record_b, backup_b_id)
+
+    # ---------------------------------------
 
     if (
         record_a.schema_version is not None
@@ -1346,8 +1504,6 @@ async def diff_backups(
         result["backup_b"] = _backup_meta(record_b, backup_b_id)
         return result
 
-    schema_a = parsed_a["schema"]
-    schema_b = parsed_b["schema"]
     tables_a = _normalise_tables(schema_a)
     tables_b = _normalise_tables(schema_b)
     enums_a = {
@@ -1369,8 +1525,8 @@ async def diff_backups(
 
     return {
         "diff_source": "schema_only",
-        "from_version": parsed_a["schema_version"],
-        "to_version": parsed_b["schema_version"],
+        "from_version": schema_a.get("schema_version"),
+        "to_version": schema_b.get("schema_version"),
         "from_index": record_a.schema_order_index,
         "to_index": record_b.schema_order_index,
         "migration_count": None,
@@ -1382,7 +1538,7 @@ async def diff_backups(
         "backup_a": _backup_meta(record_a, backup_a_id),
         "backup_b": _backup_meta(record_b, backup_b_id),
     }
-
+    
 
 def _backup_meta(record: BackupRecord, backup_id: UUID) -> dict:
     return {
