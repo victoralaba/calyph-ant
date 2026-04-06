@@ -100,7 +100,7 @@ from shared.types import Base
 # Constants & Concurrency
 # ---------------------------------------------------------------------------
 
-CHUNK_ROW_LIMIT = 50_000   # rows per .calyph part file
+CHUNK_BYTE_LIMIT = 50 * 1024 * 1024   # 50 MB per .calyph part file
 CALYPH_VERSION = "2"
 
 # ---------------------------------------------------------------------------
@@ -717,6 +717,10 @@ async def _resolve_schema_version(
 # Core backup — chunked .calyph builder (Streaming Generator)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Core backup — chunked .calyph builder (Streaming Generator)
+# ---------------------------------------------------------------------------
+
 async def _stream_calyph_chunked(
     pg_conn: asyncpg.Connection,
     label: str,
@@ -772,47 +776,73 @@ async def _stream_calyph_chunked(
         yield _build_calyph_bytes(header, schema_block, {})
         return
 
-    # Data Streaming path
+    # Data Streaming path (Byte-Governed)
     current_part_idx = 1
-    current_table_data: dict[str, list[dict]] = {}
-    current_row_count = 0
+    
+    def start_new_part(part_idx: int | None, total_parts: int | None = None) -> tuple[list[str], int]:
+        h = _calyph_header(
+            database=db_name, pg_version=pg_ver.split(",")[0],
+            label=label, schema_version=schema_version,
+            schema_order_index=schema_order_index,
+            part=part_idx, total_parts=total_parts
+        )
+        h_str = json.dumps(h, default=_json_default)
+        s_str = json.dumps(schema_block, default=_json_default)
+        # Return the starting lines and their exact UTF-8 byte length (+2 for newlines)
+        return [h_str, s_str], len(h_str.encode('utf-8')) + len(s_str.encode('utf-8')) + 2
+
+    current_lines, current_byte_size = start_new_part(current_part_idx)
+    has_data = False
 
     async with pg_conn.transaction(isolation="repeatable_read", readonly=True):
         for table_name in table_names:
             async with pg_conn.transaction():
                 cursor = await pg_conn.cursor(f'SELECT * FROM "public"."{table_name}"')
                 while True:
-                    rows = await cursor.fetch(5000)
+                    # Fetch 1000 rows at a time (smaller chunks prevent raw tuple memory spikes)
+                    rows = await cursor.fetch(1000)
                     if not rows:
                         break
                         
                     dict_rows = [dict(r) for r in rows]
-                    current_table_data.setdefault(table_name, []).extend(dict_rows)
-                    current_row_count += len(dict_rows)
+                    
+                    # Serialize immediately to measure footprint and drop the dict representations
+                    block_str = json.dumps({"table": table_name, "rows": dict_rows}, default=_json_default)
+                    block_bytes_len = len(block_str.encode('utf-8'))
+                    
+                    current_lines.append(block_str)
+                    current_byte_size += block_bytes_len + 1 # +1 for newline
+                    has_data = True
 
-                    if current_row_count >= CHUNK_ROW_LIMIT:
-                        header = _calyph_header(
-                            database=db_name, pg_version=pg_ver.split(",")[0],
-                            label=label, schema_version=schema_version,
-                            schema_order_index=schema_order_index,
-                            part=current_part_idx,
-                        )
-                        yield _build_calyph_bytes(header, schema_block, current_table_data)
+                    # If we breached 50MB, flush the part to R2 immediately
+                    if current_byte_size >= CHUNK_BYTE_LIMIT:
+                        body = "\n".join(current_lines)
+                        checksum = hashlib.sha256(body.encode('utf-8')).hexdigest()
+                        current_lines.append(json.dumps({"manifest": checksum}))
+                        yield gzip.compress("\n".join(current_lines).encode('utf-8'))
                         
                         current_part_idx += 1
-                        current_table_data = {}
-                        current_row_count = 0
+                        current_lines, current_byte_size = start_new_part(current_part_idx)
+                        has_data = False
 
         # Flush remainder
-        if current_row_count > 0 or current_part_idx == 1:
-            header = _calyph_header(
-                database=db_name, pg_version=pg_ver.split(",")[0],
-                label=label, schema_version=schema_version,
-                schema_order_index=schema_order_index,
-                part=current_part_idx if current_part_idx > 1 else None,
-                total_parts=current_part_idx if current_part_idx > 1 else None,
-            )
-            yield _build_calyph_bytes(header, schema_block, current_table_data)
+        if has_data or current_part_idx == 1:
+            if current_part_idx > 1:
+                # We need to tag the final part with `total_parts`.
+                # We swap out line 0 (the header) with the updated metadata.
+                h = _calyph_header(
+                    database=db_name, pg_version=pg_ver.split(",")[0],
+                    label=label, schema_version=schema_version,
+                    schema_order_index=schema_order_index,
+                    part=current_part_idx, total_parts=current_part_idx
+                )
+                current_lines[0] = json.dumps(h, default=_json_default)
+                
+            body = "\n".join(current_lines)
+            checksum = hashlib.sha256(body.encode('utf-8')).hexdigest()
+            current_lines.append(json.dumps({"manifest": checksum}))
+            yield gzip.compress("\n".join(current_lines).encode('utf-8'))
+
 
 
 async def _cursor_chunks(
@@ -830,39 +860,6 @@ async def _cursor_chunks(
             if not rows:
                 break
             yield [dict(r) for r in rows]
-
-
-def _partition_table_data(
-    all_data: dict[str, list[dict]],
-) -> list[dict[str, list[dict]]]:
-    """
-    Split table data into parts where each part contains at most
-    CHUNK_ROW_LIMIT total rows across all tables.
-
-    Large tables are split across parts; each table fragment keeps the
-    table name so the reassembly logic in restore can merge them.
-    """
-    parts: list[dict[str, list[dict]]] = [{}]
-
-    for table_name, rows in all_data.items():
-        offset = 0
-        while offset < len(rows) or (offset == 0 and len(rows) == 0):
-            chunk = rows[offset: offset + CHUNK_ROW_LIMIT]
-            offset += CHUNK_ROW_LIMIT
-
-            current = parts[-1]
-            current_total = sum(len(v) for v in current.values())
-
-            if current_total >= CHUNK_ROW_LIMIT:
-                parts.append({})
-                current = parts[-1]
-
-            current.setdefault(table_name, []).extend(chunk)
-
-            if offset >= len(rows):
-                break
-
-    return parts
 
 
 def _serialise_snapshot_filtered(snapshot, table_names_set: set[str]) -> dict[str, Any]:
