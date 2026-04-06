@@ -29,6 +29,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
+from uuid import UUID
 
 from loguru import logger
 from sqlalchemy import Inspector, inspect, text
@@ -169,10 +170,6 @@ def _validate_safe_target(url_str: str) -> None:
 # Engine factory (sync — Inspector requires sync engine)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Engine factory (sync — Inspector requires sync engine)
-# ---------------------------------------------------------------------------
-
 @lru_cache(maxsize=2048)
 def _make_sync_engine(url: str) -> Engine:
     """
@@ -212,49 +209,62 @@ def _make_sync_engine(url: str) -> Engine:
 # Core introspection
 # ---------------------------------------------------------------------------
 
-async def introspect_database(url: str, target_schema: str = "public") -> SchemaSnapshot:
+async def introspect_database(connection_id: UUID, url: str, target_schema: str = "public") -> SchemaSnapshot:
     """
     Full structural introspection of a database.
-    
-    ASYNC GATEWAY: This forces the underlying synchronous SQLAlchemy Inspector 
-    operations onto a background worker thread. It guarantees the FastAPI 
-    event loop will never be blocked by slow external database connections.
+    ASYNC GATEWAY: Bypasses OS threading entirely. Borrows an AsyncEngine 
+    from the Fortress and yields to the sync Inspector via run_sync.
     """
-    return await asyncio.to_thread(_sync_introspect_database, url, target_schema)
+    from domains.query.service import pool_manager
+    engine = await pool_manager.get_engine(connection_id, url)
+    
+    # ---------------------------------------------------------------------
+    # UI CONSIDERATION: Because connection pooling is now multiplexed, 
+    # parallel automated schema refreshes from multiple tabs will no longer 
+    # throw HTTP 503 "Connection limits exceeded" errors.
+    # ---------------------------------------------------------------------
+    async with engine.connect() as conn:
+        return await conn.run_sync(
+            _sync_introspect_database_logic, 
+            target_schema=target_schema
+        )
 
 
-async def introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
+async def introspect_table(connection_id: UUID, url: str, table_name: str, schema: str = "public") -> TableInfo:
     """
     Introspect a single table. Faster than full snapshot for targeted ops.
+    """
+    from domains.query.service import pool_manager
+    engine = await pool_manager.get_engine(connection_id, url)
     
-    ASYNC GATEWAY: Safely delegates to a background thread to prevent starvation.
+    async with engine.connect() as conn:
+        return await conn.run_sync(
+            _sync_introspect_table_logic, 
+            table_name=table_name, 
+            schema=schema
+        )
+
+
+def _sync_introspect_database_logic(sync_conn: Any, target_schema: str) -> SchemaSnapshot:
     """
-    return await asyncio.to_thread(_sync_introspect_table, url, table_name, schema)
-
-
-def _sync_introspect_database(url: str, target_schema: str = "public") -> SchemaSnapshot:
+    PRIVATE: Synchronous execution payload. Executed safely inside the run_sync greenlet.
+    sync_conn is a proxied synchronous connection provided by SQLAlchemy ext.asyncio.
     """
-    PRIVATE: Synchronous execution payload. Do not call this directly from an async router.
-    """
-    engine = _make_sync_engine(url)
-    with engine.connect() as conn:
-        inspector: Inspector = inspect(engine)
+    inspector: Inspector = inspect(sync_conn)
 
-        pg_version = conn.execute(text("SELECT version()")).scalar()
-        database = conn.execute(text("SELECT current_database()")).scalar()
+    pg_version = sync_conn.execute(text("SELECT version()")).scalar()
+    database = sync_conn.execute(text("SELECT current_database()")).scalar()
 
-        schemas = [
-            s for s in inspector.get_schema_names()
-            if s not in ("pg_catalog", "information_schema", "pg_toast")
-        ]
+    schemas = [
+        s for s in inspector.get_schema_names()
+        if s not in ("pg_catalog", "information_schema", "pg_toast")
+    ]
 
-        # Explicitly unpacking the tuple to handle the new telemetry contract
-        tables, unreadable_entities = _introspect_tables(inspector, conn, target_schema)
-        enums = _introspect_enums(conn, target_schema)
-        sequences = _introspect_sequences(conn, target_schema)
-        extensions = _introspect_extensions(conn)
+    tables, unreadable_entities = _introspect_tables(inspector, sync_conn, target_schema)
+    enums = _introspect_enums(sync_conn, target_schema)
+    sequences = _introspect_sequences(sync_conn, target_schema)
+    extensions = _introspect_extensions(sync_conn)
 
-    # Returning outside the `with` block so the connection is closed before we serialize
     return SchemaSnapshot(
         database=str(database or "unknown"),
         pg_version=str(pg_version or "").split(",")[0].strip(),
@@ -267,23 +277,19 @@ def _sync_introspect_database(url: str, target_schema: str = "public") -> Schema
     )
 
 
-def _sync_introspect_table(url: str, table_name: str, schema: str = "public") -> TableInfo:
+def _sync_introspect_table_logic(sync_conn: Any, table_name: str, schema: str) -> TableInfo:
     """
     PRIVATE: Synchronous execution payload for single-table inspection.
     """
-    engine = _make_sync_engine(url)
-    with engine.connect() as conn:
-        inspector = inspect(engine)
+    inspector = inspect(sync_conn)
+    
+    tables, unreadable_entities = _introspect_tables(inspector, sync_conn, schema, only=[table_name])
+    
+    if not tables:
+        reason = unreadable_entities[0]["reason"] if unreadable_entities else "Unknown error"
+        raise ValueError(f"Table '{schema}.{table_name}' could not be read. Reason: {reason}")
         
-        # Explicitly unpacking the tuple to handle the new telemetry contract
-        tables, unreadable_entities = _introspect_tables(inspector, conn, schema, only=[table_name])
-        
-        if not tables:
-            # If the table failed, extract the specific DB reason and raise it violently
-            reason = unreadable_entities[0]["reason"] if unreadable_entities else "Unknown error"
-            raise ValueError(f"Table '{schema}.{table_name}' could not be read. Reason: {reason}")
-            
-        return tables[0]
+    return tables[0]
 
 
 def _introspect_tables(

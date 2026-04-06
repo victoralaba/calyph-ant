@@ -200,102 +200,142 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
 class WorkspacePoolManager:
     """
     Global registry for tenant-specific PostgreSQL connection pools.
-    Engineered for O(1) critical path lookup, isolated background GC without
-    blocking sweepers, and strict Thundering Herd prevention via Task caching.
+    Now manages BOTH raw asyncpg.Pools (for high-speed queries) and 
+    SQLAlchemy AsyncEngines (for schema reflection) with unified Garbage Collection.
     """
     def __init__(self, ttl_seconds: int = 600):
-        # Maps connection_id -> asyncio.Task[asyncpg.Pool]
         self._pool_tasks: dict[UUID, asyncio.Task] = {}
-        
-        # Maps connection_id -> asyncio.TimerHandle (for decentralized eviction)
+        self._engine_tasks: dict[UUID, asyncio.Task] = {}
         self._eviction_timers: dict[UUID, asyncio.TimerHandle] = {}
-        
         self._ttl_seconds = ttl_seconds
 
-    async def get_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
-        # 1. Fast Heartbeat Refresh
+    def _refresh_heartbeat(self, connection_id: UUID) -> None:
+        """Centralized heartbeat to extend the TTL of active connections."""
         timer = self._eviction_timers.pop(connection_id, None)
         if timer is not None:
             timer.cancel()
+        
+        loop = asyncio.get_running_loop()
+        self._eviction_timers[connection_id] = loop.call_later(
+            self._ttl_seconds,
+            self._schedule_eviction,
+            connection_id
+        )
 
-        # 2. Thundering Herd Protection (Native asyncio)
+    async def get_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
+        self._refresh_heartbeat(connection_id)
+
         task = self._pool_tasks.get(connection_id)
         if task is None:
             task = asyncio.create_task(self._build_pool(connection_id, url))
             self._pool_tasks[connection_id] = task
 
         try:
-            pool = await task
+            return await task
         except Exception:
-            # NO GHOST LOCKS: Instantly purge failed connection tasks
             self._pool_tasks.pop(connection_id, None)
             raise
 
-        # 3. Schedule Decentralized Eviction
-        loop = asyncio.get_running_loop()
-        self._eviction_timers[connection_id] = loop.call_later(
-            self._ttl_seconds,
-            self._schedule_eviction,
-            connection_id,
-            pool
-        )
+    async def get_engine(self, connection_id: UUID, url: str):
+        """Retrieves or builds a SQLAlchemy AsyncEngine for safe schema reflection."""
+        self._refresh_heartbeat(connection_id)
 
-        return pool
+        task = self._engine_tasks.get(connection_id)
+        if task is None:
+            task = asyncio.create_task(self._build_engine(url))
+            self._engine_tasks[connection_id] = task
+
+        try:
+            return await task
+        except Exception:
+            self._engine_tasks.pop(connection_id, None)
+            raise
 
     async def _build_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
-        """
-        The single critical I/O block for pool creation.
-        """
         return await get_workspace_pool(url)
 
-    def _schedule_eviction(self, connection_id: UUID, pool: asyncpg.Pool) -> None:
-        """
-        Triggered natively by the event loop when the TTL expires.
-        """
-        self._eviction_timers.pop(connection_id, None)
-        asyncio.create_task(self._evict_pool_if_idle(connection_id, pool))
+    async def _build_engine(self, url: str):
+        from sqlalchemy.ext.asyncio import create_async_engine
+        
+        # Native conversion to asyncpg driver protocol for SQLAlchemy
+        clean_url = url.replace("postgresql+psycopg://", "postgresql+asyncpg://")
+        if clean_url.startswith("postgres://"):
+            clean_url = clean_url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif not clean_url.startswith("postgresql+"):
+            clean_url = clean_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-    async def _evict_pool_if_idle(self, connection_id: UUID, pool: asyncpg.Pool) -> None:
-        """
-        The true idleness check. Safely closes the pool or extends its life
-        if a stream is still active.
-        """
-        if pool.get_idle_size() == pool.get_size():
-            # Pool is idle. Safe to tear down.
+        return create_async_engine(
+            clean_url,
+            pool_size=1, # Introspection is bursty; keep pool micro-sized
+            max_overflow=1,
+            pool_timeout=15,
+            connect_args={
+                "server_settings": {
+                    "application_name": "calyphant-inspector",
+                    "statement_timeout": "15000",
+                }
+            }
+        )
+
+    def _schedule_eviction(self, connection_id: UUID) -> None:
+        self._eviction_timers.pop(connection_id, None)
+        asyncio.create_task(self._evict_if_idle(connection_id))
+
+    async def _evict_if_idle(self, connection_id: UUID) -> None:
+        """Unified GC: Drops both pools if and only if both are completely idle."""
+        pool_task = self._pool_tasks.get(connection_id)
+        engine_task = self._engine_tasks.get(connection_id)
+
+        is_idle = True
+        pool = None
+        engine = None
+
+        if pool_task and pool_task.done():
+            pool = pool_task.result()
+            if pool.get_idle_size() != pool.get_size():
+                is_idle = False
+
+        if engine_task and engine_task.done():
+            engine = engine_task.result()
+            if engine.pool.checkedout() > 0:
+                is_idle = False
+
+        if is_idle:
             self._pool_tasks.pop(connection_id, None)
-            try:
-                await pool.close()
-            except Exception as exc:
-                logger.warning(f"Failed to cleanly close idle workspace pool: {exc}")
+            self._engine_tasks.pop(connection_id, None)
+            
+            if pool:
+                try: await pool.close()
+                except Exception as exc: logger.warning(f"Failed to close pool: {exc}")
+            if engine:
+                try: await engine.dispose()
+                except Exception as exc: logger.warning(f"Failed to dispose engine: {exc}")
         else:
-            # A query or stream is still holding a connection. Extend TTL.
-            loop = asyncio.get_running_loop()
-            self._eviction_timers[connection_id] = loop.call_later(
-                self._ttl_seconds,
-                self._schedule_eviction,
-                connection_id,
-                pool
-            )
+            self._refresh_heartbeat(connection_id)
 
     async def close_all(self) -> None:
-        """
-        The Master Kill Switch.
-        Awaits all pending pool creations and cleanly closes every active pool.
-        Called exclusively by the FastAPI lifespan shutdown hook.
-        """
+        """The Master Kill Switch."""
         for timer in self._eviction_timers.values():
             timer.cancel()
         self._eviction_timers.clear()
 
-        tasks = list(self._pool_tasks.values())
+        p_tasks = list(self._pool_tasks.values())
+        e_tasks = list(self._engine_tasks.values())
+        
         self._pool_tasks.clear()
+        self._engine_tasks.clear()
 
-        for task in tasks:
+        for task in p_tasks:
             try:
                 pool = await task
                 await pool.close()
-            except Exception as exc:
-                logger.error(f"Error during graceful shutdown of workspace pool: {exc}")
+            except Exception: pass
+            
+        for task in e_tasks:
+            try:
+                engine = await task
+                await engine.dispose()
+            except Exception: pass
 
 # Initialize the global singleton manager
 pool_manager = WorkspacePoolManager()
