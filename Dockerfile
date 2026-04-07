@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     libpq-dev \
     gcc \
+    libc-dev \
+    python3-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

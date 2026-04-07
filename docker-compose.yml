@@ -69,11 +69,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      # BUG FIX: dynamically evaluate POSTGRES_USER
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      # ARCHITECTURE FIX: Direct interpolation and explicit database targeting
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 45s
     # ARCHITECTURE UPDATE: Tuned specifically for 24GB Host RAM
     command: >
       postgres
