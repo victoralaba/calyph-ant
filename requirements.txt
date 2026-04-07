@@ -12,6 +12,7 @@ psycopg2-binary
 # ── ORM + migrations ──────────────────────────────────────────────────────────
 sqlalchemy[asyncio]
 alembic
+ruff
 
 # ── Schema diff ───────────────────────────────────────────────────────────────
 migra

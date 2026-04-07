@@ -227,6 +227,7 @@ async def get_quota_status(user: CurrentUser):
 @router.post("/{connection_id}/sql", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def stream_natural_language_to_sql(
+    request: Request,
     connection_id: UUID,
     body: NlToSqlRequest,
     user: CurrentUser,
@@ -296,6 +297,7 @@ async def stream_natural_language_to_sql(
 @router.post("/{connection_id}/explain", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def explain_sql(
+    request: Request,
     connection_id: UUID,
     body: ExplainSqlRequest,
     user: CurrentUser,
@@ -352,6 +354,7 @@ async def explain_sql(
 @router.post("/{connection_id}/optimize", dependencies=[Depends(verify_connection_ownership)])
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def optimize_query(
+    request: Request,
     connection_id: UUID,
     body: OptimizeRequest,
     user: CurrentUser,

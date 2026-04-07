@@ -1,5 +1,12 @@
 # docker-compose.yml
-version: "3.9"
+
+x-shared-env: &shared-env
+  REDIS_URL: "redis://redis:6379/0"
+  CELERY_BROKER_URL: "redis://redis:6379/1"
+  CELERY_RESULT_BACKEND: "redis://redis:6379/2"
+  # Ensures the API and workers hit the postgres container, not localhost
+  DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+  SYNC_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
 
 services:
   api:
@@ -10,9 +17,10 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
-      - POOLING_ENABLED=true
-      - POOL_MIN_SIZE=5
-      - POOL_MAX_SIZE=20
+      <<: *shared-env
+      POOLING_ENABLED: "true"
+      POOL_MIN_SIZE: "5"
+      POOL_MAX_SIZE: "20"
     depends_on:
       postgres:
         condition: service_healthy
@@ -20,7 +28,6 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-    # Production: Utilize the 4 oCPUs
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
   worker:
@@ -28,25 +35,27 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    environment:
+      <<: *shared-env
     depends_on:
       - postgres
       - redis
-    # Standard queue: Restricted to 2 concurrent processes
     command: celery -A worker.celery:celery_app worker --loglevel=info -Q default,keep_alive,backups,maintenance -c 2
 
   worker_ephemeral:
     build:
       context: .
       dockerfile: Dockerfile
-    user: root # SECURITY FIX: Required for dynamic docker.sock orchestration
+    user: root
     env_file: .env
+    environment:
+      <<: *shared-env
     volumes:
       - .:/app
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - postgres
       - redis
-    # Ephemeral queue: Restricted to 2 concurrent processes to prevent host starvation
     command: celery -A worker.celery:celery_app worker --loglevel=info -Q ephemeral_compute -c 2
 
   beat:
@@ -54,6 +63,8 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    environment:
+      <<: *shared-env
     depends_on:
       - redis
     command: celery -A worker.celery:celery_app beat --loglevel=info

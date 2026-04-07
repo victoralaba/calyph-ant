@@ -262,7 +262,7 @@ class ImportChunkRequest(BaseModel):
 _IDENTIFIER_REGEX = r"^[a-zA-Z0-9_]+$"
 
 TablePath = Annotated[str, Path(pattern=_IDENTIFIER_REGEX)]
-SchemaQuery = Annotated[str, Query(default="public", pattern=_IDENTIFIER_REGEX)]
+SchemaQuery = Annotated[str, Query(pattern=_IDENTIFIER_REGEX)]
 
 # Used for Query parameters that represent structural column names
 StrictColumnQuery = Annotated[str, Query(pattern=_IDENTIFIER_REGEX)]
