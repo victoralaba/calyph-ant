@@ -16,7 +16,7 @@ from functools import lru_cache
 from typing import Any, AsyncGenerator
 from uuid import UUID
 
-import aiobotocore.session
+import aiobotocore.session #type: ignore
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -132,8 +132,9 @@ class R2MultipartStreamer:
         while len(self.buffer) >= self.chunk_size_limit:
             payload = bytes(self.buffer[:self.chunk_size_limit])
             del self.buffer[:self.chunk_size_limit]
-            
             current_part = self.part_number
+            if self.client is None:
+                raise RuntimeError("R2MultipartStreamer client is not initialized.")
             res = await self.client.upload_part(
                 Bucket=settings.R2_BUCKET_NAME,
                 Key=self.key,
@@ -141,7 +142,6 @@ class R2MultipartStreamer:
                 UploadId=self.upload_id,
                 Body=payload
             )
-            
             self.parts.append({"PartNumber": current_part, "ETag": res["ETag"]})
             self.part_number += 1
 
@@ -152,7 +152,8 @@ class R2MultipartStreamer:
 
         payload = bytes(self.buffer)
         current_part = self.part_number
-        
+        if self.client is None:
+            raise RuntimeError("R2MultipartStreamer client is not initialized.")
         res = await self.client.upload_part(
             Bucket=settings.R2_BUCKET_NAME,
             Key=self.key,
@@ -160,7 +161,6 @@ class R2MultipartStreamer:
             UploadId=self.upload_id,
             Body=payload
         )
-        
         self.parts.append({"PartNumber": current_part, "ETag": res["ETag"]})
         self.part_number += 1
         self.buffer.clear()
