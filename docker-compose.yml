@@ -32,7 +32,7 @@ services:
       - postgres
       - redis
     # Standard queue: Restricted to 2 concurrent processes
-    command: celery -A worker.celery celery_app worker --loglevel=info -Q default,keep_alive,backups,maintenance -c 2
+    command: celery -A worker.celery:celery_app worker --loglevel=info -Q default,keep_alive,backups,maintenance -c 2
 
   worker_ephemeral:
     build:
@@ -47,7 +47,7 @@ services:
       - postgres
       - redis
     # Ephemeral queue: Restricted to 2 concurrent processes to prevent host starvation
-    command: celery -A worker.celery celery_app worker --loglevel=info -Q ephemeral_compute -c 2
+    command: celery -A worker.celery:celery_app worker --loglevel=info -Q ephemeral_compute -c 2
 
   beat:
     build:
@@ -56,7 +56,7 @@ services:
     env_file: .env
     depends_on:
       - redis
-    command: celery -A worker.celery celery_app beat --loglevel=info
+    command: celery -A worker.celery:celery_app beat --loglevel=info
 
   postgres:
     image: pgvector/pgvector:pg17
