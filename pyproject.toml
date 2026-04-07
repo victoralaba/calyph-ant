@@ -42,6 +42,7 @@ dependencies = [
     # Storage
     "boto3",
     "botocore",
+    "aiobotocore",
 
     # Rate limiting
     "slowapi",

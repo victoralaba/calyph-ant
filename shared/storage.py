@@ -2,7 +2,7 @@
 """
 Cloudflare R2 storage client wrapper.
 
-Thin abstraction over boto3's S3-compatible API.
+Thin abstraction over boto3's S3-compatible API and aiobotocore for streaming.
 All R2 operations go through here — no domain imports boto3 directly.
 
 Also contains the pagination helper used across domains.
@@ -11,10 +11,11 @@ Also contains the pagination helper used across domains.
 from __future__ import annotations
 
 import asyncio
-import mimetypes
+from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
+import aiobotocore.session
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -27,8 +28,13 @@ from core.config import settings
 # R2 client factory
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=1)
 def _get_client():
-    """Build a boto3 S3 client pointed at Cloudflare R2."""
+    """
+    Build and cache a boto3 S3 client pointed at Cloudflare R2.
+    Prevents re-instantiation overhead and reuses the underlying connection pool.
+    Strictly for lightweight I/O and cryptographic operations.
+    """
     return boto3.client(
         "s3",
         endpoint_url=settings.R2_ENDPOINT_URL,
@@ -36,6 +42,7 @@ def _get_client():
         aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
         region_name="auto",
         config=Config(
+            max_pool_connections=50,
             retries={"max_attempts": 3, "mode": "adaptive"},
             connect_timeout=10,
             read_timeout=60,
@@ -51,15 +58,18 @@ def _check_r2_enabled() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Async Streaming Engine
+# ---------------------------------------------------------------------------
+
 class R2MultipartStreamer:
     """
-    Asynchronous Context Manager for pass-through file streaming to R2.
-    Absorbs stream chunks, buffers to 5MB, and flushes to storage thread-safely.
+    Native Asyncio Context Manager for pass-through file streaming to R2.
+    Uses aiobotocore to prevent thread-pool exhaustion under heavy concurrent load.
     Guarantees peak memory usage of ~5MB per active upload regardless of file size.
     """
     def __init__(self, key: str, content_type: str = "application/octet-stream", metadata: dict[str, str] | None = None):
         _check_r2_enabled()
-        self.client = _get_client()
         self.key = key
         self.content_type = content_type
         self.metadata = metadata or {}
@@ -71,20 +81,34 @@ class R2MultipartStreamer:
         
         # S3/R2 requires multipart chunks to be at least 5MB, except for the final part.
         self.chunk_size_limit = 5 * 1024 * 1024 
+        
+        # Aiobotocore session is safe to instantiate locally
+        self.session = aiobotocore.session.get_session()
+        self._client_ctx = None
+        self.client = None
 
     async def __aenter__(self) -> "R2MultipartStreamer":
-        kwargs = {
-            "Bucket": settings.R2_BUCKET_NAME,
-            "Key": self.key,
-            "ContentType": self.content_type,
-            "Metadata": self.metadata
-        }
-        res = await asyncio.to_thread(self.client.create_multipart_upload, **kwargs)
+        self._client_ctx = self.session.create_client(
+            "s3",
+            endpoint_url=settings.R2_ENDPOINT_URL,
+            aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+            config=Config(retries={"max_attempts": 3, "mode": "adaptive"}),
+        )
+        self.client = await self._client_ctx.__aenter__()
+
+        res = await self.client.create_multipart_upload(
+            Bucket=settings.R2_BUCKET_NAME,
+            Key=self.key,
+            ContentType=self.content_type,
+            Metadata=self.metadata
+        )
         self.upload_id = res["UploadId"]
         return self
 
     async def push_chunk(self, chunk: bytes) -> None:
-        """Absorb bytes. Block and flush to R2 only when buffer breaches 5MB."""
+        """Absorb bytes. Block and flush to R2 natively when buffer breaches 5MB."""
         self.buffer.extend(chunk)
         if len(self.buffer) >= self.chunk_size_limit:
             await self._flush_part()
@@ -96,8 +120,7 @@ class R2MultipartStreamer:
         payload = bytes(self.buffer)
         current_part = self.part_number
         
-        res = await asyncio.to_thread(
-            self.client.upload_part,
+        res = await self.client.upload_part(
             Bucket=settings.R2_BUCKET_NAME,
             Key=self.key,
             PartNumber=current_part,
@@ -110,27 +133,29 @@ class R2MultipartStreamer:
         self.buffer.clear()
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if exc_type is not None:
-            logger.error(f"Stream interrupted for {self.key}. Aborting R2 multipart upload.")
-            if self.upload_id:
-                await asyncio.to_thread(
-                    self.client.abort_multipart_upload,
+        try:
+            if exc_type is not None:
+                logger.error(f"Stream interrupted for {self.key}. Aborting R2 multipart upload.")
+                if self.upload_id and self.client:
+                    await self.client.abort_multipart_upload(
+                        Bucket=settings.R2_BUCKET_NAME,
+                        Key=self.key,
+                        UploadId=self.upload_id
+                    )
+                return
+
+            await self._flush_part()
+
+            if self.upload_id and self.parts and self.client:
+                await self.client.complete_multipart_upload(
                     Bucket=settings.R2_BUCKET_NAME,
                     Key=self.key,
-                    UploadId=self.upload_id
+                    UploadId=self.upload_id,
+                    MultipartUpload={"Parts": self.parts}
                 )
-            return
-
-        await self._flush_part()
-
-        if self.upload_id and self.parts:
-            await asyncio.to_thread(
-                self.client.complete_multipart_upload,
-                Bucket=settings.R2_BUCKET_NAME,
-                Key=self.key,
-                UploadId=self.upload_id,
-                MultipartUpload={"Parts": self.parts}
-            )
+        finally:
+            if self._client_ctx:
+                await self._client_ctx.__aexit__(exc_type, exc_val, exc_tb)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +195,11 @@ async def upload(
 
 
 async def download(key: str) -> bytes:
-    """Download an object from R2. Raises ValueError if not found."""
+    """
+    Download an object from R2 into memory.
+    Strictly limited to 5MB to prevent OOM crashes on the backend.
+    For larger assets (like backups), the client MUST use generate_presigned_url.
+    """
     _check_r2_enabled()
     client = _get_client()
     try:
@@ -179,7 +208,17 @@ async def download(key: str) -> bytes:
             Bucket=settings.R2_BUCKET_NAME,
             Key=key,
         )
-        return response["Body"].read()
+        
+        # OOM Protection: Enforce 5MB limit before reading into RAM
+        content_length = response.get("ContentLength", 0)
+        if content_length > 5 * 1024 * 1024:
+            raise ValueError(
+                f"Object '{key}' is {content_length} bytes, exceeding the 5MB in-memory limit. "
+                "Use generate_presigned_url for this asset."
+            )
+            
+        return await asyncio.to_thread(response["Body"].read)
+        
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
         if code in ("NoSuchKey", "404"):
@@ -208,7 +247,10 @@ async def generate_presigned_url(
     expires_in: int = 3600,
     method: str = "get_object",
 ) -> str:
-    """Generate a pre-signed URL for direct client access."""
+    """
+    Generate a pre-signed URL for direct client access.
+    Purely local cryptographic math.
+    """
     _check_r2_enabled()
     client = _get_client()
     return await asyncio.to_thread(
@@ -235,22 +277,27 @@ async def object_exists(key: str) -> bool:
 
 
 async def list_objects(prefix: str) -> list[dict[str, Any]]:
-    """List objects under a key prefix."""
+    """
+    List objects under a key prefix.
+    Safely paginates through R2 to prevent silent truncation at 1,000 items.
+    """
     _check_r2_enabled()
     client = _get_client()
-    response = await asyncio.to_thread(
-        client.list_objects_v2,
-        Bucket=settings.R2_BUCKET_NAME,
-        Prefix=prefix,
-    )
-    return [
-        {
-            "key": obj["Key"],
-            "size": obj["Size"],
-            "last_modified": obj["LastModified"].isoformat(),
-        }
-        for obj in response.get("Contents", [])
-    ]
+    
+    def _fetch_all_pages() -> list[dict[str, Any]]:
+        paginator = client.get_paginator("list_objects_v2")
+        results = []
+        
+        for page in paginator.paginate(Bucket=settings.R2_BUCKET_NAME, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                results.append({
+                    "key": obj["Key"],
+                    "size": obj["Size"],
+                    "last_modified": obj["LastModified"].isoformat(),
+                })
+        return results
+
+    return await asyncio.to_thread(_fetch_all_pages)
 
 
 # ---------------------------------------------------------------------------
