@@ -32,6 +32,11 @@ import json
 import asyncpg
 from typing import Any
 from loguru import logger
+from uuid import UUID
+from fastapi import HTTPException, status
+
+from core.db import get_redis
+from redis.asyncio import Redis as AsyncRedis
 
 # ---------------------------------------------------------------------------
 # Value coercion (Crucial for translating JSON strings to PG native types)
@@ -90,6 +95,49 @@ def _coerce_value(raw: Any, pg_type: str) -> Any:
 # Core Ingestion Engine
 # ---------------------------------------------------------------------------
 
+
+async def init_import_session(
+    workspace_id: UUID, 
+    connection_id: UUID, 
+    session_id: str,
+    tier_limits: dict[str, Any]
+) -> None:
+    """
+    Initializes metering. Must be called by the POST /import/init endpoint before chunks begin.
+    """
+    redis: AsyncRedis = await get_redis()
+    active_imports_key = f"active_imports:{workspace_id}:{connection_id}"
+    
+    # 1. Enforce Concurrency Lock
+    active_count = await redis.scard(active_imports_key)  # type: ignore
+    max_concurrent = tier_limits.get("max_concurrent_imports", 1)
+    
+    if active_count >= max_concurrent:
+        """
+        [UI CONSIDERATION]
+        If 429 is returned, UI should alert the user that another import is currently 
+        running on this database and they must wait.
+        """
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Limit reached: You can only run {max_concurrent} concurrent import(s) on this database."
+        )
+
+    # 2. Register session & initialize row counter
+    await redis.sadd(active_imports_key, session_id)  # type: ignore
+    await redis.expire(active_imports_key, 3600) 
+    await redis.setex(f"import_rows_counted:{session_id}", 3600, 0)
+
+
+async def complete_import_session(workspace_id: UUID, connection_id: UUID, session_id: str) -> None:
+    """ 
+    Cleans up locks. Must be called by the frontend when all chunks are sent, or if user cancels. 
+    """
+    redis: AsyncRedis = await get_redis()
+    await redis.srem(f"active_imports:{workspace_id}:{connection_id}", session_id)  # type: ignore
+    await redis.delete(f"import_rows_counted:{session_id}")
+
+
 async def execute_import_chunk(
     pg_conn: asyncpg.Connection,
     table_name: str,
@@ -97,18 +145,46 @@ async def execute_import_chunk(
     columns: list[str],
     column_types: dict[str, str],
     rows: list[dict[str, Any]],
+    session_id: str,
+    tier_limits: dict[str, Any]
 ) -> int:
     """
-    Executes a high-speed bulk insert for a single chunk of data.
-    All rows succeed, or the entire chunk rolls back.
+    Executes a high-speed bulk insert and meters the rows against tier limits.
     """
+    redis: AsyncRedis = await get_redis()
+    chunk_size = len(rows)
+    
+    # 1. Enforce Row Limits
+    counter_key = f"import_rows_counted:{session_id}"
+    current_rows_raw = await redis.get(counter_key)
+    
+    if current_rows_raw is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Import session invalid or expired. Please restart the import."
+        )
+        
+    current_rows = int(current_rows_raw)
+    max_rows = tier_limits.get("max_import_rows_per_job", 10000) 
+    
+    if current_rows + chunk_size > max_rows:
+        """
+        [UI CONSIDERATION]
+        If the frontend receives a 402 here, it MUST immediately halt sending further chunks,
+        show the user a success message for the rows already imported, and prompt an upgrade 
+        to continue importing unlimited rows.
+        """
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Tier limit reached: Your plan allows a maximum of {max_rows} rows per import job."
+        )
+
+    # 2. Database Execution
     cols_sql = ", ".join(f'"{col}"' for col in columns)
     placeholders = ", ".join(f"${i+1}" for i in range(len(columns)))
     insert_sql = f'INSERT INTO "{schema}"."{table_name}" ({cols_sql}) VALUES ({placeholders})'
 
     value_tuples = []
-    
-    # Map dictionaries to flat tuples, coercing types based on DB schema
     for row_idx, row in enumerate(rows):
         try:
             values = tuple(
@@ -119,12 +195,12 @@ async def execute_import_chunk(
         except Exception as exc:
             raise ValueError(f"Data type error on row {row_idx + 1}: {exc}")
 
-    # Bulk execute inside a single transaction
     async with pg_conn.transaction():
         await pg_conn.executemany(insert_sql, value_tuples)
         
+    # 3. Update Metering
+    await redis.incrby(counter_key, chunk_size)
     return len(value_tuples)
-
 
 # ---------------------------------------------------------------------------
 # Export helpers (for round-trip testing and download)

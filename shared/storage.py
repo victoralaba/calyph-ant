@@ -51,6 +51,88 @@ def _check_r2_enabled() -> None:
         )
 
 
+class R2MultipartStreamer:
+    """
+    Asynchronous Context Manager for pass-through file streaming to R2.
+    Absorbs stream chunks, buffers to 5MB, and flushes to storage thread-safely.
+    Guarantees peak memory usage of ~5MB per active upload regardless of file size.
+    """
+    def __init__(self, key: str, content_type: str = "application/octet-stream", metadata: dict[str, str] | None = None):
+        _check_r2_enabled()
+        self.client = _get_client()
+        self.key = key
+        self.content_type = content_type
+        self.metadata = metadata or {}
+        
+        self.upload_id: str | None = None
+        self.parts: list[dict[str, Any]] = []
+        self.buffer = bytearray()
+        self.part_number = 1
+        
+        # S3/R2 requires multipart chunks to be at least 5MB, except for the final part.
+        self.chunk_size_limit = 5 * 1024 * 1024 
+
+    async def __aenter__(self) -> "R2MultipartStreamer":
+        kwargs = {
+            "Bucket": settings.R2_BUCKET_NAME,
+            "Key": self.key,
+            "ContentType": self.content_type,
+            "Metadata": self.metadata
+        }
+        res = await asyncio.to_thread(self.client.create_multipart_upload, **kwargs)
+        self.upload_id = res["UploadId"]
+        return self
+
+    async def push_chunk(self, chunk: bytes) -> None:
+        """Absorb bytes. Block and flush to R2 only when buffer breaches 5MB."""
+        self.buffer.extend(chunk)
+        if len(self.buffer) >= self.chunk_size_limit:
+            await self._flush_part()
+
+    async def _flush_part(self) -> None:
+        if not self.buffer:
+            return
+
+        payload = bytes(self.buffer)
+        current_part = self.part_number
+        
+        res = await asyncio.to_thread(
+            self.client.upload_part,
+            Bucket=settings.R2_BUCKET_NAME,
+            Key=self.key,
+            PartNumber=current_part,
+            UploadId=self.upload_id,
+            Body=payload
+        )
+        
+        self.parts.append({"PartNumber": current_part, "ETag": res["ETag"]})
+        self.part_number += 1
+        self.buffer.clear()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if exc_type is not None:
+            logger.error(f"Stream interrupted for {self.key}. Aborting R2 multipart upload.")
+            if self.upload_id:
+                await asyncio.to_thread(
+                    self.client.abort_multipart_upload,
+                    Bucket=settings.R2_BUCKET_NAME,
+                    Key=self.key,
+                    UploadId=self.upload_id
+                )
+            return
+
+        await self._flush_part()
+
+        if self.upload_id and self.parts:
+            await asyncio.to_thread(
+                self.client.complete_multipart_upload,
+                Bucket=settings.R2_BUCKET_NAME,
+                Key=self.key,
+                UploadId=self.upload_id,
+                MultipartUpload={"Parts": self.parts}
+            )
+
+
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
@@ -63,8 +145,12 @@ async def upload(
 ) -> int:
     """
     Upload bytes to R2. Returns size in bytes.
-    key: e.g. "backups/workspace_id/connection_id/backup_id.calyph.gz"
+    Strictly limited to 5MB to prevent OOM crashes on the backend.
+    For large files, use R2MultipartStreamer instead.
     """
+    if len(data) > 5 * 1024 * 1024:
+        raise ValueError("Payload exceeds 5MB limit for in-memory upload. Use streaming.")
+        
     _check_r2_enabled()
     client = _get_client()
     kwargs: dict[str, Any] = {
@@ -176,6 +262,16 @@ def backup_key(workspace_id: UUID, connection_id: UUID, backup_id: UUID, fmt: st
     return f"backups/{workspace_id}/{connection_id}/{backup_id}{ext}"
 
 
-def avatar_key(user_id: UUID, filename: str) -> str:
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
-    return f"avatars/{user_id}.{ext}"
+def avatar_key(user_id: UUID, mime_type: str) -> str:
+    """
+    Generates storage key for avatars.
+    Exploit Fixed: Never trust client filenames. Derive extension strictly from MIME type.
+    """
+    allowed_types = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp"
+    }
+    if mime_type not in allowed_types:
+        raise ValueError("Invalid image type. Only JPG, PNG, and WebP are allowed.")
+    return f"avatars/{user_id}.{allowed_types[mime_type]}"
