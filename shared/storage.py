@@ -11,8 +11,9 @@ Also contains the pagination helper used across domains.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any
+from typing import Any, AsyncGenerator
 from uuid import UUID
 
 import aiobotocore.session
@@ -48,6 +49,24 @@ def _get_client():
             read_timeout=60,
         ),
     )
+
+@asynccontextmanager
+async def _async_client():
+    """
+    Native async client factory for aiobotocore.
+    Prevents thread exhaustion for heavy I/O operations.
+    """
+    _check_r2_enabled()
+    session = aiobotocore.session.get_session()
+    async with session.create_client(
+        "s3",
+        endpoint_url=settings.R2_ENDPOINT_URL,
+        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=Config(retries={"max_attempts": 3, "mode": "adaptive"}),
+    ) as client:
+        yield client
 
 
 def _check_r2_enabled() -> None:
@@ -110,10 +129,24 @@ class R2MultipartStreamer:
     async def push_chunk(self, chunk: bytes) -> None:
         """Absorb bytes. Block and flush to R2 natively when buffer breaches 5MB."""
         self.buffer.extend(chunk)
-        if len(self.buffer) >= self.chunk_size_limit:
-            await self._flush_part()
+        while len(self.buffer) >= self.chunk_size_limit:
+            payload = bytes(self.buffer[:self.chunk_size_limit])
+            del self.buffer[:self.chunk_size_limit]
+            
+            current_part = self.part_number
+            res = await self.client.upload_part(
+                Bucket=settings.R2_BUCKET_NAME,
+                Key=self.key,
+                PartNumber=current_part,
+                UploadId=self.upload_id,
+                Body=payload
+            )
+            
+            self.parts.append({"PartNumber": current_part, "ETag": res["ETag"]})
+            self.part_number += 1
 
     async def _flush_part(self) -> None:
+        """Flush any remaining bytes as the final part."""
         if not self.buffer:
             return
 
@@ -228,14 +261,12 @@ async def download(key: str) -> bytes:
 
 async def delete(key: str) -> bool:
     """Delete an object from R2. Returns True if deleted, False if not found."""
-    _check_r2_enabled()
-    client = _get_client()
     try:
-        await asyncio.to_thread(
-            client.delete_object,
-            Bucket=settings.R2_BUCKET_NAME,
-            Key=key,
-        )
+        async with _async_client() as client:
+            await client.delete_object(
+                Bucket=settings.R2_BUCKET_NAME,
+                Key=key,
+            )
         return True
     except ClientError as exc:
         logger.warning(f"R2 delete failed for key '{key}': {exc}")
@@ -263,41 +294,32 @@ async def generate_presigned_url(
 
 async def object_exists(key: str) -> bool:
     """Check if an object exists without downloading it."""
-    _check_r2_enabled()
-    client = _get_client()
     try:
-        await asyncio.to_thread(
-            client.head_object,
-            Bucket=settings.R2_BUCKET_NAME,
-            Key=key,
-        )
+        async with _async_client() as client:
+            await client.head_object(
+                Bucket=settings.R2_BUCKET_NAME,
+                Key=key,
+            )
         return True
     except ClientError:
         return False
 
 
-async def list_objects(prefix: str) -> list[dict[str, Any]]:
+async def list_objects(prefix: str) -> AsyncGenerator[dict[str, Any], None]:
     """
     List objects under a key prefix.
     Safely paginates through R2 to prevent silent truncation at 1,000 items.
+    Yields objects iteratively to prevent large memory overheads.
     """
-    _check_r2_enabled()
-    client = _get_client()
-    
-    def _fetch_all_pages() -> list[dict[str, Any]]:
+    async with _async_client() as client:
         paginator = client.get_paginator("list_objects_v2")
-        results = []
-        
-        for page in paginator.paginate(Bucket=settings.R2_BUCKET_NAME, Prefix=prefix):
+        async for page in paginator.paginate(Bucket=settings.R2_BUCKET_NAME, Prefix=prefix):
             for obj in page.get("Contents", []):
-                results.append({
+                yield {
                     "key": obj["Key"],
                     "size": obj["Size"],
                     "last_modified": obj["LastModified"].isoformat(),
-                })
-        return results
-
-    return await asyncio.to_thread(_fetch_all_pages)
+                }
 
 
 # ---------------------------------------------------------------------------
