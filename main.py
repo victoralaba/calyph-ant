@@ -6,17 +6,15 @@ Startup sequence (lifespan):
   1. Init telemetry (logging, Sentry, PostHog)
   2. Init database (pool or NullPool per POOLING_ENABLED)
   3. Init Redis (general + pubsub clients)
-  4. Init R2 Storage (async HTTP connection pool)
-  5. Start Redis pub/sub listener (cross-worker WS broadcast)
-  6. Register middleware
-  7. Register exception handlers
-  8. Mount all domain routers
+  4. Start Redis pub/sub listener (cross-worker WS broadcast)
+  5. Register middleware
+  6. Register exception handlers
+  7. Mount all domain routers
 
 Shutdown sequence:
   1. Cancel pub/sub listener task
-  2. Close R2 Storage connection pool
-  3. Close DB pool / engine
-  4. Close Redis connections
+  2. Close DB pool / engine
+  3. Close Redis connections
 """
 
 from __future__ import annotations
@@ -34,7 +32,6 @@ from core.db import init_db, init_redis, close_db
 from core.exceptions import register_exception_handlers
 from core.middleware import init_sentry, register_middleware
 from shared.telemetry import init_telemetry
-from shared.storage import init_r2_client, close_r2_client
 from domains.query.service import pool_manager
 
 
@@ -50,7 +47,6 @@ async def lifespan(app: FastAPI):
 
     await init_db()
     await init_redis()
-    await init_r2_client()
 
     # Seed the platform extension catalogue (idempotent — skips existing entries)
     try:
@@ -93,7 +89,6 @@ async def lifespan(app: FastAPI):
     await pool_manager.close_all()
     logger.info("All workspace pools successfully closed. Network boundary secured.")
 
-    await close_r2_client()
     await close_db()
     logger.info(f"{settings.APP_NAME} shutdown complete")
 
