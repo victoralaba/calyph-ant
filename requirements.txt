@@ -43,8 +43,7 @@ tenacity
 urllib3<2.3.0
 
 # ── Cloud storage ─────────────────────────────────────────────────────────────
-boto3
-botocore
+aiobotocore
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 slowapi
