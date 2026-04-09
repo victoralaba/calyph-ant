@@ -31,6 +31,7 @@ from typing import Any
 from uuid import UUID
 
 import asyncpg
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +39,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
 from domains.query.service import pool_manager
+from domains.platform.extension_catalogue import increment_install_count
+from worker.celery import celery_app
+
 
 # ---------------------------------------------------------------------------
 # Static Knowledge Base (The "No Part is the Best Part" Engine)
@@ -200,7 +204,8 @@ class DisableRequest(BaseModel):
 async def list_extensions(pool: asyncpg.Pool) -> dict[str, Any]:
     """
     Return all available extensions with installed status.
-    Uses O(1) memory lookup for metadata. No background tasks.
+    Uses O(1) memory lookup for metadata to ensure sub-millisecond API response.
+    Dispatches asynchronous background tasks to enrich unknown extensions.
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -213,6 +218,19 @@ async def list_extensions(pool: asyncpg.Pool) -> dict[str, Any]:
 
     result = [_build_extension_dict(dict(row)) for row in rows]
     installed_count = sum(1 for e in result if e["installed"])
+
+    # --- THE HOOK: SILENT ENRICHMENT ---
+    # Proactively identify installed extensions that are unknown to our static catalogue.
+    # We dispatch a fire-and-forget message to Celery. The user feels zero latency.
+    # UI CONSIDERATION: The UI MUST gracefully handle extensions where category="other" 
+    # and docs_url=null. Do not show loading spinners. Render what you have instantly. 
+    # The background worker will populate the global DB for their next session.
+    for ext in result:
+        if ext["installed"] and not ext["is_curated"]:
+            celery_app.send_task(
+                "platform.catalogue.enrich_extension_async", 
+                args=[ext["name"]]
+            )
 
     return {
         "extensions": result,
@@ -231,7 +249,17 @@ async def get_extension_detail(pool: asyncpg.Pool, name: str) -> dict[str, Any]:
     if not row:
         raise ValueError(f"Extension '{name}' not found on this database server.")
 
-    return _build_extension_dict(dict(row))
+    detail = _build_extension_dict(dict(row))
+
+    # --- THE HOOK: ON-DEMAND ENRICHMENT ---
+    # If a user explicitly clicks into an obscure extension, ensure we learn about it.
+    if not detail.get("is_curated"):
+         celery_app.send_task(
+             "platform.catalogue.enrich_extension_async", 
+             args=[name]
+         )
+
+    return detail
 
 
 async def enable_extension(
@@ -262,6 +290,12 @@ async def enable_extension(
             raise ValueError(
                 f"Extension '{name}' is not available on this PostgreSQL server."
             )
+
+    # --- THE HOOK: INSTALLATION TELEMETRY ---
+    # Fire-and-forget: Tell the Platform DB an installation occurred so UI sorting works.
+    # We use asyncio.create_task because increment_install_count manages its own DB 
+    # session internally and we refuse to block this API return on a central DB write.
+    asyncio.create_task(increment_install_count(name))
 
     return await get_extension_detail(pool, name)
 
