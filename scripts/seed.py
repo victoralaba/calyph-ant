@@ -49,8 +49,8 @@ async def main() -> None:
     # ---------------------------------------------------------------------------
     # Read seed credentials from environment
     # ---------------------------------------------------------------------------
-    admin_email = os.environ.get("SUPER_ADMIN_EMAIL")
-    admin_password = os.environ.get("SUPER_ADMIN_PASSWORD")
+    admin_email = input("Enter super admin email: ").strip() or os.environ.get("SUPER_ADMIN_EMAIL")
+    admin_password = input("Enter super admin password: ") or os.environ.get("SUPER_ADMIN_PASSWORD")
 
     if not admin_email or not admin_password:
         logger.error(
