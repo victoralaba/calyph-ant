@@ -27,7 +27,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import EmailStr, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -160,11 +160,22 @@ class Settings(BaseSettings):
     FLUTTERWAVE_WEBHOOK_SECRET: str = ""
 
     # ------------------------------------------------------------------
-    # Brevo
+    # SendPulse (Transactional Email Service)
     # ------------------------------------------------------------------
-    BREVO_API_KEY: str = ""
-    EMAIL_FROM_ADDRESS: str = "hello@calyphant.com"
-    EMAIL_FROM_NAME: str = "Calyphant"
+    # ── SendPulse (Transactional Email Service) ──────────────────────────────
+    SENDPULSE_CLIENT_ID: str
+    SENDPULSE_CLIENT_SECRET: str
+    
+    # University Workspace address (Activation)
+    SENDPULSE_ADMIN_EMAIL: EmailStr
+    
+    # SendPulse Single Sender
+    SENDPULSE_SENDER_EMAIL: EmailStr
+    SENDPULSE_SENDER_NAME: str = "Victor Pamilerin"
+    
+    # SendPulse System Identity
+    SENDPULSE_SYSTEM_EMAIL: EmailStr
+    SENDPULSE_SYSTEM_NAME: str = "Calyphant Team"
 
     # ------------------------------------------------------------------
     # PostHog
