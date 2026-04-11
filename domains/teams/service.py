@@ -70,10 +70,12 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from core.config import settings
 from core.auth import CurrentUser
 from core.db import get_db, get_db_context
 from shared.types import Base
 from shared.pubsub import SignalEvent, ws_ingress_throttle
+from domains.notifications.service import dispatch_workspace_event, NotificationKind
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +835,7 @@ async def invite_member(
 
     invite = await create_invite(db, workspace_id, user.id, body.email, body.role)
 
-    from domains.notifications.service import send_invite_email
+    from domains.notifications.tasks import send_async_email
 
     inviter_name = user.email
     try:
@@ -843,6 +845,28 @@ async def invite_member(
             inviter_name = inviter_user.full_name
     except Exception:
         pass
+
+    # For external invites, we bypass the DB inbox entirely and hit Celery directly
+    accept_url = f"{settings.APP_BASE_URL}/invites/{invite.token}/accept"
+    email_html = f"""
+    <h2>You've been invited to join {workspace.name} on Calyphant</h2>
+    <p>{inviter_name} has invited you to collaborate on their database workspace.</p>
+    <p>
+      <a href="{accept_url}" style="background:#4F46E5;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;">
+        Accept Invitation
+      </a>
+    </p>
+    """
+    
+    send_async_email.apply_async(
+        kwargs={
+            "to_email": body.email,
+            "to_name": body.email,
+            "subject": f"{inviter_name} invited you to {workspace.name} on Calyphant",
+            "html_content": email_html,
+            "sender_type": "system"
+        }
+    )
 
     asyncio.create_task(
         send_invite_email(
@@ -881,10 +905,10 @@ async def accept_workspace_invite(
         )
     ))
 
-    asyncio.create_task(notify_workspace_members(
+    asyncio.create_task(dispatch_workspace_event(
         db=db,
         workspace_id=member.workspace_id,
-        kind="member_joined",
+        kind=NotificationKind.team_invite_accepted,
         title=f"{user.email} joined the workspace",
         exclude_user_id=user.id,
         meta={"user_id": str(user.id), "role": member.role},

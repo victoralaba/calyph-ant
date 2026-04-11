@@ -1,75 +1,69 @@
 # domains/notifications/service.py
 """
-Notifications domain.
+Notifications Domain (State Manager & Event Dispatcher).
 
-In-app notification storage + fan-out, and Brevo email delivery.
-Both live here — they share the same trigger points and are always
-called together. No value in splitting them.
-
-In-app notifications are stored in Calyphant's DB and served via API.
-Email notifications go through Brevo's API.
-
-Changes from original
----------------------
-FIXED  notify_workspace() now respects per-user notification preferences.
-       The original implementation created an in-app notification for every
-       workspace member unconditionally. Now it checks each member's
-       preferences.notifications.in_app flag before creating a notification.
-       Members with in_app=False are silently skipped. Opt-out model —
-       members who have no preferences set receive the notification.
-
-       Similarly, email fan-out from notify_workspace_with_email() checks
-       the preferences.notifications.email flag before sending.
-
-Router endpoints:
-  GET    /notifications                    — list user's notifications
-  GET    /notifications/unread-count       — count of unread notifications
-  PATCH  /notifications/{id}/read          — mark as read
-  PATCH  /notifications/read-all           — mark all as read
-  DELETE /notifications/{id}              — delete notification
+Re-architected to act as the "Engine of Truth" for the event matrix.
+Evaluates preferences, saves state to Postgres, dispatches to WebSockets (Toasts), 
+and pushes email I/O to Celery.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, cast
 from uuid import UUID, uuid4
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import DateTime, String, Text, Boolean
-from sqlalchemy import select, update
+from sqlalchemy import DateTime, String, Text, Boolean, select, update, and_
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.auth import CurrentUser
-from core.config import settings
 from core.db import get_db
 from shared.types import Base
 
+# ---------------------------------------------------------------------------
+# The Event Matrix Dictionary
+# ---------------------------------------------------------------------------
+# Defines the physical behavior of every system event.
 
-# ---------------------------------------------------------------------------
-# Notification types
-# ---------------------------------------------------------------------------
+EVENT_MATRIX = {
+    "user_signup":              {"in_app": False, "email": True,  "toast": False, "sender": "ceo", "priority": "High"},
+    "password_reset":           {"in_app": False, "email": True,  "toast": False, "sender": "system", "priority": "High"},
+    "security_new_login":       {"in_app": True,  "email": True,  "toast": False, "sender": "system", "priority": "High"},
+    "team_invite_received":     {"in_app": True,  "email": True,  "toast": False, "sender": "system", "priority": "High"},
+    "team_invite_accepted":     {"in_app": True,  "email": False, "toast": False, "sender": "system", "priority": "Medium"},
+    "team_role_changed":        {"in_app": True,  "email": False, "toast": False, "sender": "system", "priority": "Medium"},
+    "db_connection_success":    {"in_app": False, "email": False, "toast": True,  "sender": "system", "priority": "Low"},
+    "db_connection_failed":     {"in_app": True,  "email": False, "toast": True,  "sender": "system", "priority": "High"},
+    "schema_migration_success": {"in_app": True,  "email": False, "toast": False, "sender": "system", "priority": "Medium"},
+    "schema_migration_failed":  {"in_app": True,  "email": True,  "toast": False, "sender": "system", "priority": "High"},
+    "backup_completed":         {"in_app": True,  "email": False, "toast": False, "sender": "system", "priority": "Low"},
+    "backup_failed":            {"in_app": True,  "email": True,  "toast": False, "sender": "system", "priority": "High"},
+    "billing_plan_upgraded":    {"in_app": False, "email": True,  "toast": False, "sender": "ceo", "priority": "High"},
+    "platform_update":          {"in_app": True,  "email": True,  "toast": False, "sender": "ceo", "priority": "Low"},
+}
+
 
 class NotificationKind(str, Enum):
-    migration_applied    = "migration_applied"
-    migration_failed     = "migration_failed"
-    backup_completed     = "backup_completed"
-    backup_failed        = "backup_failed"
-    member_joined        = "member_joined"
-    member_left          = "member_left"
-    invite_received      = "invite_received"
-    connection_down      = "connection_down"
-    connection_restored  = "connection_restored"
-    billing_upgraded     = "billing_upgraded"
-    billing_cancelled    = "billing_cancelled"
-    storage_warning      = "storage_warning"
+    # Dynamically built from the matrix keys to maintain strict typing
+    user_signup = "user_signup"
+    password_reset = "password_reset"
+    security_new_login = "security_new_login"
+    team_invite_received = "team_invite_received"
+    team_invite_accepted = "team_invite_accepted"
+    team_role_changed = "team_role_changed"
+    db_connection_success = "db_connection_success"
+    db_connection_failed = "db_connection_failed"
+    schema_migration_success = "schema_migration_success"
+    schema_migration_failed = "schema_migration_failed"
+    backup_completed = "backup_completed"
+    backup_failed = "backup_failed"
+    billing_plan_upgraded = "billing_plan_upgraded"
+    platform_update = "platform_update"
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +83,8 @@ class Notification(Base):
     action_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    
     meta: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -96,13 +92,15 @@ class Notification(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+    # Allows soft-delete, archiving, and restoring.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # ---------------------------------------------------------------------------
-# In-app notification service
+# The Grand Dispatcher
 # ---------------------------------------------------------------------------
 
-async def create_notification(
+async def dispatch_event(
     db: AsyncSession,
     user_id: UUID,
     kind: NotificationKind,
@@ -111,212 +109,152 @@ async def create_notification(
     action_url: str | None = None,
     workspace_id: UUID | None = None,
     meta: dict | None = None,
-) -> Notification:
-    notif = Notification(
-        user_id=user_id,
-        workspace_id=workspace_id,
-        kind=kind,
-        title=title,
-        body=body,
-        action_url=action_url,
-        meta=meta or {},
-    )
-    db.add(notif)
-    await db.commit()
-    await db.refresh(notif)
-    return notif
-
-
-async def notify_workspace(
-    db: AsyncSession,
-    workspace_id: UUID,
-    kind: NotificationKind,
-    title: str,
-    body: str | None = None,
-    action_url: str | None = None,
-    exclude_user_id: UUID | None = None,
-    meta: dict | None = None,
-) -> int:
+    email_subject: str | None = None,
+    email_html: str | None = None,
+):
     """
-    Fan-out an in-app notification to all members of a workspace.
-
-    Respects per-user notification preferences — members who have set
-    preferences.notifications.in_app = False are silently skipped.
-    Members with no preferences configured receive the notification
-    (opt-out model, default = receive).
-
-    Returns count of notifications actually created.
+    The Single Source of Truth for system messaging.
+    Evaluates the matrix, checks user preferences, and pushes out events.
     """
-    from domains.teams.service import WorkspaceMember
-    from domains.users.service import get_preferences
+    from domains.users.service import get_preferences, get_user
+    from domains.teams.service import ws_manager
+    from shared.pubsub import SignalEvent
+    from domains.notifications.tasks import send_async_email
 
-    result = await db.execute(
-        select(WorkspaceMember.user_id).where(
-            WorkspaceMember.workspace_id == workspace_id
-        )
-    )
-    member_ids = [row[0] for row in result.all()]
-    if exclude_user_id:
-        member_ids = [uid for uid in member_ids if uid != exclude_user_id]
+    rules = EVENT_MATRIX.get(kind.value, {})
+    if not rules:
+        logger.warning(f"Unmapped event kind dispatched: {kind.value}")
+        return
 
-    created = 0
-    for user_id in member_ids:
-        # Check the user's notification preferences
-        prefs = await get_preferences(db, user_id)
-        notif_prefs = prefs.get("notifications", {})
+    # 1. Fetch Preferences & User Data
+    prefs = await get_preferences(db, user_id)
+    notif_prefs = prefs.get("notifications", {})
+    user = await get_user(db, user_id)
+    
+    if not user:
+        return
 
-        # Global in-app toggle — defaults to True (opt-out model)
-        if not notif_prefs.get("in_app", True):
-            continue
-
-        # Per-event-kind toggle if present (e.g. "migration_applied": True)
-        if kind.value in notif_prefs and not notif_prefs[kind.value]:
-            continue
-
-        db.add(Notification(
-            user_id=user_id,
-            workspace_id=workspace_id,
-            kind=kind,
-            title=title,
-            body=body,
-            action_url=action_url,
-            meta=meta or {},
-        ))
-        created += 1
-
-    if created:
-        await db.commit()
-
-    return created
-
-
-async def notify_workspace_with_email(
-    db: AsyncSession,
-    workspace_id: UUID,
-    kind: NotificationKind,
-    title: str,
-    email_subject: str,
-    email_html: str,
-    body: str | None = None,
-    action_url: str | None = None,
-    exclude_user_id: UUID | None = None,
-    meta: dict | None = None,
-) -> dict[str, int]:
-    """
-    Fan-out both in-app notification AND email to all workspace members,
-    each gated by the respective preference flag.
-
-    Returns {"in_app": N, "emails": M} for observability.
-    """
-    from domains.teams.service import WorkspaceMember
-    from domains.users.service import User, get_preferences
-
-    result = await db.execute(
-        select(WorkspaceMember.user_id).where(
-            WorkspaceMember.workspace_id == workspace_id
-        )
-    )
-    member_ids = [row[0] for row in result.all()]
-    if exclude_user_id:
-        member_ids = [uid for uid in member_ids if uid != exclude_user_id]
-
-    in_app_count = 0
-    email_count = 0
-
-    for user_id in member_ids:
-        prefs = await get_preferences(db, user_id)
-        notif_prefs = prefs.get("notifications", {})
-
-        # --- In-app ---
-        send_in_app = notif_prefs.get("in_app", True)
-        if kind.value in notif_prefs:
-            send_in_app = send_in_app and notif_prefs[kind.value]
-
-        if send_in_app:
-            db.add(Notification(
+    # 2. Database (In-App Inbox)
+    if rules.get("in_app"):
+        if notif_prefs.get("in_app", True):
+            notif = Notification(
                 user_id=user_id,
                 workspace_id=workspace_id,
-                kind=kind,
+                kind=kind.value,
                 title=title,
                 body=body,
                 action_url=action_url,
                 meta=meta or {},
-            ))
-            in_app_count += 1
-
-        # --- Email ---
-        send_email_pref = notif_prefs.get("email", True)
-        if kind.value in notif_prefs:
-            send_email_pref = send_email_pref and notif_prefs[kind.value]
-
-        if send_email_pref:
-            # Fetch email from users table
-            user_result = await db.execute(
-                select(User).where(User.id == user_id, User.is_active == True)  # noqa
             )
-            user = user_result.scalar_one_or_none()
-            if user:
-                import asyncio
-                asyncio.create_task(send_email(
-                    to_email=user.email,
-                    to_name=user.full_name or user.email,
-                    subject=email_subject,
-                    html_content=email_html,
-                ))
-                email_count += 1
+            db.add(notif)
+            # We don't commit immediately; caller can wrap in a transaction if needed, 
+            # or we commit at the end. We'll commit here for safety if called standalone.
+            await db.commit()
 
-    if in_app_count:
-        await db.commit()
+    # 3. WebSockets (Live Toasts)
+    if rules.get("toast") and workspace_id:
+        # Pushes directly to the UI layer as a transient toast
+        event_payload = SignalEvent(
+            event="ui_toast",
+            workspace_id=workspace_id,
+            entity_id=str(user_id),
+            meta={"title": title, "body": body, "kind": kind.value, "priority": rules.get("priority")}
+        )
+        import asyncio
+        asyncio.create_task(ws_manager.broadcast(workspace_id, event_payload))
 
-    return {"in_app": in_app_count, "emails": email_count}
+    # 4. Celery (Email Fan-out)
+    if rules.get("email") and email_subject and email_html:
+        if notif_prefs.get("email", True):
+            # Fire and forget to Celery
+            send_async_email.apply_async(
+                kwargs={
+                    "to_email": user.email,
+                    "to_name": user.full_name or user.email,
+                    "subject": email_subject,
+                    "html_content": email_html,
+                    "sender_type": rules.get("sender", "system")
+                }
+            )
 
+
+async def dispatch_workspace_event(
+    db: AsyncSession,
+    workspace_id: UUID,
+    kind: NotificationKind,
+    title: str,
+    body: str | None = None,
+    action_url: str | None = None,
+    exclude_user_id: UUID | None = None,
+    meta: dict | None = None,
+    email_subject_template: str | None = None, # e.g. "{user} joined the workspace"
+    email_html_template: str | None = None,
+):
+    """
+    Fans out a matrix event to all active members of a workspace.
+    """
+    from domains.teams.service import WorkspaceMember
+    
+    # Get all workspace members
+    result = await db.execute(
+        select(WorkspaceMember.user_id).where(
+            WorkspaceMember.workspace_id == workspace_id
+        )
+    )
+    member_ids = [row[0] for row in result.all()]
+    
+    if exclude_user_id:
+        member_ids = [uid for uid in member_ids if uid != exclude_user_id]
+
+    import asyncio
+    
+    # Dispatch individual events concurrently
+    tasks = []
+    for uid in member_ids:
+        tasks.append(
+            dispatch_event(
+                db=db,
+                user_id=uid,
+                kind=kind,
+                title=title,
+                body=body,
+                action_url=action_url,
+                workspace_id=workspace_id,
+                meta=meta,
+                email_subject=email_subject_template,
+                email_html=email_html_template
+            )
+        )
+    
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+# ---------------------------------------------------------------------------
+# Inbox Operations (CRUD)
+# ---------------------------------------------------------------------------
 
 async def list_notifications(
     db: AsyncSession,
     user_id: UUID,
     unread_only: bool = False,
+    include_deleted: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> list[Notification]:
     q = select(Notification).where(Notification.user_id == user_id)
+    
+    if not include_deleted:
+        q = q.where(Notification.deleted_at.is_(None))
+        
     if unread_only:
-        q = q.where(Notification.read == False)  # noqa
-    q = q.order_by(Notification.created_at.desc()).offset(offset).limit(limit)
+        q = q.where(Notification.read == False)
+        
+    # Pinned items always float to the top, then sort by date
+    q = q.order_by(Notification.is_pinned.desc(), Notification.created_at.desc()).offset(offset).limit(limit)
+    
     result = await db.execute(q)
     return list(result.scalars().all())
-
-
-async def mark_read(db: AsyncSession, notification_id: UUID, user_id: UUID) -> bool:
-    result = await db.execute(
-        update(Notification)
-        .where(Notification.id == notification_id, Notification.user_id == user_id)
-        .values(read=True)
-    )
-    await db.commit()
-    # Tell Pylance this is a CursorResult
-    cursor_result = cast(CursorResult, result)
-    return cursor_result.rowcount > 0
-
-
-async def mark_all_read(db: AsyncSession, user_id: UUID) -> int:
-    result = await db.execute(
-        update(Notification)
-        .where(Notification.user_id == user_id, Notification.read == False)  # noqa
-        .values(read=True)
-    )
-    await db.commit()
-    # Tell Pylance this is a CursorResult
-    cursor_result = cast(CursorResult, result)
-    return cursor_result.rowcount
-
-
-async def delete_notification(db: AsyncSession, notification_id: UUID, user_id: UUID) -> bool:
-    notif = await db.get(Notification, notification_id)
-    if not notif or notif.user_id != user_id:
-        return False
-    await db.delete(notif)
-    await db.commit()
-    return True
 
 
 async def unread_count(db: AsyncSession, user_id: UUID) -> int:
@@ -324,156 +262,11 @@ async def unread_count(db: AsyncSession, user_id: UUID) -> int:
     result = await db.execute(
         select(func.count()).where(
             Notification.user_id == user_id,
-            Notification.read == False,  # noqa
+            Notification.read == False,
+            Notification.deleted_at.is_(None)
         )
     )
     return result.scalar() or 0
-
-
-# ---------------------------------------------------------------------------
-# Brevo email service
-# ---------------------------------------------------------------------------
-
-BREVO_API = "https://api.brevo.com/v3"
-
-
-async def send_email(
-    to_email: str,
-    to_name: str,
-    subject: str,
-    html_content: str,
-    template_id: int | None = None,
-    template_params: dict | None = None,
-) -> bool:
-    """
-    Send a transactional email via Brevo.
-    Returns True on success, False on failure (never raises).
-    """
-    if not settings.BREVO_API_KEY:
-        logger.warning("BREVO_API_KEY not set — email not sent.")
-        return False
-
-    payload: dict[str, Any] = {
-        "to": [{"email": to_email, "name": to_name}],
-        "sender": {
-            "email": settings.EMAIL_FROM_ADDRESS,
-            "name": settings.EMAIL_FROM_NAME,
-        },
-    }
-
-    if template_id:
-        payload["templateId"] = template_id
-        payload["params"] = template_params or {}
-    else:
-        payload["subject"] = subject
-        payload["htmlContent"] = html_content
-
-    try:
-        async with httpx.AsyncClient(
-            base_url=BREVO_API,
-            headers={
-                "api-key": settings.BREVO_API_KEY,
-                "Content-Type": "application/json",
-            },
-            timeout=15.0,
-        ) as client:
-            response = await client.post("/smtp/email", json=payload)
-            response.raise_for_status()
-            return True
-    except Exception as exc:
-        logger.error(f"Brevo email failed to {to_email}: {exc}")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Email templates (inline HTML — replace with Brevo template IDs in production)
-# ---------------------------------------------------------------------------
-
-async def send_invite_email(
-    to_email: str,
-    inviter_name: str,
-    workspace_name: str,
-    invite_token: str,
-) -> bool:
-    accept_url = f"{settings.APP_BASE_URL}/invites/{invite_token}/accept"
-    html = f"""
-    <h2>You've been invited to join {workspace_name} on Calyphant</h2>
-    <p>{inviter_name} has invited you to collaborate on their database workspace.</p>
-    <p>
-      <a href="{accept_url}"
-         style="background:#4F46E5;color:white;padding:12px 24px;
-                border-radius:6px;text-decoration:none;">
-        Accept Invitation
-      </a>
-    </p>
-    <p>This invite expires in 7 days.</p>
-    <p style="color:#6b7280;font-size:12px;">
-      If you weren't expecting this invitation, you can safely ignore this email.
-    </p>
-    """
-    return await send_email(
-        to_email=to_email,
-        to_name=to_email,
-        subject=f"{inviter_name} invited you to {workspace_name} on Calyphant",
-        html_content=html,
-    )
-
-
-async def send_backup_complete_email(
-    to_email: str,
-    to_name: str,
-    database_name: str,
-    backup_size: str,
-) -> bool:
-    html = f"""
-    <h2>Backup completed</h2>
-    <p>Your backup of <strong>{database_name}</strong> completed successfully.</p>
-    <p>Size: {backup_size}</p>
-    <p><a href="{settings.APP_BASE_URL}/backups">View backups →</a></p>
-    """
-    return await send_email(
-        to_email=to_email,
-        to_name=to_name,
-        subject=f"Backup complete — {database_name}",
-        html_content=html,
-    )
-
-
-async def send_welcome_email(to_email: str, to_name: str) -> bool:
-    html = f"""
-    <h2>Welcome to Calyphant, {to_name or 'there'}!</h2>
-    <p>Your PostgreSQL workspace is ready. Connect your first database to get started.</p>
-    <p>
-      <a href="{settings.APP_BASE_URL}/connections/new">Connect a database →</a>
-    </p>
-    """
-    return await send_email(
-        to_email=to_email,
-        to_name=to_name or "there",
-        subject="Welcome to Calyphant",
-        html_content=html,
-    )
-
-
-async def send_password_reset_email(to_email: str, reset_token: str) -> bool:
-    reset_url = f"{settings.APP_BASE_URL}/auth/reset-password?token={reset_token}"
-    html = f"""
-    <h2>Reset your password</h2>
-    <p>
-      Click the link below to reset your Calyphant password.
-      This link expires in 1 hour.
-    </p>
-    <p><a href="{reset_url}">Reset password →</a></p>
-    <p style="color:#6b7280;font-size:12px;">
-      If you didn't request this, ignore this email — your password won't change.
-    </p>
-    """
-    return await send_email(
-        to_email=to_email,
-        to_name=to_email,
-        subject="Reset your Calyphant password",
-        html_content=html,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +275,6 @@ async def send_password_reset_email(to_email: str, reset_token: str) -> bool:
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
-
 class NotificationResponse(BaseModel):
     id: UUID
     kind: str
@@ -490,7 +282,9 @@ class NotificationResponse(BaseModel):
     body: str | None
     action_url: str | None
     read: bool
+    is_pinned: bool
     created_at: str
+    deleted_at: str | None
 
 
 @router.get("", response_model=list[NotificationResponse])
@@ -498,11 +292,18 @@ async def list_user_notifications(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     unread_only: bool = False,
+    include_deleted: bool = False, # Used to fetch the Archive view
     limit: int = 50,
     offset: int = 0,
 ):
+    """
+    [UI CONSIDERATION] 
+    By default this returns active notifications. 
+    Pass include_deleted=true to render the "Archive/Trash" view in Svelte.
+    Pinned items are automatically sorted to the top.
+    """
     notifications = await list_notifications(
-        db, user.id, unread_only=unread_only, limit=limit, offset=offset
+        db, user.id, unread_only=unread_only, include_deleted=include_deleted, limit=limit, offset=offset
     )
     return [
         NotificationResponse(
@@ -512,7 +313,9 @@ async def list_user_notifications(
             body=n.body,
             action_url=n.action_url,
             read=n.read,
+            is_pinned=n.is_pinned,
             created_at=n.created_at.isoformat(),
+            deleted_at=n.deleted_at.isoformat() if n.deleted_at else None
         )
         for n in notifications
     ]
@@ -530,27 +333,86 @@ async def mark_notification_read(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    updated = await mark_read(db, notification_id, user.id)
-    if not updated:
+    result = await db.execute(
+        update(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == user.id)
+        .values(read=True)
+    )
+    await db.commit()
+    if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Notification not found.")
     return {"read": True}
 
 
-@router.patch("/read-all")
-async def mark_all_notifications_read(
+@router.patch("/{notification_id}/pin")
+async def toggle_notification_pin(
+    notification_id: UUID,
+    pin_state: bool, # Send true to pin, false to unpin
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    count = await mark_all_read(db, user.id)
-    return {"marked_read": count}
+    result = await db.execute(
+        update(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == user.id)
+        .values(is_pinned=pin_state)
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"is_pinned": pin_state}
 
 
-@router.delete("/{notification_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user_notification(
+@router.delete("/{notification_id}")
+async def soft_delete_user_notification(
     notification_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    deleted = await delete_notification(db, notification_id, user.id)
-    if not deleted:
+    """
+    [UI CONSIDERATION] 
+    This moves the item to the Archive. Provide a UI toast offering an "Undo" button 
+    that calls the /restore endpoint.
+    """
+    result = await db.execute(
+        update(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == user.id)
+        .values(deleted_at=datetime.now(timezone.utc))
+    )
+    await db.commit()
+    if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"archived": True}
+
+
+@router.patch("/{notification_id}/restore")
+async def restore_user_notification(
+    notification_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        update(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == user.id)
+        .values(deleted_at=None)
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"restored": True}
+
+
+@router.delete("/{notification_id}/hard", status_code=status.HTTP_204_NO_CONTENT)
+async def hard_delete_user_notification(
+    notification_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    [UI CONSIDERATION]
+    Use this only when emptying the trash/archive. Permanent, non-recoverable deletion.
+    """
+    notif = await db.get(Notification, notification_id)
+    if not notif or notif.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    await db.delete(notif)
+    await db.commit()

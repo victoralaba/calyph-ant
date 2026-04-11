@@ -90,12 +90,14 @@ celery_app.conf.update(
         
         "platform.catalogue.enrich_extension_async": {"queue": "maintenance"},
         "platform.catalogue.refresh_stale_entries": {"queue": "maintenance"},
+        "notifications.send_async_email": {"queue": "notifications"},
     },
     task_queues=(
         Queue("keep_alive"),
         Queue("backups"),
         Queue("maintenance"),
         Queue("ephemeral_compute"),
+        Queue("notifications"),
         Queue("default"),
     ),
     task_default_queue="default",

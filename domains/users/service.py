@@ -113,14 +113,18 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     "auto_save_queries": True,
     "show_row_counts": True,
     "notifications": {
+        # Global toggles
         "email": True,
         "in_app": True,
-        "migration_applied": True,
-        "backup_completed": True,
-        "member_joined": True,
+        # Matrix granular toggles (Opt-out model)
+        "security_alerts": True,       # High priority, usually forced anyway
+        "team_activity": True,         # Invites, role changes
+        "schema_migrations": True,
+        "backup_alerts": True,
+        "billing_alerts": True,
+        "platform_updates": True,
     },
 }
-
 
 # ---------------------------------------------------------------------------
 # Service functions
