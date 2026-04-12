@@ -28,9 +28,10 @@ Key architectural decisions
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -42,7 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.auth import CurrentUser
-from core.db import get_db
+from core.config import settings
+from core.db import get_db, get_redis
 from shared.types import Base
 
 
@@ -75,6 +77,95 @@ EVENT_MATRIX: dict[str, dict[str, Any]] = {
     "billing_plan_upgraded":    {"in_app": False, "email": True,  "toast": False, "sender": "ceo",    "priority": "High"},
     "platform_update":          {"in_app": True,  "email": True,  "toast": False, "sender": "ceo",    "priority": "Low"},
 }
+
+NotificationSender = Literal["system", "ceo"]
+
+
+def _normalize_sender(sender: str | None) -> NotificationSender:
+    """
+    Normalize sender identities to a safe, known set.
+
+    We intentionally default unknown values to "system" so event dispatch
+    remains resilient even when a caller passes malformed metadata.
+    """
+    if sender == "ceo":
+        return "ceo"
+    return "system"
+
+
+async def enqueue_email_notification(
+    *,
+    to_email: str,
+    to_name: str,
+    subject: str,
+    html_content: str,
+    sender_type: str = "system",
+    notification_kind: str | None = None,
+    correlation_id: str | None = None,
+    idempotency_key: str | None = None,
+    bypass_rate_limit: bool = False,
+) -> bool:
+    """
+    Single queueing boundary for outbound email jobs.
+
+    Architectural intent:
+      - Keep producer call-sites thin and consistent.
+      - Guarantee all outbound emails go through the same Celery route.
+      - Centralize sender normalization ("system" | "ceo").
+
+    Returns:
+      True if the task was enqueued, False if skipped by idempotency guard.
+    """
+    from domains.notifications.tasks import send_async_email
+
+    # Per-recipient hourly cap to reduce blast radius from abuse loops.
+    if not bypass_rate_limit:
+        try:
+            redis = await get_redis()
+            recipient_key = f"notifications:email:hour:{to_email.lower()}"
+            current = await redis.incr(recipient_key)
+            if current == 1:
+                await redis.expire(recipient_key, 3600)
+            if current > settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR:
+                await redis.incr(f"notifications:throttle:email:recipient:{to_email.lower()}")
+                logger.warning(
+                    "Email enqueue throttled "
+                    f"recipient={to_email} limit={settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR}/hour"
+                )
+                return False
+        except Exception as exc:
+            logger.warning(f"Email rate-limit store unavailable; proceeding with enqueue: {exc}")
+
+    if idempotency_key:
+        try:
+            redis = await get_redis()
+            claimed = await redis.set(
+                f"notifications:idempotency:{idempotency_key}",
+                "1",
+                ex=3600,
+                nx=True,
+            )
+            if not claimed:
+                logger.info(f"Notification email deduplicated for key={idempotency_key}")
+                return False
+        except Exception as exc:
+            # Never block dispatch if Redis idempotency tracking is unavailable.
+            logger.warning(f"Idempotency store unavailable; proceeding with enqueue: {exc}")
+
+    send_async_email.apply_async(  # type: ignore[attr-defined]
+        kwargs={
+            "to_email": to_email,
+            "to_name": to_name or to_email,
+            "subject": subject,
+            "html_content": html_content,
+            "sender_type": _normalize_sender(sender_type),
+            "notification_kind": notification_kind,
+            "correlation_id": correlation_id,
+            "idempotency_key": idempotency_key,
+        },
+        queue="notifications",
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -135,19 +226,16 @@ async def send_welcome_email(email: str, name: str) -> None:
     UI NOTE: The welcome email is sent immediately after account creation.
     If SendPulse is temporarily down, Celery will retry up to 3 times.
     """
-    from domains.notifications.tasks import send_async_email
     from domains.notifications.templates import build_welcome_email
 
     subject, html = build_welcome_email(name)
-    send_async_email.apply_async(  # type: ignore[attr-defined]
-        kwargs={
-            "to_email": email,
-            "to_name": name or email,
-            "subject": subject,
-            "html_content": html,
-            "sender_type": "ceo",
-        },
-        queue="notifications",
+    await enqueue_email_notification(
+        to_email=email,
+        to_name=name or email,
+        subject=subject,
+        html_content=html,
+        sender_type="ceo",
+        notification_kind="user_signup",
     )
 
 
@@ -159,19 +247,17 @@ async def send_password_reset_email(email: str, token: str) -> None:
     UI NOTE: The reset link expires in 1 hour. The email template states this.
     If the user doesn't receive it, they must request a new one.
     """
-    from domains.notifications.tasks import send_async_email
     from domains.notifications.templates import build_password_reset_email
 
     subject, html = build_password_reset_email(token)
-    send_async_email.apply_async(  # type: ignore[attr-defined]
-        kwargs={
-            "to_email": email,
-            "to_name": email,
-            "subject": subject,
-            "html_content": html,
-            "sender_type": "system",
-        },
-        queue="notifications",
+    await enqueue_email_notification(
+        to_email=email,
+        to_name=email,
+        subject=subject,
+        html_content=html,
+        sender_type="system",
+        notification_kind="password_reset",
+        idempotency_key=f"password_reset:{email}:{token}",
     )
 
 
@@ -195,6 +281,8 @@ async def dispatch_event(
     _user_email: str | None = None,
     _user_name: str | None = None,
     _notif_prefs: dict | None = None,
+    _autocommit: bool = True,
+    event_id: str | None = None,
 ) -> None:
     """
     The Single Source of Truth for system messaging.
@@ -210,7 +298,6 @@ async def dispatch_event(
     """
     from domains.teams.service import ws_manager
     from shared.pubsub import SignalEvent
-    from domains.notifications.tasks import send_async_email
 
     # Normalise kind to its string value
     kind_str: str = kind.value if hasattr(kind, "value") else str(kind)
@@ -219,6 +306,27 @@ async def dispatch_event(
     if not rules:
         logger.warning(f"Unmapped event kind dispatched: {kind_str}")
         return
+
+    # Suppress repeated non-critical notifications with same fingerprint.
+    # High-priority security/billing style alerts are never suppressed.
+    if rules.get("priority") != "High":
+        try:
+            redis = await get_redis()
+            raw = f"{user_id}|{workspace_id}|{kind_str}|{title}|{body or ''}|{event_id or ''}"
+            fp = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            dedupe_key = f"notifications:repeat:{fp}"
+            accepted = await redis.set(
+                dedupe_key,
+                "1",
+                ex=settings.NOTIFICATIONS_REPEAT_SUPPRESS_SECONDS,
+                nx=True,
+            )
+            if not accepted:
+                await redis.incr(f"notifications:throttle:repeat:{kind_str}")
+                logger.info(f"Notification repeat-suppressed kind={kind_str} user_id={user_id}")
+                return
+        except Exception as exc:
+            logger.warning(f"Repeat suppression store unavailable; continuing: {exc}")
 
     # Fetch preferences & user data only if not pre-supplied (avoids N+1)
     notif_prefs: dict = _notif_prefs or {}
@@ -237,6 +345,23 @@ async def dispatch_event(
 
     # 1. Database (In-App Inbox)
     if rules.get("in_app") and notif_prefs.get("in_app", True):
+        if rules.get("priority") != "High":
+            try:
+                redis = await get_redis()
+                in_app_key = f"notifications:in_app:hour:{user_id}"
+                in_app_count = await redis.incr(in_app_key)
+                if in_app_count == 1:
+                    await redis.expire(in_app_key, 3600)
+                if in_app_count > settings.NOTIFICATIONS_USER_IN_APP_LIMIT_PER_HOUR:
+                    await redis.incr(f"notifications:throttle:in_app:user:{user_id}")
+                    logger.warning(
+                        "In-app notification throttled "
+                        f"user_id={user_id} limit={settings.NOTIFICATIONS_USER_IN_APP_LIMIT_PER_HOUR}/hour"
+                    )
+                    return
+            except Exception as exc:
+                logger.warning(f"In-app rate-limit store unavailable; proceeding with write: {exc}")
+
         notif = Notification(
             user_id=user_id,
             workspace_id=workspace_id,
@@ -247,7 +372,8 @@ async def dispatch_event(
             meta=meta or {},
         )
         db.add(notif)
-        await db.commit()
+        if _autocommit:
+            await db.commit()
 
     # 2. WebSocket Toast
     if rules.get("toast") and workspace_id:
@@ -268,15 +394,18 @@ async def dispatch_event(
     # 3. Celery Email Fan-out
     if rules.get("email") and email_subject and email_html:
         if notif_prefs.get("email", True):
-            send_async_email.apply_async(  # type: ignore[attr-defined]
-                kwargs={
-                    "to_email": user_email,
-                    "to_name": user_name,
-                    "subject": email_subject,
-                    "html_content": email_html,
-                    "sender_type": rules.get("sender", "system"),
-                },
-                queue="notifications",
+            await enqueue_email_notification(
+                to_email=user_email,
+                to_name=user_name,
+                subject=email_subject,
+                html_content=email_html,
+                sender_type=rules.get("sender", "system"),
+                notification_kind=kind_str,
+                idempotency_key=(
+                    event_id
+                    or f"dispatch_event:{kind_str}:{user_id}:{workspace_id}:{email_subject}"
+                ),
+                bypass_rate_limit=(rules.get("priority") == "High"),
             )
 
 
@@ -291,6 +420,7 @@ async def dispatch_workspace_event(
     meta: dict | None = None,
     email_subject: str | None = None,
     email_html: str | None = None,
+    event_id: str | None = None,
 ) -> None:
     """
     Fan out an event to all active members of a workspace.
@@ -316,6 +446,23 @@ async def dispatch_workspace_event(
     if not member_ids:
         return
 
+    # Workspace-wide fan-out throttle (per minute) to contain abuse blasts.
+    try:
+        redis = await get_redis()
+        ws_key = f"notifications:workspace:minute:{workspace_id}:{str(kind)}"
+        ws_count = await redis.incr(ws_key)
+        if ws_count == 1:
+            await redis.expire(ws_key, 60)
+        if ws_count > settings.NOTIFICATIONS_WORKSPACE_EVENT_LIMIT_PER_MINUTE:
+            logger.warning(
+                "Workspace notification throttled "
+                f"workspace_id={workspace_id} kind={kind} "
+                f"limit={settings.NOTIFICATIONS_WORKSPACE_EVENT_LIMIT_PER_MINUTE}/minute"
+            )
+            return
+    except Exception as exc:
+        logger.warning(f"Workspace rate-limit store unavailable; proceeding with fan-out: {exc}")
+
     # 2. Bulk-fetch all user records in a single query (email, name, preferences)
     users_result = await db.execute(
         select(User.id, User.email, User.full_name, User.preferences).where(
@@ -332,34 +479,32 @@ async def dispatch_workspace_event(
         notif_prefs = merged_prefs.get("notifications", {})
         user_data[row.id] = (row.email, row.full_name or row.email, notif_prefs)
 
-    # 3. Fan out — no additional DB queries in this loop
-    import asyncio
-    tasks = []
+    # 3. Fan out — sequential dispatch avoids unsafe concurrent access
+    # to a shared AsyncSession and allows one commit at the end.
     for uid in member_ids:
         if uid not in user_data:
             continue
         u_email, u_name, n_prefs = user_data[uid]
-        tasks.append(
-            dispatch_event(
-                db=db,
-                user_id=uid,
-                kind=kind,
-                title=title,
-                body=body,
-                action_url=action_url,
-                workspace_id=workspace_id,
-                meta=meta,
-                email_subject=email_subject,
-                email_html=email_html,
-                # Pass pre-fetched data to skip redundant queries
-                _user_email=u_email,
-                _user_name=u_name,
-                _notif_prefs=n_prefs,
-            )
+        await dispatch_event(
+            db=db,
+            user_id=uid,
+            kind=kind,
+            title=title,
+            body=body,
+            action_url=action_url,
+            workspace_id=workspace_id,
+            meta=meta,
+            email_subject=email_subject,
+            email_html=email_html,
+            # Pass pre-fetched data to skip redundant queries
+            _user_email=u_email,
+            _user_name=u_name,
+            _notif_prefs=n_prefs,
+            _autocommit=False,
+            event_id=event_id,
         )
 
-    if tasks:
-        await asyncio.gather(*tasks)
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------

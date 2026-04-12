@@ -856,6 +856,9 @@ async def invite_member(
         role=body.role.value,
     )
 
+    # Approved exception to centralized dispatch_event flow:
+    # invite targets can be non-users (no user_id/preferences row yet), so this
+    # path remains direct email dispatch by design.
     # Single Celery dispatch — fire-and-forget with automatic retry on failure.
     # UI NOTE: If this endpoint returns 201 but the invitee never receives an email,
     # it is a Celery/SendPulse delivery issue, not an invite creation failure.

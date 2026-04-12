@@ -442,11 +442,10 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
             f"{format_price(amount_minor, currency)}"
         )
 
-        # Dispatch billing upgrade notification via Celery
-        # We do NOT use dispatch_event here because we need the email
-        # immediately and we already have all the data — no extra DB query needed.
+        # Dispatch through the notifications engine so policy + preferences
+        # stay centralized across domains.
         try:
-            from domains.notifications.tasks import send_async_email
+            from domains.notifications.service import dispatch_event
             from domains.notifications.templates import build_billing_upgraded_email
 
             # Retrieve user name for the email (already fetched above as `user`)
@@ -462,16 +461,22 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
                 amount_display=format_price(amount_minor, currency),
                 currency=currency,
             )
-            send_async_email.apply_async(  # type: ignore[attr-defined]
-                kwargs={
-                    "to_email": user.email if user else "",
-                    "to_name": display_name,
-                    "subject": email_subject,
-                    "html_content": email_html,
-                    "sender_type": "ceo",
-                },
-                queue="notifications",
-            )
+            if user:
+                await dispatch_event(
+                    db=db,
+                    user_id=user.id,
+                    kind="billing_plan_upgraded",
+                    title=f"Your plan is now {tier.title()}",
+                    body=(
+                        f"Payment confirmed: {format_price(amount_minor, currency)}. "
+                        "Your new plan is active."
+                    ),
+                    meta={"tier": tier, "currency": currency, "amount_minor": amount_minor},
+                    email_subject=email_subject,
+                    email_html=email_html,
+                    _user_email=user.email,
+                    _user_name=display_name,
+                )
         except Exception as notif_exc:
             # Notification failure must NEVER roll back a successful payment
             logger.warning(f"billing_plan_upgraded notification failed (non-fatal): {notif_exc}")

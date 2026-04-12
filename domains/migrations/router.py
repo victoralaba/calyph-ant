@@ -94,16 +94,13 @@ async def _notify_migration_result(
     error: str | None = None,
 ) -> None:
     """
-    Write a schema_migration_success or schema_migration_failed Notification
-    row to the in-app inbox. Fire-and-forget — never raises.
-
-    UI NOTE: These appear in the user's notification bell/inbox.
-    They are NOT emailed (per EVENT_MATRIX: email=False for migration_success,
-    email=True for migration_failed — but email for failed is handled separately
-    via send_async_email if the workspace has that preference set).
+    Dispatch migration result through the notifications engine.
+    Fire-and-forget — never raises.
     """
     try:
-        from domains.notifications.service import Notification
+        from domains.notifications.service import dispatch_event
+        from domains.notifications.templates import build_migration_failed_email
+        from domains.users.service import get_user
         from core.db import _session_factory
 
         if not _session_factory:
@@ -123,8 +120,24 @@ async def _notify_migration_result(
         )
         action_url = f"{settings.APP_BASE_URL}/dashboard/connections/{connection_id}/migrations"
 
+        email_subject: str | None = None
+        email_html: str | None = None
+
         async with _session_factory() as notif_session:
-            notif = Notification(
+            user = await get_user(notif_session, user_id)
+            if not user:
+                return
+
+            if not succeeded and error:
+                email_subject, email_html = build_migration_failed_email(
+                    workspace_name=str(workspace_id),
+                    migration_label=migration_label,
+                    migration_version=migration_version,
+                    error_detail=error,
+                )
+
+            await dispatch_event(
+                db=notif_session,
                 user_id=user_id,
                 workspace_id=workspace_id,
                 kind=kind,
@@ -135,39 +148,12 @@ async def _notify_migration_result(
                     "migration_version": migration_version,
                     "connection_id": str(connection_id),
                 },
+                email_subject=email_subject,
+                email_html=email_html,
+                _user_email=user.email,
+                _user_name=user.full_name or user.email,
+                _notif_prefs=(user.preferences or {}).get("notifications", {}),
             )
-            notif_session.add(notif)
-            await notif_session.commit()
-
-        # For migration failures, also send an email (per EVENT_MATRIX email=True)
-        if not succeeded and error:
-            try:
-                from domains.notifications.tasks import send_async_email
-                from domains.notifications.templates import build_migration_failed_email
-                from domains.users.service import get_user
-
-                async with _session_factory() as u_session:
-                    user = await get_user(u_session, user_id)
-                    if user:
-                        subject, html = build_migration_failed_email(
-                            workspace_name=str(workspace_id),
-                            migration_label=migration_label,
-                            migration_version=migration_version,
-                            error_detail=error,
-                        )
-                        send_async_email.apply_async(
-                            kwargs={
-                                "to_email": user.email,
-                                "to_name": user.full_name or user.email,
-                                "subject": subject,
-                                "html_content": html,
-                                "sender_type": "system",
-                            },
-                            queue="notifications",
-                        )
-            except Exception as email_exc:
-                import logging
-                logging.getLogger(__name__).warning(f"Migration failed email dispatch failed (non-fatal): {email_exc}")
 
     except Exception as exc:
         import logging
