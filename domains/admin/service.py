@@ -85,7 +85,7 @@ class AuditLog(Base):
 # ---------------------------------------------------------------------------
 
 async def write_audit(
-    db: AsyncSession,
+    db: AsyncSession,  # kept for signature compatibility — no longer used internally
     action: str,
     user_id: UUID | None = None,
     workspace_id: UUID | None = None,
@@ -96,57 +96,73 @@ async def write_audit(
     ip_address: str | None = None,
 ) -> None:
     """
-    Fire-and-forget audit log write. Never raises.
-    Call this from any domain after a significant mutation.
+    Fire-and-forget audit log write.
 
-    Example:
-        await write_audit(db, "migration.applied",
-                          user_id=user.id,
-                          resource_type="migration",
-                          resource_id=str(migration.id))
+    Uses its OWN isolated session so it never interferes with the caller's
+    open transaction. The `db` parameter is kept for backward compatibility
+    but is ignored — do not rely on it being committed here.
+
+    Never raises. On failure, logs ERROR and returns silently.
     """
+    # `db` parameter intentionally ignored — we open a fresh session below.
     try:
-        entry = AuditLog(
-            user_id=user_id,
-            workspace_id=workspace_id,
-            action=action,
-            resource_type=resource_type,
-            resource_id=str(resource_id) if resource_id else None,
-            diff=diff or {},
-            meta=meta or {},
-            ip_address=ip_address,
-        )
-        db.add(entry)
-        await db.commit()
+        from core.db import _session_factory
+        if not _session_factory:
+            return
+
+        async with _session_factory() as audit_session:
+            entry = AuditLog(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                action=action,
+                resource_type=resource_type,
+                resource_id=str(resource_id) if resource_id else None,
+                diff=diff or {},
+                meta=meta or {},
+                ip_address=ip_address,
+            )
+            audit_session.add(entry)
+            await audit_session.commit()
     except Exception as exc:
         logger.error(f"Audit log write failed for action '{action}': {exc}")
 
 
 async def write_audit_batch(
-    db: AsyncSession,
-    entries: list[dict[str, Any]]
+    db: AsyncSession,  # kept for signature compatibility — no longer used internally
+    entries: list[dict[str, Any]],
 ) -> None:
     """
     Batch write audit logs for high-volume operations (bulk update/delete).
-    Prevents connection pool exhaustion by writing all events in a single transaction.
+
+    Uses its OWN isolated session. Prevents connection pool exhaustion by
+    writing all events in a single transaction. The `db` parameter is kept
+    for backward compatibility but is ignored.
+
+    Never raises. On failure, logs ERROR and returns silently.
     """
     if not entries:
         return
+
     try:
-        logs = [
-            AuditLog(
-                user_id=e.get("user_id"),
-                workspace_id=e.get("workspace_id"),
-                action=e["action"],
-                resource_type=e.get("resource_type"),
-                resource_id=str(e["resource_id"]) if e.get("resource_id") else None,
-                diff=e.get("diff", {}),
-                meta=e.get("meta", {}),
-            )
-            for e in entries
-        ]
-        db.add_all(logs)
-        await db.commit()
+        from core.db import _session_factory
+        if not _session_factory:
+            return
+
+        async with _session_factory() as audit_session:
+            logs = [
+                AuditLog(
+                    user_id=e.get("user_id"),
+                    workspace_id=e.get("workspace_id"),
+                    action=e["action"],
+                    resource_type=e.get("resource_type"),
+                    resource_id=str(e["resource_id"]) if e.get("resource_id") else None,
+                    diff=e.get("diff", {}),
+                    meta=e.get("meta", {}),
+                )
+                for e in entries
+            ]
+            audit_session.add_all(logs)
+            await audit_session.commit()
     except Exception as exc:
         logger.error(f"Batch audit write failed ({len(entries)} entries): {exc}")
 

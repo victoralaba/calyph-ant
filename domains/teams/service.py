@@ -835,8 +835,7 @@ async def invite_member(
 
     invite = await create_invite(db, workspace_id, user.id, body.email, body.role)
 
-    from domains.notifications.tasks import send_async_email
-
+    # Resolve inviter display name for the email
     inviter_name = user.email
     try:
         from domains.users.service import get_user
@@ -846,35 +845,30 @@ async def invite_member(
     except Exception:
         pass
 
-    # For external invites, we bypass the DB inbox entirely and hit Celery directly
-    accept_url = f"{settings.APP_BASE_URL}/invites/{invite.token}/accept"
-    email_html = f"""
-    <h2>You've been invited to join {workspace.name} on Calyphant</h2>
-    <p>{inviter_name} has invited you to collaborate on their database workspace.</p>
-    <p>
-      <a href="{accept_url}" style="background:#4F46E5;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;">
-        Accept Invitation
-      </a>
-    </p>
-    """
-    
-    send_async_email.apply_async(
+    # Build email from the template system (single source of HTML truth)
+    from domains.notifications.templates import build_invite_email
+    from domains.notifications.tasks import send_async_email
+
+    email_subject, email_html = build_invite_email(
+        inviter_name=inviter_name,
+        workspace_name=workspace.name,
+        invite_token=invite.token,
+        role=body.role.value,
+    )
+
+    # Single Celery dispatch — fire-and-forget with automatic retry on failure.
+    # UI NOTE: If this endpoint returns 201 but the invitee never receives an email,
+    # it is a Celery/SendPulse delivery issue, not an invite creation failure.
+    # The invite token is valid regardless — the invitee can accept via direct link.
+    send_async_email.apply_async(  # type: ignore[attr-defined]
         kwargs={
             "to_email": body.email,
             "to_name": body.email,
-            "subject": f"{inviter_name} invited you to {workspace.name} on Calyphant",
+            "subject": email_subject,
             "html_content": email_html,
-            "sender_type": "system"
-        }
-    )
-
-    asyncio.create_task(
-        send_invite_email(
-            to_email=body.email,
-            inviter_name=inviter_name,
-            workspace_name=workspace.name,
-            invite_token=invite.token,
-        )
+            "sender_type": "system",
+        },
+        queue="notifications",
     )
 
     return {
@@ -908,7 +902,7 @@ async def accept_workspace_invite(
     asyncio.create_task(dispatch_workspace_event(
         db=db,
         workspace_id=member.workspace_id,
-        kind=NotificationKind.team_invite_accepted,
+        kind="team_invite_accepted",
         title=f"{user.email} joined the workspace",
         exclude_user_id=user.id,
         meta={"user_id": str(user.id), "role": member.role},

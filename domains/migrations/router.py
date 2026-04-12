@@ -83,6 +83,97 @@ async def _broadcast_migration_event(
         )
 
 
+async def _notify_migration_result(
+    db: AsyncSession,
+    user_id: UUID,
+    workspace_id: UUID,
+    connection_id: UUID,
+    migration_label: str,
+    migration_version: str,
+    succeeded: bool,
+    error: str | None = None,
+) -> None:
+    """
+    Write a schema_migration_success or schema_migration_failed Notification
+    row to the in-app inbox. Fire-and-forget — never raises.
+
+    UI NOTE: These appear in the user's notification bell/inbox.
+    They are NOT emailed (per EVENT_MATRIX: email=False for migration_success,
+    email=True for migration_failed — but email for failed is handled separately
+    via send_async_email if the workspace has that preference set).
+    """
+    try:
+        from domains.notifications.service import Notification
+        from core.db import _session_factory
+
+        if not _session_factory:
+            return
+
+        from core.config import settings
+        kind = "schema_migration_success" if succeeded else "schema_migration_failed"
+        title = (
+            f"Migration applied: {migration_label}"
+            if succeeded
+            else f"Migration failed: {migration_label}"
+        )
+        body = (
+            f"Version {migration_version} applied successfully."
+            if succeeded
+            else f"Version {migration_version} failed. Error: {(error or '')[:200]}"
+        )
+        action_url = f"{settings.APP_BASE_URL}/dashboard/connections/{connection_id}/migrations"
+
+        async with _session_factory() as notif_session:
+            notif = Notification(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                kind=kind,
+                title=title,
+                body=body,
+                action_url=action_url,
+                meta={
+                    "migration_version": migration_version,
+                    "connection_id": str(connection_id),
+                },
+            )
+            notif_session.add(notif)
+            await notif_session.commit()
+
+        # For migration failures, also send an email (per EVENT_MATRIX email=True)
+        if not succeeded and error:
+            try:
+                from domains.notifications.tasks import send_async_email
+                from domains.notifications.templates import build_migration_failed_email
+                from domains.users.service import get_user
+
+                async with _session_factory() as u_session:
+                    user = await get_user(u_session, user_id)
+                    if user:
+                        subject, html = build_migration_failed_email(
+                            workspace_name=str(workspace_id),
+                            migration_label=migration_label,
+                            migration_version=migration_version,
+                            error_detail=error,
+                        )
+                        send_async_email.apply_async(
+                            kwargs={
+                                "to_email": user.email,
+                                "to_name": user.full_name or user.email,
+                                "subject": subject,
+                                "html_content": html,
+                                "sender_type": "system",
+                            },
+                            queue="notifications",
+                        )
+            except Exception as email_exc:
+                import logging
+                logging.getLogger(__name__).warning(f"Migration failed email dispatch failed (non-fatal): {email_exc}")
+
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(f"Migration notification write failed (non-fatal): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -404,6 +495,17 @@ async def apply_migration(
                 migration_label=failed_record.label,
                 error=str(exc),
             ))
+            # Write in-app failure notification
+            asyncio.create_task(_notify_migration_result(
+                db=db,
+                user_id=user.id,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
+                migration_label=failed_record.label,
+                migration_version=failed_record.version,
+                succeeded=False,
+                error=str(exc),
+            ))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -426,6 +528,16 @@ async def apply_migration(
                 migration_label=failed_record.label,
                 error=str(exc),
             ))
+            asyncio.create_task(_notify_migration_result(
+                db=db,
+                user_id=user.id,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
+                migration_label=failed_record.label,
+                migration_version=failed_record.version,
+                succeeded=False,
+                error=str(exc),
+            ))
         raise HTTPException(status_code=500, detail=f"Migration failed: {exc}")
     finally:
         await pg_conn.close()
@@ -436,6 +548,16 @@ async def apply_migration(
         event="migration_applied",
         migration_version=record.version,
         migration_label=record.label,
+    ))
+    # Write in-app success notification
+    asyncio.create_task(_notify_migration_result(
+        db=db,
+        user_id=user.id,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        migration_label=record.label,
+        migration_version=record.version,
+        succeeded=True,
     ))
 
     return MigrationResponse.from_record(record)

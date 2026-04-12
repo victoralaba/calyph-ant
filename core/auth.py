@@ -384,11 +384,9 @@ async def register(
     Register a new user account.
 
     Creates the user, a personal workspace, adds them as workspace owner,
-    and fires a welcome email as a background task. Returns access +
+    and fires a welcome email as a background Celery task. Returns access +
     refresh tokens immediately — no email verification gate on first login.
-    Verification status is tracked (is_verified) but not enforced here.
     """
-    from domains.notifications.service import send_welcome_email
     from domains.teams.service import create_workspace
     from domains.users.service import User, get_user_by_email
 
@@ -409,7 +407,10 @@ async def register(
     )
     await db.commit()
 
-    # Fire-and-forget — welcome email must never block the response
+    # Fire-and-forget via Celery — never blocks the response.
+    # The task handles retries internally if SendPulse is temporarily down.
+    import asyncio
+    from domains.notifications.service import send_welcome_email
     asyncio.create_task(send_welcome_email(user.email, user.full_name or ""))
 
     access = create_access_token(
@@ -523,11 +524,10 @@ async def forgot_password(
     """
     Initiate a password reset.
 
-    Stores a one-time token in Redis (1-hour TTL) and sends a reset email.
-    Always returns 204 regardless of whether the email is registered —
-    prevents account enumeration.
+    Stores a one-time token in Redis (1-hour TTL) and enqueues a Celery
+    task to send the reset email. Always returns 204 regardless of whether
+    the email is registered — prevents account enumeration.
     """
-    from domains.notifications.service import send_password_reset_email
     from domains.users.service import get_user_by_email
 
     user = await get_user_by_email(db, body.email)
@@ -538,7 +538,9 @@ async def forgot_password(
     redis = await get_redis()
     await redis.setex(f"pwd_reset:{token}", 3600, str(user.id))
 
-    # Fire-and-forget — email must never block the response
+    # Fire-and-forget via Celery — never blocks the response.
+    import asyncio
+    from domains.notifications.service import send_password_reset_email
     asyncio.create_task(send_password_reset_email(user.email, token))
 
 

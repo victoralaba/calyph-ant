@@ -962,6 +962,93 @@ def _serialise_snapshot_filtered(snapshot, table_names_set: set[str]) -> dict[st
 # Backup orchestration
 # ---------------------------------------------------------------------------
 
+async def _dispatch_backup_notification(
+    db: AsyncSession,
+    record: "BackupRecord",
+    workspace_id: UUID,
+    succeeded: bool,
+) -> None:
+    """
+    Fire-and-forget notification for backup completion or failure.
+    Only dispatches for SCHEDULED backups (generated_by="scheduled").
+    Manual backups use UI polling — no email for those.
+
+    UI NOTE: Manual backups triggered from the dashboard show status via
+    real-time polling on the backup list endpoint. Email notifications are
+    reserved for scheduled backups where the user is not watching the UI.
+    """
+    # Only email for scheduled backups — manual ones are watched via UI polling
+    if getattr(record, "generated_by", None) != "scheduled":
+        return
+
+    try:
+        from domains.connections.models import Connection
+        from domains.teams.service import WorkspaceMember
+        from domains.users.service import User
+        from domains.notifications.tasks import send_async_email
+        from domains.notifications.templates import (
+            build_backup_completed_email,
+            build_backup_failed_email,
+        )
+        from sqlalchemy import select as sa_select
+
+        # Get connection name
+        conn_result = await db.execute(
+            sa_select(Connection.name).where(Connection.id == record.connection_id)
+        )
+        connection_name = conn_result.scalar_one_or_none() or str(record.connection_id)
+
+        # Get workspace owner/admins to notify
+        from domains.teams.service import WorkspaceRole
+        members_result = await db.execute(
+            sa_select(WorkspaceMember.user_id).where(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.role.in_([WorkspaceRole.owner, WorkspaceRole.admin]),
+            )
+        )
+        admin_ids = [row[0] for row in members_result.all()]
+
+        if not admin_ids:
+            return
+
+        users_result = await db.execute(
+            sa_select(User.id, User.email, User.full_name).where(
+                User.id.in_(admin_ids),
+                User.is_active == True,  # noqa: E712
+            )
+        )
+
+        for user_row in users_result.all():
+            if succeeded:
+                subject, html = build_backup_completed_email(
+                    workspace_name=str(workspace_id),  # replaced by real name if available
+                    connection_name=connection_name,
+                    backup_label=record.label,
+                    size_bytes=record.size_bytes,
+                )
+            else:
+                subject, html = build_backup_failed_email(
+                    workspace_name=str(workspace_id),
+                    connection_name=connection_name,
+                    backup_label=record.label,
+                    error_detail=record.error or "Unknown error",
+                )
+
+            send_async_email.apply_async(
+                kwargs={
+                    "to_email": user_row.email,
+                    "to_name": user_row.full_name or user_row.email,
+                    "subject": subject,
+                    "html_content": html,
+                    "sender_type": "system",
+                },
+                queue="notifications",
+            )
+
+    except Exception as exc:
+        logger.warning(f"Backup notification dispatch failed (non-fatal): {exc}")
+
+
 async def create_backup(
     db: AsyncSession,
     pg_conn: asyncpg.Connection,
@@ -1035,6 +1122,12 @@ async def create_backup(
         record.status = "completed"
         record.completed_at = datetime.now(timezone.utc)
         
+        # Dispatch completion notification (scheduled backups only, fire-and-forget)
+        import asyncio
+        asyncio.create_task(
+            _dispatch_backup_notification(db, record, workspace_id, succeeded=True)
+        )
+        
         # --- THE MUSCLE: Atomic Storage Tracking ---
         # Increment the Redis byte tracker upon successful write.
         # FIXED: Extracting to a local variable with a fallback to 0 to bypass Pylance ORM confusion
@@ -1052,6 +1145,12 @@ async def create_backup(
         record.status = "failed"
         record.error = str(exc)
         logger.error(f"Backup failed for connection {connection_id}: {exc}")
+
+        # Dispatch failure notification (scheduled backups only, fire-and-forget)
+        import asyncio
+        asyncio.create_task(
+            _dispatch_backup_notification(db, record, workspace_id, succeeded=False)
+        )
 
     await db.commit()
     await db.refresh(record)

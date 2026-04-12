@@ -442,6 +442,40 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
             f"{format_price(amount_minor, currency)}"
         )
 
+        # Dispatch billing upgrade notification via Celery
+        # We do NOT use dispatch_event here because we need the email
+        # immediately and we already have all the data — no extra DB query needed.
+        try:
+            from domains.notifications.tasks import send_async_email
+            from domains.notifications.templates import build_billing_upgraded_email
+
+            # Retrieve user name for the email (already fetched above as `user`)
+            display_name = ""
+            if user and user.full_name:
+                display_name = user.full_name
+            elif user:
+                display_name = user.email
+
+            email_subject, email_html = build_billing_upgraded_email(
+                name=display_name,
+                new_tier=tier,
+                amount_display=format_price(amount_minor, currency),
+                currency=currency,
+            )
+            send_async_email.apply_async(  # type: ignore[attr-defined]
+                kwargs={
+                    "to_email": user.email if user else "",
+                    "to_name": display_name,
+                    "subject": email_subject,
+                    "html_content": email_html,
+                    "sender_type": "ceo",
+                },
+                queue="notifications",
+            )
+        except Exception as notif_exc:
+            # Notification failure must NEVER roll back a successful payment
+            logger.warning(f"billing_plan_upgraded notification failed (non-fatal): {notif_exc}")
+
     elif event_type == "subscription.cancelled":
         data = event.get("data", {})
         meta = data.get("meta", {})

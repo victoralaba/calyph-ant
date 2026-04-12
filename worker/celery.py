@@ -51,7 +51,9 @@ celery_app = Celery(
     "calyphant",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["worker.celery"],
+    include=["worker.celery",
+    "domains.notifications.tasks",
+    ],
 )
 
 

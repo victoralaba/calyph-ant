@@ -55,9 +55,6 @@ dependencies = [
     # Analytics
     "posthog",
 
-    # Email
-    "brevo-python",
-
     # AI
     "anthropic",
     "google-genai",
