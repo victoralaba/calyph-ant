@@ -45,6 +45,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from core.auth import CurrentUser
 from core.config import settings
 from core.db import get_db, get_redis
+from domains.notifications.rate_limit import enforce_redis_limit
 from shared.types import Base
 
 
@@ -104,6 +105,7 @@ async def enqueue_email_notification(
     correlation_id: str | None = None,
     idempotency_key: str | None = None,
     bypass_rate_limit: bool = False,
+    fail_closed_on_redis_error: bool = False,
 ) -> bool:
     """
     Single queueing boundary for outbound email jobs.
@@ -120,21 +122,20 @@ async def enqueue_email_notification(
 
     # Per-recipient hourly cap to reduce blast radius from abuse loops.
     if not bypass_rate_limit:
-        try:
-            redis = await get_redis()
-            recipient_key = f"notifications:email:hour:{to_email.lower()}"
-            current = await redis.incr(recipient_key)
-            if current == 1:
-                await redis.expire(recipient_key, 3600)
-            if current > settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR:
-                await redis.incr(f"notifications:throttle:email:recipient:{to_email.lower()}")
-                logger.warning(
-                    "Email enqueue throttled "
-                    f"recipient={to_email} limit={settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR}/hour"
-                )
-                return False
-        except Exception as exc:
-            logger.warning(f"Email rate-limit store unavailable; proceeding with enqueue: {exc}")
+        rl = await enforce_redis_limit(
+            key=f"notifications:email:hour:{to_email.lower()}",
+            limit=settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR,
+            window_seconds=3600,
+            fail_closed=fail_closed_on_redis_error,
+            action=f"email_enqueue:{notification_kind or 'unknown'}",
+        )
+        if not rl.allowed:
+            logger.warning(
+                "Email enqueue blocked "
+                f"recipient={to_email} reason={rl.reason} "
+                f"limit={settings.NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR}/hour"
+            )
+            return False
 
     if idempotency_key:
         try:
@@ -236,6 +237,7 @@ async def send_welcome_email(email: str, name: str) -> None:
         html_content=html,
         sender_type="ceo",
         notification_kind="user_signup",
+        fail_closed_on_redis_error=True,
     )
 
 
@@ -258,6 +260,7 @@ async def send_password_reset_email(email: str, token: str) -> None:
         sender_type="system",
         notification_kind="password_reset",
         idempotency_key=f"password_reset:{email}:{token}",
+        fail_closed_on_redis_error=True,
     )
 
 

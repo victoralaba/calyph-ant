@@ -229,6 +229,10 @@ class Settings(BaseSettings):
     # Abuse score window and threshold before temporary non-critical mute.
     NOTIFICATIONS_ABUSE_WINDOW_SECONDS: int = 1800
     NOTIFICATIONS_ABUSE_THRESHOLD: int = 50
+    # High-risk action limits (fail-closed when Redis is unavailable)
+    NOTIFICATIONS_REGISTER_LIMIT_PER_HOUR: int = 10
+    NOTIFICATIONS_PASSWORD_RESET_LIMIT_PER_HOUR: int = 8
+    NOTIFICATIONS_WORKSPACE_INVITE_LIMIT_PER_HOUR: int = 50
 
     # ------------------------------------------------------------------
     # Cross-field validators
