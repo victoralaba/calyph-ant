@@ -216,6 +216,21 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
     # ------------------------------------------------------------------
+    # Notifications hardening controls
+    # ------------------------------------------------------------------
+    # Max workspace-wide notification fan-out events per minute.
+    NOTIFICATIONS_WORKSPACE_EVENT_LIMIT_PER_MINUTE: int = 300
+    # Max in-app notifications written per user per hour.
+    NOTIFICATIONS_USER_IN_APP_LIMIT_PER_HOUR: int = 500
+    # Max email enqueue operations per recipient per hour.
+    NOTIFICATIONS_EMAIL_LIMIT_PER_HOUR: int = 200
+    # Suppress repeated non-critical events with same fingerprint for this TTL.
+    NOTIFICATIONS_REPEAT_SUPPRESS_SECONDS: int = 300
+    # Abuse score window and threshold before temporary non-critical mute.
+    NOTIFICATIONS_ABUSE_WINDOW_SECONDS: int = 1800
+    NOTIFICATIONS_ABUSE_THRESHOLD: int = 50
+
+    # ------------------------------------------------------------------
     # Cross-field validators
     # ------------------------------------------------------------------
 

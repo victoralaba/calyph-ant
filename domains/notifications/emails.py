@@ -45,6 +45,10 @@ async def _fetch_fresh_token() -> str | None:
     Exchange Client ID/Secret for a new OAuth2 Bearer token from SendPulse.
     Caches the result in Redis. Returns the token or None on failure.
     """
+    if not settings.SENDPULSE_CLIENT_ID or not settings.SENDPULSE_CLIENT_SECRET:
+        logger.error("SendPulse OAuth2 token fetch aborted: missing client credentials")
+        return None
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -98,6 +102,7 @@ async def send_sendpulse_email(
     subject: str,
     html_content: str,
     sender_type: str = "system",  # "system" | "ceo"
+    correlation_id: str | None = None,
 ) -> bool:
     """
     Send a transactional email via the SendPulse SMTP API.
@@ -123,6 +128,10 @@ async def send_sendpulse_email(
     else:
         from_email = settings.SENDPULSE_SYSTEM_EMAIL
         from_name  = settings.SENDPULSE_SYSTEM_NAME
+
+    if not from_email:
+        logger.error("SendPulse: sender email is missing from configuration")
+        return False
 
     # -------------------------------------------------------------------
     # BASE64 ENCODING — SendPulse SMTP API requirement.
@@ -182,6 +191,17 @@ async def send_sendpulse_email(
                     continue  # retry with force_refresh=True
 
                 resp.raise_for_status()
+
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+
+                logger.info(
+                    "SendPulse delivery success "
+                    f"to={to_email} corr={correlation_id or 'n/a'} "
+                    f"response_keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}"
+                )
                 return True
 
         except httpx.HTTPStatusError as exc:

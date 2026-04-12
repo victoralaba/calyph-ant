@@ -57,6 +57,9 @@ def send_async_email(
     subject: str,
     html_content: str,
     sender_type: str = "system",
+    notification_kind: str | None = None,
+    correlation_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> bool:
     """
     Celery task: deliver a transactional email via SendPulse.
@@ -75,6 +78,13 @@ def send_async_email(
     from domains.notifications.emails import send_sendpulse_email
 
     try:
+        if not to_email or "@" not in to_email:
+            raise ValueError("send_async_email requires a valid recipient email")
+        if not subject.strip():
+            raise ValueError("send_async_email requires a non-empty subject")
+        if not html_content.strip():
+            raise ValueError("send_async_email requires non-empty html_content")
+
         success = _run(
             send_sendpulse_email(
                 to_email=to_email,
@@ -82,6 +92,7 @@ def send_async_email(
                 subject=subject,
                 html_content=html_content,
                 sender_type=sender_type,
+                correlation_id=correlation_id,
             )
         )
 
@@ -89,6 +100,12 @@ def send_async_email(
             raise RuntimeError(
                 f"SendPulse returned failure for {to_email}. Will retry."
             )
+
+        logger.info(
+            "send_async_email delivered "
+            f"to={to_email} kind={notification_kind or 'n/a'} "
+            f"corr={correlation_id or 'n/a'} idem={idempotency_key or 'n/a'}"
+        )
 
         return True
 

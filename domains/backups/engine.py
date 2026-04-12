@@ -985,7 +985,7 @@ async def _dispatch_backup_notification(
         from domains.connections.models import Connection
         from domains.teams.service import WorkspaceMember
         from domains.users.service import User
-        from domains.notifications.tasks import send_async_email
+        from domains.notifications.service import dispatch_event
         from domains.notifications.templates import (
             build_backup_completed_email,
             build_backup_failed_email,
@@ -1034,15 +1034,29 @@ async def _dispatch_backup_notification(
                     error_detail=record.error or "Unknown error",
                 )
 
-            send_async_email.apply_async(
-                kwargs={
-                    "to_email": user_row.email,
-                    "to_name": user_row.full_name or user_row.email,
-                    "subject": subject,
-                    "html_content": html,
-                    "sender_type": "system",
+            await dispatch_event(
+                db=db,
+                user_id=user_row.id,
+                kind="backup_completed" if succeeded else "backup_failed",
+                title=(
+                    f"Backup completed: {record.label}"
+                    if succeeded else f"Backup failed: {record.label}"
+                ),
+                body=(
+                    f"{connection_name} backup finished successfully."
+                    if succeeded else f"{connection_name} backup failed: {(record.error or 'Unknown error')[:200]}"
+                ),
+                workspace_id=workspace_id,
+                action_url=f"/dashboard/backups?workspace_id={workspace_id}",
+                meta={
+                    "backup_id": str(record.id),
+                    "connection_id": str(record.connection_id),
+                    "generated_by": getattr(record, "generated_by", None),
                 },
-                queue="notifications",
+                email_subject=subject,
+                email_html=html,
+                _user_email=user_row.email,
+                _user_name=user_row.full_name or user_row.email,
             )
 
     except Exception as exc:
