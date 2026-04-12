@@ -67,14 +67,16 @@ async def _broadcast_migration_event(
 ) -> None:
     try:
         from domains.teams.service import ws_manager
-        payload: dict = {
-            "event": event,
-            "connection_id": str(connection_id),
-            "migration_version": migration_version,
-            "migration_label": migration_label,
-        }
-        if error:
-            payload["error"] = error
+        from shared.pubsub import SignalEvent
+        payload = SignalEvent(
+            event=event,
+            workspace_id=workspace_id,
+            entity_id=None,
+            connection_id=str(connection_id),  # type: ignore[call-arg]
+            migration_version=migration_version,  # type: ignore[call-arg]
+            migration_label=migration_label,  # type: ignore[call-arg]
+            **({"error": error} if error else {}),  # type: ignore[call-arg]
+        )
         await ws_manager.broadcast(workspace_id, payload)
     except Exception as exc:
         import logging
