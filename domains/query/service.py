@@ -56,6 +56,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from core.db import get_redis
 from domains.tables.editor import stream_query_result
 from shared.types import Base
 
@@ -397,6 +398,9 @@ async def execute_query(
             f"Query exceeded the {timeout}s timeout and was cancelled by the server. "
             "Reduce query complexity or increase the timeout limit."
         )
+        # TRIGGER THE TRIPWIRE
+        background_tasks.add_task(_evaluate_abuse_tripwire, user_id)
+    
     # Notice: asyncpg.exceptions.ActiveSQLTransactionError is GONE.
     except asyncpg.PostgresSyntaxError as exc:
         error = f"Syntax error: {exc.args[0]}"
@@ -548,19 +552,17 @@ async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def explain_query(
-    pg_conn: asyncpg.Connection | PoolConnectionProxy,  # <-- UPDATE TYPE
+    pg_conn: asyncpg.Connection | PoolConnectionProxy,
     sql: str,
+    user_id: UUID,                      # <-- NEW: Required for tripwire
+    background_tasks: BackgroundTasks,  # <-- NEW: Required for tripwire
     analyze: bool = False,
     buffers: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     """
     Run EXPLAIN (or EXPLAIN ANALYZE) on a query.
-    Returns both the raw text plan and a parsed JSON plan.
-    
-    Protects against runaway EXPLAIN ANALYZE executions and explicitly
-    rolls back the transaction natively so EXPLAIN ANALYZE UPDATE doesn't 
-    mutate data and the asyncpg state machine remains uncorrupted.
+    Enforces the same physics timeouts and abuse tracking as standard execution.
     """
     options = ["FORMAT JSON"]
     if analyze:
@@ -572,13 +574,9 @@ async def explain_query(
     explain_sql = f"EXPLAIN ({opts}) {sql}"
     timeout_ms = int(min(timeout, MAX_TIMEOUT) * 1000)
 
-    # We give json_plan a starting value here so Pylance knows it exists!
     json_plan = None
 
     try:
-        # EXPLAIN ANALYZE actually executes the query. 
-        # We must protect the backend from hanging, and we roll back natively 
-        # so profiling an UPDATE doesn't accidentally mutate data.
         async with pg_conn.transaction():
             await pg_conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
             
@@ -590,11 +588,12 @@ async def explain_query(
     except _RollbackSentinel:
         pass
     except asyncpg.QueryCanceledError:
+        # TRIGGER THE TRIPWIRE (A failed EXPLAIN ANALYZE is still compute abuse)
+        background_tasks.add_task(_evaluate_abuse_tripwire, user_id)
         return {"error": "EXPLAIN ANALYZE exceeded execution timeout.", "plan": None}
     except Exception as exc:
         return {"error": str(exc), "plan": None}
 
-    # Also fetch the human-readable text plan (Fast, no execution needed)
     text_sql = f"EXPLAIN {sql}"
     try:
         text_rows = await pg_conn.fetch(text_sql)
@@ -707,6 +706,42 @@ async def _background_record_history(
             )
     except Exception as exc:
         logger.warning(f"Background query history write failed: {exc}")
+
+
+async def _evaluate_abuse_tripwire(user_id: UUID) -> None:
+    """
+    The Autonomous Tripwire. 
+    If a user hits 20 QueryCanceledErrors (timeouts) within a 1-hour window,
+    we permanently flag their account to protect the system.
+    """
+    try:
+        redis = await get_redis()
+        if not redis:
+            return
+            
+        key = f"abuse:timeout_strikes:{user_id}"
+        strikes = await redis.incr(key)
+        
+        # Set 1-hour rolling window on the first strike
+        if strikes == 1:
+            await redis.expire(key, 3600)
+            
+        if strikes >= 20:
+            logger.warning(f"USER {user_id} TRIGGERED ABUSE TRIPWIRE. Applying flag.")
+            
+            async with get_db_context() as db:
+                from domains.users.service import User
+                user = await db.get(User, user_id)
+                if user and not user.is_flagged:
+                    user.is_flagged = True
+                    await db.commit()
+                    logger.error(f"User {user_id} has been permanently flagged for compute abuse.")
+                    
+            # Clear the counter so we don't spam the database lock
+            await redis.delete(key)
+            
+    except Exception as exc:
+        logger.error(f"Failed to evaluate abuse tripwire for user {user_id}: {exc}")
 
 
 async def _record_history(

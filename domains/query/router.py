@@ -61,38 +61,34 @@ from asyncpg.pool import PoolConnectionProxy  # <-- ADD THIS IMPORT
 from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
+from domains.billing.flutterwave import TIER_LIMITS
 from domains.query import service
 from domains.query.service import DEFAULT_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT
+from domains.users.service import User
 
 router = APIRouter(prefix="/query", tags=["query"])
 
 
 # ---------------------------------------------------------------------------
-# Schemas
+# Schemas (The Locked Contract)
 # ---------------------------------------------------------------------------
 
 class ExecuteRequest(BaseModel):
     sql: str = Field(..., min_length=1)
-    timeout: float = Field(30.0, ge=1.0, le=300.0)
-    max_rows: int = Field(10_000, ge=1, le=50_000)
-
+    # UI NOTE: The client can only ask for a SMALLER limit for pagination. 
+    # The server will clamp this value against the user's maximum entitlement.
+    requested_limit: int = Field(100, ge=1, le=50_000)
 
 class StreamRequest(BaseModel):
     sql: str = Field(..., min_length=1)
     chunk_size: int = Field(500, ge=100, le=2000)
-    execution_timeout_seconds: float = Field(
-        DEFAULT_STREAM_TIMEOUT,
-        ge=5.0,
-        le=MAX_STREAM_TIMEOUT,
-        description=(
-            "How long PostgreSQL will allow this query to run before cancelling it. "
-            f"Default {DEFAULT_STREAM_TIMEOUT}s, max {MAX_STREAM_TIMEOUT}s."
-        ),
-    )
+    # UI NOTE: 'execution_timeout_seconds' has been REMOVED. 
+    # The server dictates stream lifespan based on the billing tier.
 
 
 class CancelRequest(BaseModel):
@@ -123,6 +119,57 @@ class SaveQueryRequest(BaseModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     is_public: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Entitlements Engine (The Gateway Physics)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ComputeProfile:
+    timeout_seconds: float
+    max_rows: int
+    is_flagged: bool
+
+async def resolve_compute_profile(
+    user: CurrentUser, 
+    db: AsyncSession = Depends(get_db)
+) -> ComputeProfile:
+    """
+    Evaluates the strict hierarchy of compute entitlements.
+    Order of authority:
+    1. Penalty Box (Flagged Users)
+    2. Enterprise Custom Overrides
+    3. Baseline Tier Physics
+    """
+    db_user = await db.get(User, user.id)
+    if not db_user:
+        raise HTTPException(status_code=403, detail="User validation failed.")
+
+    # LEVEL 1: The Penalty Box (Survival limits only)
+    if db_user.is_flagged:
+        return ComputeProfile(timeout_seconds=5.0, max_rows=100, is_flagged=True)
+
+    tier_physics = TIER_LIMITS.get(db_user.tier, TIER_LIMITS["free"])
+    
+    # LEVEL 2: Enterprise Overrides OR LEVEL 3: Tier Defaults
+    timeout = float(
+        db_user.custom_query_timeout 
+        if db_user.custom_query_timeout is not None 
+        else tier_physics.get("query_timeout_seconds", 30.0)
+    )
+    
+    rows = int(
+        db_user.custom_max_rows 
+        if db_user.custom_max_rows is not None 
+        else tier_physics.get("streaming_rows", 10_000)
+    )
+    
+    # -1 implies unlimited in our billing config. Cap it at something sane for the DB's sake.
+    if rows == -1:
+        rows = 10_000_000
+        
+    return ComputeProfile(timeout_seconds=timeout, max_rows=rows, is_flagged=False)
 
 
 # ---------------------------------------------------------------------------
@@ -158,15 +205,17 @@ async def execute_query(
     background_tasks: BackgroundTasks,
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
+    profile: ComputeProfile = Depends(resolve_compute_profile), # <-- Physics Injected
 ):
     """Execute a SQL query via persistent hot socket."""
     url = await _get_url(connection_id, workspace_id, db)
     
-    # Grab a pre-authenticated pool
+    # Clamp the requested rows to the user's actual entitlement
+    actual_limit = min(body.requested_limit, profile.max_rows)
+    
     pool = await service.pool_manager.get_pool(connection_id, url)
     
     try:
-        # pool.acquire() natively handles checkouts and safe returns
         async with pool.acquire() as pg_conn:
             return await service.execute_query(
                 pg_conn=pg_conn,
@@ -176,8 +225,8 @@ async def execute_query(
                 connection_id=connection_id,
                 user_id=user.id,
                 background_tasks=background_tasks,
-                timeout=body.timeout,
-                max_rows=body.max_rows,
+                timeout=profile.timeout_seconds, # <-- Forced Server Timeout
+                max_rows=actual_limit,           # <-- Forced Server Limit
             )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database execution failed: {exc}")
@@ -191,20 +240,16 @@ async def stream_query(
     user: CurrentUser,
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
+    profile: ComputeProfile = Depends(resolve_compute_profile), # <-- Physics Injected
 ):
     """
     Stream large query results as Server-Sent Events.
-    Uses the pool manager to guarantee connection is returned on client disconnect.
-    Engineered with strict L7 proxy bypass mechanics (Buffer blowouts & Heartbeats).
     """
     url = await _get_url(connection_id, workspace_id, db)
-    
 
     async def _generate_events(pg_conn: asyncpg.Connection | PoolConnectionProxy) -> AsyncGenerator[str, None]:
-        # 1. The Buffer Blowout (The 4KB Exploit)
         yield f": {' ' * 4096}\n\n"
         
-        # 2. Extract PID natively (Cleaner than parsing SSE dictionary chunks)
         raw_pid = await pg_conn.fetchval("SELECT pg_backend_pid()")
         pid: int = int(raw_pid) if raw_pid is not None else 0
         
@@ -215,12 +260,11 @@ async def stream_query(
                 pg_conn,
                 body.sql,
                 body.chunk_size,
-                execution_timeout_seconds=body.execution_timeout_seconds,
+                execution_timeout_seconds=profile.timeout_seconds, # <-- Forced Server Timeout
             )
             
             stream_iter = aiter(stream)
             while True:
-                # 3. THE SEAL: Disconnect Verification
                 if await request.is_disconnected():
                     logger.warning(f"Client disconnected mid-stream. Assassinating PID: {pid}")
                     if pid > 0:
@@ -231,14 +275,12 @@ async def stream_query(
                     event = await asyncio.wait_for(anext(stream_iter), timeout=10.0)
                     yield f"data: {json.dumps(event, default=str)}\n\n"
                 except asyncio.TimeoutError:
-                    # The Void Ping
                     yield ": heartbeat\n\n"
                 except StopAsyncIteration:
                     break
                     
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except asyncio.CancelledError:
-            # 4. THE SEAL: Framework-level Task Cancellation (e.g. Uvicorn timeout)
             logger.warning(f"Stream task forcefully cancelled by ASGI. Assassinating PID: {pid}")
             if pid > 0:
                 await service.cancel_query(url, pid)
@@ -246,23 +288,21 @@ async def stream_query(
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
 
-
     async def _safe_stream() -> AsyncGenerator[str, None]:
         pool = await service.pool_manager.get_pool(connection_id, url)
         async with pool.acquire() as pg_conn:
             async for chunk in _generate_events(pg_conn):
                 yield chunk
 
-    # 3. Omni-Proxy Disarmament (The Header Barrage)
     return StreamingResponse(
         _safe_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",       # Bypasses Nginx buffering
-            "Content-Encoding": "none",      # Forbids proxies from gzip buffering
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "none",
             "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",  # Explicit streaming declaration
+            "Transfer-Encoding": "chunked",
         },
     )
 
@@ -297,8 +337,10 @@ async def explain_query(
     connection_id: UUID,
     body: ExplainRequest,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,                          # <-- NEW: Inject tasks
     workspace_id: UUID = Depends(require_workspace),
     db: AsyncSession = Depends(get_db),
+    profile: ComputeProfile = Depends(resolve_compute_profile), # <-- NEW: Inject physics
 ):
     url = await _get_url(connection_id, workspace_id, db)
     pool = await service.pool_manager.get_pool(connection_id, url)
@@ -306,11 +348,17 @@ async def explain_query(
     try:
         async with pool.acquire() as pg_conn:
             return await service.explain_query(
-                pg_conn, body.sql, analyze=body.analyze, buffers=body.buffers
+                pg_conn, 
+                body.sql, 
+                user_id=user.id,
+                background_tasks=background_tasks,
+                analyze=body.analyze, 
+                buffers=body.buffers,
+                timeout=profile.timeout_seconds,
             )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Explain execution failed: {exc}")
-
+    
 
 @router.post("/{connection_id}/describe")
 async def describe_result_columns(

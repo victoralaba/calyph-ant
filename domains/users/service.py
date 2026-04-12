@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import DateTime, String, Text, Boolean
+from sqlalchemy import DateTime, String, Text, Boolean, Integer
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,23 +57,27 @@ class User(Base):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_superadmin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # --- NEW: Security & Abuse Physics ---
+    is_flagged: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    
+    # --- NEW: Enterprise Overrides ---
+    custom_query_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    custom_max_rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Billing tier
     tier: Mapped[str] = mapped_column(String(30), default="free", nullable=False)
 
-    # Preferences stored as JSON — avoids migrations for new preference keys
+    # Preferences stored as JSON 
+    # UI NOTE: The UI MUST NOT send 'query_limit' in this payload anymore. It will be ignored.
     preferences: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
-    # e.g. {"theme": "dark", "default_schema": "public", "query_limit": 1000,
-    #        "notifications": {"email": true, "in_app": true}}
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
