@@ -40,7 +40,7 @@ services:
     depends_on:
       - postgres
       - redis
-    command: celery -A worker.celery:celery_app worker --loglevel=info -Q default,keep_alive,backups,maintenance -c 2
+    command: celery -A worker.celery:celery_app worker --loglevel=info -Q default,keep_alive,backups,maintenance,notifications -c 2
 
   worker_ephemeral:
     build:

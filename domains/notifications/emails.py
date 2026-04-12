@@ -21,6 +21,7 @@ Sender routing:
 
 from __future__ import annotations
 
+import base64
 import httpx
 from loguru import logger
 from typing import Any
@@ -101,6 +102,12 @@ async def send_sendpulse_email(
     """
     Send a transactional email via the SendPulse SMTP API.
 
+    KEY PROTOCOL REQUIREMENT:
+    The SendPulse SMTP API requires the "html" field to be Base64-encoded.
+    This function encodes html_content to Base64 before sending.
+    Without this encoding SendPulse either rejects the payload or renders
+    garbage — the API does not return a meaningful error in all cases.
+
     On HTTP 401, force-refreshes the token and retries exactly once.
     Returns True on success, False on any failure (never raises).
 
@@ -112,23 +119,32 @@ async def send_sendpulse_email(
     """
     if sender_type == "ceo":
         from_email = settings.SENDPULSE_SENDER_EMAIL
-        from_name = settings.SENDPULSE_SENDER_NAME
+        from_name  = settings.SENDPULSE_SENDER_NAME
     else:
         from_email = settings.SENDPULSE_SYSTEM_EMAIL
-        from_name = settings.SENDPULSE_SYSTEM_NAME
+        from_name  = settings.SENDPULSE_SYSTEM_NAME
+
+    # -------------------------------------------------------------------
+    # BASE64 ENCODING — SendPulse SMTP API requirement.
+    # The "html" field must be a Base64-encoded string.
+    # Encoding happens here, at the delivery boundary, so that all callers
+    # (templates, service, tasks) can work with raw HTML strings throughout
+    # the rest of the pipeline without any encoding awareness.
+    # -------------------------------------------------------------------
+    html_b64: str = base64.b64encode(html_content.encode("utf-8")).decode("ascii")
 
     payload: dict[str, Any] = {
         "email": {
-            "html": html_content,
-            "text": "Please view this email in an HTML-compatible email client.",
+            "html":    html_b64,
+            "text":    "Please view this email in an HTML-compatible email client.",
             "subject": subject,
             "from": {
-                "name": from_name,
+                "name":  from_name,
                 "email": from_email,
             },
             "to": [
                 {
-                    "name": to_name or to_email,
+                    "name":  to_name or to_email,
                     "email": to_email,
                 }
             ],
@@ -147,7 +163,7 @@ async def send_sendpulse_email(
                     SENDPULSE_SMTP_URL,
                     headers={
                         "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
+                        "Content-Type":  "application/json",
                     },
                     json=payload,
                 )
@@ -158,7 +174,6 @@ async def send_sendpulse_email(
                         f"SendPulse: 401 on attempt {attempt + 1} for {to_email}. "
                         "Force-refreshing token and retrying."
                     )
-                    # Invalidate the cached token so the next call fetches fresh
                     try:
                         redis = await get_redis()
                         await redis.delete(_REDIS_TOKEN_KEY)

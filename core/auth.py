@@ -56,7 +56,7 @@ from uuid import UUID
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
@@ -423,6 +423,7 @@ async def register(
 @auth_router.post("/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
+    request: Request,                       # <-- ADD: needed to extract IP address
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -430,6 +431,10 @@ async def login(
 
     Returns access + refresh tokens. If the stored password hash uses
     outdated argon2 parameters, it is transparently rehashed on login.
+
+    After successful authentication, fires a fire-and-forget
+    security_new_login notification so the user receives an in-app
+    and email alert about the new sign-in. This never blocks the response.
     """
     from domains.teams.service import WorkspaceMember
     from domains.users.service import get_user_by_email
@@ -455,10 +460,68 @@ async def login(
     )
     workspace_id = result.scalar_one_or_none()
 
-    access = create_access_token(
-        user.id, user.email, user.tier, workspace_id, user.is_superadmin
-    )
+    access  = create_access_token(user.id, user.email, user.tier, workspace_id, user.is_superadmin)
     refresh = create_refresh_token(user.id)
+
+    # -----------------------------------------------------------------------
+    # FIRE-AND-FORGET: security_new_login notification
+    #
+    # Dispatches an in-app notification AND an email alert to the user
+    # informing them of the new sign-in. Uses asyncio.create_task() so
+    # it never adds latency to the login response.
+    #
+    # IP EXTRACTION: We extract the real client IP from X-Forwarded-For
+    # when running behind a reverse proxy (nginx, Cloudflare), falling
+    # back to the direct connection IP. This matches the ip_address field
+    # on AuditLog for correlation.
+    #
+    # UI CONSIDERATION:
+    #   The resulting in-app notification (kind="security_new_login") should
+    #   be displayed with a lock/shield icon. It is High priority — do NOT
+    #   hide it behind a collapsed "Other notifications" group. If the user
+    #   did not initiate this login, the action_url should direct them to
+    #   the password reset page.
+    # -----------------------------------------------------------------------
+    ip_address: str | None = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.headers.get("X-Real-IP")
+        or (request.client.host if request.client else None)
+    )
+
+    import asyncio as _asyncio
+    from domains.notifications.service import dispatch_event
+    from domains.notifications.templates import build_new_login_email
+    from core.config import settings as _settings
+
+    async def _fire_login_notification():
+        try:
+            subject, html = build_new_login_email(
+                name=user.full_name or user.email,
+                ip_address=ip_address,
+            )
+            await dispatch_event(
+                db=db,
+                user_id=user.id,
+                kind="security_new_login",
+                title="New sign-in to your Calyphant account",
+                body=f"A new sign-in was detected from IP {ip_address or 'unknown'}.",
+                action_url=f"{_settings.APP_BASE_URL}/auth/forgot-password",
+                workspace_id=workspace_id,
+                meta={"ip_address": ip_address},
+                email_subject=subject,
+                email_html=html,
+                # Pass pre-fetched user data to skip redundant DB queries
+                # inside dispatch_event (avoids a second get_user() call)
+                _user_email=user.email,
+                _user_name=user.full_name or user.email,
+            )
+        except Exception as exc:
+            # Notification failure must NEVER fail the login response
+            from loguru import logger
+            logger.warning(f"security_new_login notification failed (non-fatal): {exc}")
+
+    _asyncio.create_task(_fire_login_notification())
+
     return TokenResponse(access_token=access, refresh_token=refresh)
 
 
