@@ -75,6 +75,7 @@ from core.auth import CurrentUser
 from core.db import get_db, get_db_context
 from shared.types import Base
 from shared.pubsub import SignalEvent, ws_ingress_throttle
+from domains.notifications.rate_limit import enforce_redis_limit
 from domains.notifications.service import dispatch_workspace_event, NotificationKind
 
 
@@ -833,6 +834,20 @@ async def invite_member(
     if not workspace or not workspace.is_active:
         raise HTTPException(status_code=404, detail="Workspace not found.")
 
+    invite_limit = await enforce_redis_limit(
+        key=f"notifications:rl:workspace_invite:hour:{workspace_id}:{user.id}",
+        limit=settings.NOTIFICATIONS_WORKSPACE_INVITE_LIMIT_PER_HOUR,
+        window_seconds=3600,
+        fail_closed=True,
+        action="workspace_invite",
+    )
+    if not invite_limit.allowed:
+        status_code = 503 if invite_limit.reason == "redis_unavailable" else 429
+        raise HTTPException(
+            status_code=status_code,
+            detail="Workspace invites are temporarily unavailable. Please try again shortly.",
+        )
+
     invite = await create_invite(db, workspace_id, user.id, body.email, body.role)
 
     # Resolve inviter display name for the email
@@ -846,8 +861,8 @@ async def invite_member(
         pass
 
     # Build email from the template system (single source of HTML truth)
+    from domains.notifications.service import enqueue_email_notification
     from domains.notifications.templates import build_invite_email
-    from domains.notifications.tasks import send_async_email
 
     email_subject, email_html = build_invite_email(
         inviter_name=inviter_name,
@@ -863,15 +878,15 @@ async def invite_member(
     # UI NOTE: If this endpoint returns 201 but the invitee never receives an email,
     # it is a Celery/SendPulse delivery issue, not an invite creation failure.
     # The invite token is valid regardless — the invitee can accept via direct link.
-    send_async_email.apply_async(  # type: ignore[attr-defined]
-        kwargs={
-            "to_email": body.email,
-            "to_name": body.email,
-            "subject": email_subject,
-            "html_content": email_html,
-            "sender_type": "system",
-        },
-        queue="notifications",
+    await enqueue_email_notification(
+        to_email=body.email,
+        to_name=body.email,
+        subject=email_subject,
+        html_content=email_html,
+        sender_type="system",
+        notification_kind="team_invite_received",
+        idempotency_key=f"workspace_invite:{workspace_id}:{invite.token}",
+        fail_closed_on_redis_error=True,
     )
 
     return {

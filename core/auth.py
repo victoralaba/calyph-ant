@@ -65,6 +65,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.db import get_db, get_redis
+from domains.notifications.rate_limit import enforce_redis_limit
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,7 @@ class PasswordResetConfirm(BaseModel):
 )
 async def register(
     body: RegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -389,6 +391,25 @@ async def register(
     """
     from domains.teams.service import create_workspace
     from domains.users.service import User, get_user_by_email
+
+    client_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.headers.get("X-Real-IP")
+        or (request.client.host if request.client else "unknown")
+    )
+    register_limit = await enforce_redis_limit(
+        key=f"notifications:rl:register:hour:{client_ip}",
+        limit=settings.NOTIFICATIONS_REGISTER_LIMIT_PER_HOUR,
+        window_seconds=3600,
+        fail_closed=True,
+        action="register",
+    )
+    if not register_limit.allowed:
+        status_code = 503 if register_limit.reason == "redis_unavailable" else 429
+        raise HTTPException(
+            status_code=status_code,
+            detail="Registration temporarily unavailable. Please try again shortly.",
+        )
 
     existing = await get_user_by_email(db, body.email)
     if existing:
@@ -582,6 +603,7 @@ async def refresh_tokens(
 @auth_router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
 async def forgot_password(
     body: PasswordResetRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -592,6 +614,25 @@ async def forgot_password(
     the email is registered — prevents account enumeration.
     """
     from domains.users.service import get_user_by_email
+
+    client_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.headers.get("X-Real-IP")
+        or (request.client.host if request.client else "unknown")
+    )
+    reset_limit = await enforce_redis_limit(
+        key=f"notifications:rl:pwd_reset:hour:{client_ip}:{body.email.lower()}",
+        limit=settings.NOTIFICATIONS_PASSWORD_RESET_LIMIT_PER_HOUR,
+        window_seconds=3600,
+        fail_closed=True,
+        action="password_reset",
+    )
+    if not reset_limit.allowed:
+        status_code = 503 if reset_limit.reason == "redis_unavailable" else 429
+        raise HTTPException(
+            status_code=status_code,
+            detail="Password reset temporarily unavailable. Please try again shortly.",
+        )
 
     user = await get_user_by_email(db, body.email)
     if not user:

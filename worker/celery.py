@@ -86,6 +86,7 @@ celery_app.conf.update(
         "worker.celery.drain_slow_queries": {"queue": "maintenance"},
         "worker.celery.expire_invites": {"queue": "maintenance"},
         "worker.celery.cleanup_old_backups": {"queue": "maintenance"},
+        "worker.celery.archive_notifications_lifecycle": {"queue": "maintenance"},
         "worker.celery.sync_google_schema_cache": {"queue": "maintenance"},
         "worker.celery.garbage_collect_scratch_schemas": {"queue": "maintenance"},
         "worker.celery.reap_zombie_mutations": {"queue": "maintenance"}, # The Watchdog
@@ -127,6 +128,10 @@ celery_app.conf.beat_schedule = {
     "cleanup-old-backups": {
         "task": "worker.celery.cleanup_old_backups",
         "schedule": crontab(hour=3, minute=0),
+    },
+    "archive-notifications-lifecycle": {
+        "task": "worker.celery.archive_notifications_lifecycle",
+        "schedule": crontab(day_of_month=1, hour=3, minute=30),
     },
     "drain-slow-queries": {
         "task": "worker.celery.drain_slow_queries",
@@ -1163,6 +1168,34 @@ def garbage_collect_scratch_schemas():
                 logger.error(f"Garbage Collector failed: {e}")
 
     _run(_sweep())
+
+
+@celery_app.task(name="worker.celery.archive_notifications_lifecycle")
+def archive_notifications_lifecycle():
+    """
+    Monthly notification + audit lifecycle task:
+    1) archive JSONL+Gzip snapshots to R2
+    2) verify HTTP 200 + MD5 hash match
+    3) prune live DB rows by tier retention windows
+    """
+    async def _archive():
+        from core.db import _session_factory
+        from domains.notifications.lifecycle import run_monthly_archive_and_prune
+
+        if not _session_factory:
+            return
+
+        async with _session_factory() as db:
+            stats = await run_monthly_archive_and_prune(db)
+            logger.info(
+                "Notification lifecycle archive complete "
+                f"archived_notifications={stats.notifications_archived} "
+                f"archived_audit_logs={stats.audit_logs_archived} "
+                f"pruned_notifications={stats.notifications_pruned} "
+                f"pruned_audit_logs={stats.audit_logs_pruned}"
+            )
+
+    _run(_archive())
 
 
 @celery_app.task(name="worker.celery.execute_ephemeral_semantic_diff")
