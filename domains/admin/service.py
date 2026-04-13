@@ -373,7 +373,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 class TierOverrideRequest(BaseModel):
-    tier: str = Field(..., description="free | pro | team | enterprise")
+    tier: str = Field(..., description="explorer | builder | team | mega_team | enterprise")
 
 
 class BanRequest(BaseModel):

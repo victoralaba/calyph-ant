@@ -63,9 +63,6 @@ async def consume_quota_atomic(user_id: UUID, tier: str, requested_cost: int) ->
     limits = get_limits(tier)
     daily_limit: int = limits.get("ai_requests_per_day", 5)
     
-    if daily_limit == -1: # Unlimited Enterprise
-        return
-
     try:
         redis = await get_redis()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -119,16 +116,6 @@ async def _get_ai_quota_status(user_id: UUID, tier: str) -> dict[str, Any]:
 
     limits = get_limits(tier)
     daily_limit: int = limits.get("ai_requests_per_day", 5)
-
-    if daily_limit == -1:
-        return {
-            "tier": tier,
-            "daily_limit": -1,
-            "used_today": None,
-            "remaining": -1,
-            "unlimited": True,
-            "resets_at": None,
-        }
 
     used = 0
     try:
