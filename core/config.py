@@ -207,6 +207,9 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://localhost:4173",
     ]
+    # Optional for subdomain routing (e.g. https://*.calyphant.com).
+    # NOTE: Keep explicit origins for credentialed browser requests whenever possible.
+    CORS_ALLOW_ORIGIN_REGEX: str | None = None
     CORS_ALLOW_CREDENTIALS: bool = True
 
     # ------------------------------------------------------------------

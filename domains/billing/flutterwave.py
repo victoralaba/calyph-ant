@@ -89,69 +89,94 @@ def format_price(amount_minor: int, currency: str) -> str:
 # ---------------------------------------------------------------------------
 
 class Tier(str, Enum):
-    free = "free"
-    pro = "pro"
+    explorer = "explorer"
+    builder = "builder"
     team = "team"
+    mega_team = "mega_team"
     enterprise = "enterprise"
+
+LEGACY_TIER_ALIASES: dict[str, str] = {
+    "free": Tier.explorer,
+    "pro": Tier.builder,
+}
+
+
+def normalize_tier(tier: str) -> str:
+    return LEGACY_TIER_ALIASES.get(tier, tier)
 
 
 TIER_LIMITS: dict[str, dict[str, Any]] = {
-    Tier.free: {
+    Tier.explorer: {
         "connections": 2,
-        "backups": 3,
-        "backup_retention_days": 7,
+        "backups": 10,
+        "backup_retention_days": 14,
         "workspace_members": 1,
-        "saved_queries": 10,
-        "ai_requests_per_day": 5,
-        "streaming_rows": 10_000,
-        "query_timeout_seconds": 30,
+        "saved_queries": 25,
+        "ai_requests_per_day": 20,
+        "streaming_rows": 50_000,
+        "query_timeout_seconds": 60,
     },
-    Tier.pro: {
+    Tier.builder: {
         "connections": 10,
-        "backups": 50,
-        "backup_retention_days": 30,
-        "workspace_members": 5,
-        "saved_queries": 200,
-        "ai_requests_per_day": 100,
-        "streaming_rows": 500_000,
-        "query_timeout_seconds": 120,
+        "backups": 100,
+        "backup_retention_days": 60,
+        "workspace_members": 1,
+        "saved_queries": 500,
+        "ai_requests_per_day": 200,
+        "streaming_rows": 1_000_000,
+        "query_timeout_seconds": 180,
     },
     Tier.team: {
-        "connections": 50,
-        "backups": 500,
+        "connections": 30,
+        "backups": 300,
         "backup_retention_days": 90,
-        "workspace_members": 25,
-        "saved_queries": 1_000,
+        "workspace_members": 15,
+        "saved_queries": 1_500,
         "ai_requests_per_day": 500,
         "streaming_rows": 5_000_000,
         "query_timeout_seconds": 300,
     },
-    Tier.enterprise: {
-        "connections": -1,
-        "backups": -1,
-        "backup_retention_days": 365,
-        "workspace_members": -1,
-        "saved_queries": -1,
-        "ai_requests_per_day": -1,
-        "streaming_rows": -1,
+    Tier.mega_team: {
+        "connections": 100,
+        "backups": 1_500,
+        "backup_retention_days": 180,
+        "workspace_members": 50,
+        "saved_queries": 5_000,
+        "ai_requests_per_day": 1_500,
+        "streaming_rows": 20_000_000,
         "query_timeout_seconds": 600,
+    },
+    Tier.enterprise: {
+        "connections": 200,
+        "backups": 2_000,
+        "backup_retention_days": 365,
+        "workspace_members": 200,
+        "saved_queries": 20_000,
+        "ai_requests_per_day": 10_000,
+        "streaming_rows": 100_000_000,
+        "query_timeout_seconds": 1_200,
+        "contact_sales": True,
     },
 }
 
 # All prices in minor units (kobo for NGN, cents for USD)
 # 0 = not available / contact sales
 TIER_PRICES: dict[str, dict[str, int]] = {
-    Tier.free: {
+    Tier.explorer: {
         "NGN": 0,
         "USD": 0,
     },
-    Tier.pro: {
-        "NGN": 1_500_000,    # ₦15,000 / month
-        "USD": 1_000,        # $10.00  / month
+    Tier.builder: {
+        "NGN": 1_700_000,    # ₦17,000 / month
+        "USD": 1_200,        # $12.00  / month
     },
     Tier.team: {
         "NGN": 4_500_000,    # ₦45,000 / month
         "USD": 2_900,        # $29.00  / month
+    },
+    Tier.mega_team: {
+        "NGN": 12_000_000,   # ₦120,000 / month
+        "USD": 7_900,        # $79.00  / month
     },
     Tier.enterprise: {
         "NGN": 0,            # Custom — contact sales
@@ -160,22 +185,29 @@ TIER_PRICES: dict[str, dict[str, int]] = {
 }
 
 TIER_FEATURES: dict[str, list[str]] = {
-    Tier.free: ["basic_editor", "schema_viewer", "query_editor"],
-    Tier.pro: ["basic_editor", "schema_viewer", "query_editor", "ai_assist",
+    Tier.explorer: ["basic_editor", "schema_viewer", "query_editor", "extensions", "ai_assist_lite"],
+    Tier.builder: ["basic_editor", "schema_viewer", "query_editor", "ai_assist",
                "backups", "migrations", "extensions"],
     Tier.team: ["basic_editor", "schema_viewer", "query_editor", "ai_assist",
                 "backups", "migrations", "extensions", "team_collab",
-                "monitoring", "advanced_diff"],
-    Tier.enterprise: ["*"],
+                "monitoring", "advanced_diff", "shared_query_history", "basic_roles_permissions",
+                "workspace_subdomain"],
+    Tier.mega_team: ["basic_editor", "schema_viewer", "query_editor", "ai_assist",
+                     "backups", "migrations", "extensions", "team_collab", "monitoring", "advanced_diff",
+                     "priority_execution", "advanced_monitoring", "role_based_access", "audit_logs",
+                     "shared_ai_context", "workspace_subdomain"],
+    Tier.enterprise: ["dedicated_instance", "sla", "priority_support", "custom_integrations",
+                      "workspace_subdomain", "custom_domain", "advanced_compliance"],
 }
 
 
 def get_limits(tier: str) -> dict[str, Any]:
-    return TIER_LIMITS.get(tier, TIER_LIMITS[Tier.free])
+    t = normalize_tier(tier)
+    return TIER_LIMITS.get(t, TIER_LIMITS[Tier.explorer])
 
 
 def has_feature(tier: str, feature: str) -> bool:
-    features = TIER_FEATURES.get(tier, [])
+    features = TIER_FEATURES.get(normalize_tier(tier), [])
     return "*" in features or feature in features
 
 
@@ -197,7 +229,7 @@ def get_price(tier: str, currency: str) -> int:
         raise ValueError(
             f"Unsupported currency '{currency}'. Supported: {', '.join(SUPPORTED_CURRENCIES)}"
         )
-    return TIER_PRICES.get(tier, {}).get(currency, 0)
+    return TIER_PRICES.get(normalize_tier(tier), {}).get(currency, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +275,9 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
-    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, unique=True, index=True)
-    tier: Mapped[str] = mapped_column(String(30), nullable=False, default=Tier.free)
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
+    workspace_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True, index=True)
+    tier: Mapped[str] = mapped_column(String(30), nullable=False, default=Tier.explorer)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
 
     # Currency the user is billed in — locked after first payment
@@ -271,6 +304,7 @@ class PaymentRecord(Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
+    workspace_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True, index=True)
     fw_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     # Stored in minor units (kobo / cents)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -312,6 +346,7 @@ async def initiate_payment(
     tier: str,
     currency: str,
     redirect_url: str,
+    workspace_id: UUID | None = None,
 ) -> dict[str, Any]:
     """
     Create a Flutterwave payment link for a tier upgrade.
@@ -321,6 +356,7 @@ async def initiate_payment(
     Flutterwave receives full units (not minor units) in its payload.
     """
     currency = currency.upper()
+    tier = normalize_tier(tier)
     amount_minor = get_price(tier, currency)
 
     if amount_minor == 0:
@@ -348,6 +384,7 @@ async def initiate_payment(
         },
         "meta": {
             "user_id": str(user_id),
+            "workspace_id": str(workspace_id) if workspace_id else None,
             "tier": tier,
             "currency": currency,
         },
@@ -387,6 +424,7 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
 
         meta = data.get("meta", {})
         user_id_str = meta.get("user_id")
+        workspace_id_str = meta.get("workspace_id")
         tier = meta.get("tier")
         currency = meta.get("currency", "USD").upper()
 
@@ -395,6 +433,8 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
             return
 
         user_id = UUID(user_id_str)
+        workspace_id = UUID(workspace_id_str) if workspace_id_str else None
+        tier = normalize_tier(tier)
         tx_id = str(data.get("id"))
 
         # FW sends full units — convert back to minor units for storage
@@ -403,6 +443,7 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
 
         payment = PaymentRecord(
             user_id=user_id,
+            workspace_id=workspace_id,
             fw_transaction_id=tx_id,
             amount=amount_minor,
             currency=currency,
@@ -413,7 +454,10 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
         db.add(payment)
 
         result = await db.execute(
-            select(Subscription).where(Subscription.user_id == user_id)
+            select(Subscription).where(
+                Subscription.user_id == user_id,
+                Subscription.workspace_id == workspace_id,
+            )
         )
         sub = result.scalar_one_or_none()
         if sub:
@@ -424,6 +468,7 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
         else:
             sub = Subscription(
                 user_id=user_id,
+                workspace_id=workspace_id,
                 tier=tier,
                 status="active",
                 fw_transaction_id=tx_id,
@@ -432,9 +477,30 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
             db.add(sub)
 
         from domains.users.service import User
+        from domains.teams.service import Workspace
         user = await db.get(User, user_id)
         if user:
             user.tier = tier
+        if workspace_id:
+            workspace = await db.get(Workspace, workspace_id)
+            if workspace:
+                workspace.billing_tier = tier
+                if tier in (Tier.team, Tier.mega_team, Tier.enterprise) and not workspace.subdomain:
+                    base = (workspace.slug.split("-")[0] or "workspace")[:63]
+                    candidate = base
+                    n = 1
+                    while True:
+                        existing = await db.execute(
+                            select(Workspace.id).where(
+                                Workspace.subdomain == candidate,
+                                Workspace.id != workspace.id,
+                            ).limit(1)
+                        )
+                        if existing.scalar_one_or_none() is None:
+                            workspace.subdomain = candidate
+                            break
+                        n += 1
+                        candidate = f"{base}-{n}"
 
         await db.commit()
         logger.info(
@@ -494,12 +560,12 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
             if sub:
                 sub.status = "cancelled"
                 sub.cancelled_at = datetime.now(timezone.utc)
-                sub.tier = Tier.free
+                sub.tier = Tier.explorer
 
                 from domains.users.service import User
                 user = await db.get(User, user_id)
                 if user:
-                    user.tier = Tier.free
+                    user.tier = Tier.explorer
 
                 await db.commit()
                 logger.info(f"Subscription cancelled: user={user_id}")
@@ -513,9 +579,13 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 
 
 class CheckoutRequest(BaseModel):
-    tier: str = Field(..., description="Target tier: pro | team | enterprise")
+    tier: str = Field(..., description="Target tier: builder | team | mega_team")
     currency: str = Field("USD", description="Payment currency: NGN or USD")
     redirect_url: str = Field(..., description="URL to redirect after payment")
+    workspace_id: UUID | None = Field(
+        default=None,
+        description="Workspace receiving the subscription upgrade.",
+    )
 
     @field_validator("currency")
     @classmethod
@@ -526,6 +596,24 @@ class CheckoutRequest(BaseModel):
                 f"Currency must be one of: {', '.join(SUPPORTED_CURRENCIES)}"
             )
         return v
+
+    @field_validator("tier")
+    @classmethod
+    def tier_must_be_known(cls, v: str) -> str:
+        normalized = normalize_tier(v)
+        if normalized not in TIER_LIMITS:
+            raise ValueError("Unknown tier.")
+        return normalized
+
+
+@router.get("/contact-sales")
+async def contact_sales_info():
+    return {
+        "tier": Tier.enterprise,
+        "checkout_enabled": False,
+        "message": "Enterprise is customized. Contact sales to negotiate limits and pricing.",
+        "email": "sales@calyphant.com",
+    }
 
 
 @router.get("/plans")
@@ -552,7 +640,7 @@ async def list_plans():
                 "limits": TIER_LIMITS.get(tier, {}),
                 "features": TIER_FEATURES.get(tier, []),
             }
-            for tier in [Tier.free, Tier.pro, Tier.team, Tier.enterprise]
+            for tier in [Tier.explorer, Tier.builder, Tier.team, Tier.mega_team, Tier.enterprise]
         ],
     }
 
@@ -563,18 +651,23 @@ async def get_subscription(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Subscription).where(Subscription.user_id == user.id)
+        select(Subscription)
+        .where(Subscription.user_id == user.id, Subscription.workspace_id == user.workspace_id)
+        .order_by(Subscription.created_at.desc())
+        .limit(1)
     )
     sub = result.scalar_one_or_none()
     if not sub:
         return {
-            "tier": Tier.free,
+            "tier": Tier.explorer,
+            "workspace_id": str(user.workspace_id) if user.workspace_id else None,
             "status": "active",
             "billing_currency": None,
             "subscription": None,
         }
     return {
         "tier": sub.tier,
+        "workspace_id": str(sub.workspace_id) if sub.workspace_id else None,
         "status": sub.status,
         "billing_currency": sub.billing_currency,
         "current_period_end": (
@@ -594,8 +687,11 @@ async def checkout(
     Initiate a Flutterwave payment.
     User explicitly chooses NGN or USD — price is resolved server-side.
     """
-    if body.tier not in (Tier.pro, Tier.team, Tier.enterprise):
+    if body.tier not in (Tier.builder, Tier.team, Tier.mega_team):
         raise HTTPException(status_code=400, detail="Invalid tier.")
+    workspace_id = body.workspace_id or user.workspace_id
+    if body.tier in (Tier.team, Tier.mega_team) and not workspace_id:
+        raise HTTPException(status_code=400, detail="Workspace ID is required for team plans.")
     try:
         return await initiate_payment(
             user_id=user.id,
@@ -603,6 +699,7 @@ async def checkout(
             tier=body.tier,
             currency=body.currency,
             redirect_url=body.redirect_url,
+            workspace_id=workspace_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -633,7 +730,12 @@ async def get_usage_limits(
 ):
     from domains.users.service import get_user
     db_user = await get_user(db, user.id)
-    tier = db_user.tier if db_user else Tier.free
+    tier = db_user.tier if db_user else Tier.explorer
+    if user.workspace_id:
+        from domains.teams.service import Workspace
+        ws = await db.get(Workspace, user.workspace_id)
+        if ws and ws.billing_tier:
+            tier = ws.billing_tier
     return {
         "tier": tier,
         "limits": get_limits(tier),

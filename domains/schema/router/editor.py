@@ -128,8 +128,8 @@ def get_dynamic_diff_limit(request: Request) -> str:
     Zero-latency: Relies purely on the auth token, skipping DB lookups.
     
     Expected JWT Payload Requirement:
-    The auth service MUST inject {"tier": "free" | "pro" | "enterprise"} 
-    into the JWT during login. If missing, it defaults to free.
+    The auth service injects a billing tier (legacy aliases normalized).
+    into the JWT during login. If missing, it defaults to explorer.
     """
     try:
         auth_header = request.headers.get("Authorization", "")
@@ -146,11 +146,12 @@ def get_dynamic_diff_limit(request: Request) -> str:
                 algorithms=[settings.JWT_ALGORITHM], 
                 options={"verify_exp": False, "verify_signature": False}
             )
-            tier = payload.get("tier", "free")
-            
-            if tier == "enterprise":
+            from domains.billing.flutterwave import normalize_tier
+            tier = normalize_tier(payload.get("tier", "explorer"))
+
+            if tier in ("mega_team", "enterprise"):
                 return "60/minute"  # 1 per second (CI/CD friendly)
-            elif tier == "pro":
+            elif tier in ("builder", "team"):
                 return "20/minute"  # 1 every 3 seconds
     except Exception:
         pass
@@ -1572,13 +1573,14 @@ async def request_schema_diff(
 
     # 1. Determine Tier Timeouts & Isolate Resources
     db_user = await get_user(db, user.id)
-    tier = db_user.tier if db_user else "free"
-    tier_timeout_ms = 300000 if tier == "enterprise" else (60000 if tier == "pro" else 15000)
+    from domains.billing.flutterwave import get_limits, normalize_tier
+    tier = normalize_tier(db_user.tier if db_user else "explorer")
+    tier_timeout_ms = int(get_limits(tier).get("query_timeout_seconds", 60) * 1000)
     
     # ISOLATION LAYER: Force Enterprise users into a dedicated queue lane. 
     # This ensures a heavy enterprise user doing 50 massive diffs via CI/CD 
     # cannot starve out the standard worker pool handling Free/Pro users.
-    target_queue = "enterprise_diffs" if tier == "enterprise" else "default"
+    target_queue = "enterprise_diffs" if tier in ("mega_team", "enterprise") else "default"
 
     # 2. Establish State Machine in Redis
     job_id = str(uuid.uuid4())

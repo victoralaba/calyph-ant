@@ -65,7 +65,7 @@ from fastapi import (
 from loguru import logger
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Boolean, Text
-from sqlalchemy import select, delete, update
+from sqlalchemy import select, delete, update, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
@@ -112,6 +112,8 @@ class Workspace(Base):
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    subdomain: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
+    billing_tier: Mapped[str] = mapped_column(String(30), nullable=False, default="explorer")
     created_by: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -235,6 +237,54 @@ async def create_workspace(
     return workspace
 
 
+def _sanitize_subdomain(name: str) -> str:
+    import re
+    label = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
+    label = re.sub(r"-{2,}", "-", label)
+    return (label or "workspace")[:63]
+
+
+async def _allocate_subdomain(db: AsyncSession, workspace: Workspace) -> str:
+    base = _sanitize_subdomain(workspace.name)
+    candidate = base
+    n = 1
+    while True:
+        existing = await db.execute(
+            select(Workspace.id).where(
+                Workspace.subdomain == candidate,
+                Workspace.id != workspace.id,
+            ).limit(1)
+        )
+        if existing.scalar_one_or_none() is None:
+            workspace.subdomain = candidate
+            return candidate
+        n += 1
+        candidate = f"{base}-{n}"
+
+
+async def _enforce_workspace_member_limit(
+    db: AsyncSession,
+    workspace_id: UUID,
+    incoming_delta: int = 1,
+) -> None:
+    from domains.billing.flutterwave import get_limits
+
+    ws = await db.get(Workspace, workspace_id)
+    if not ws:
+        raise ValueError("Workspace not found.")
+
+    limits = get_limits(ws.billing_tier)
+    max_members = int(limits.get("workspace_members", 1))
+    member_count = await db.scalar(
+        select(func.count(WorkspaceMember.id)).where(WorkspaceMember.workspace_id == workspace_id)
+    ) or 0
+    if member_count + incoming_delta > max_members:
+        raise ValueError(
+            f"Workspace member limit reached ({member_count}/{max_members}). "
+            "Upgrade workspace tier to add more members."
+        )
+
+
 async def soft_delete_workspace(
     db: AsyncSession,
     workspace_id: UUID,
@@ -263,6 +313,8 @@ async def get_user_workspaces(db: AsyncSession, user_id: UUID) -> list[dict]:
             "id": str(ws.id),
             "name": ws.name,
             "slug": ws.slug,
+            "subdomain": ws.subdomain,
+            "billing_tier": ws.billing_tier,
             "role": role,
             "created_at": ws.created_at.isoformat(),
         }
@@ -305,6 +357,7 @@ async def create_invite(
     email: str,
     role: WorkspaceRole,
 ) -> WorkspaceInvite:
+    await _enforce_workspace_member_limit(db, workspace_id, incoming_delta=1)
     token = secrets.token_urlsafe(32)
     invite = WorkspaceInvite(
         workspace_id=workspace_id,
@@ -344,6 +397,7 @@ async def accept_invite(
     existing = await get_member_role(db, invite.workspace_id, user_id)
     if existing:
         raise ValueError("You are already a member of this workspace.")
+    await _enforce_workspace_member_limit(db, invite.workspace_id, incoming_delta=1)
 
     member = WorkspaceMember(
         workspace_id=invite.workspace_id,
@@ -393,6 +447,39 @@ async def remove_member(
     # 2. Check if a row was actually returned (meaning it was deleted)
     deleted_member = result.first() 
     return deleted_member is not None
+
+
+async def transfer_workspace_ownership(
+    db: AsyncSession,
+    workspace_id: UUID,
+    current_owner_id: UUID,
+    target_user_id: UUID,
+) -> bool:
+    current_owner = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_owner_id,
+            WorkspaceMember.role == WorkspaceRole.owner,
+        ).limit(1)
+    )
+    owner_row = current_owner.scalar_one_or_none()
+    if not owner_row:
+        raise ValueError("Only a current workspace owner can transfer ownership.")
+
+    target = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == target_user_id,
+        ).limit(1)
+    )
+    target_row = target.scalar_one_or_none()
+    if not target_row:
+        raise ValueError("Target user must already be a workspace member.")
+
+    owner_row.role = WorkspaceRole.admin
+    target_row.role = WorkspaceRole.owner
+    await db.commit()
+    return True
 
 
 async def leave_workspace(
@@ -750,6 +837,14 @@ class CreateShareLinkRequest(BaseModel):
     max_uses: int | None = Field(default=None, ge=1, le=100000)
 
 
+class TransferOwnershipRequest(BaseModel):
+    target_user_id: UUID
+
+
+class UpdateSubdomainRequest(BaseModel):
+    subdomain: str = Field(..., min_length=3, max_length=63)
+
+
 async def _require_role(
     db: AsyncSession,
     workspace_id: UUID,
@@ -780,7 +875,57 @@ async def create_workspace_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     ws = await create_workspace(db, body.name, user.id)
-    return {"id": str(ws.id), "name": ws.name, "slug": ws.slug}
+    return {
+        "id": str(ws.id),
+        "name": ws.name,
+        "slug": ws.slug,
+        "subdomain": ws.subdomain,
+        "billing_tier": ws.billing_tier,
+    }
+
+
+@router.get("/workspaces/{workspace_id}/resolve")
+async def resolve_workspace_subdomain(
+    workspace_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_role(db, workspace_id, user.id, WorkspaceRole.viewer)
+    ws = await db.get(Workspace, workspace_id)
+    if not ws or not ws.is_active:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    if not ws.subdomain:
+        await _allocate_subdomain(db, ws)
+        await db.commit()
+    base = settings.APP_BASE_URL.replace("https://", "").replace("http://", "")
+    return {
+        "workspace_id": str(ws.id),
+        "subdomain": ws.subdomain,
+        "redirect_url": f"https://{ws.subdomain}.{base}",
+    }
+
+
+@router.patch("/workspaces/{workspace_id}/subdomain")
+async def update_workspace_subdomain(
+    workspace_id: UUID,
+    body: UpdateSubdomainRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_role(db, workspace_id, user.id, WorkspaceRole.owner)
+    ws = await db.get(Workspace, workspace_id)
+    if not ws or not ws.is_active:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    if ws.billing_tier not in ("team", "mega_team", "enterprise"):
+        raise HTTPException(status_code=403, detail="Subdomains are available on Team tier and above.")
+
+    ws.subdomain = _sanitize_subdomain(body.subdomain)
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"Subdomain unavailable: {exc}")
+    return {"updated": True, "subdomain": ws.subdomain}
 
 
 @router.delete("/workspaces/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -979,6 +1124,25 @@ async def remove_workspace_member(
             entity_id=str(target_user_id)
         )
     ))
+
+
+@router.post("/workspaces/{workspace_id}/transfer-ownership")
+async def transfer_workspace_owner(
+    workspace_id: UUID,
+    body: TransferOwnershipRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        await transfer_workspace_ownership(
+            db=db,
+            workspace_id=workspace_id,
+            current_owner_id=user.id,
+            target_user_id=body.target_user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"transferred": True, "workspace_id": str(workspace_id), "new_owner": str(body.target_user_id)}
 
 
 @router.delete(

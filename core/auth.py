@@ -134,6 +134,30 @@ def create_refresh_token(user_id: UUID) -> str:
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+async def resolve_token_tier(
+    db: AsyncSession,
+    user_tier: str,
+    workspace_id: UUID | None,
+) -> str:
+    """
+    Resolve effective tier for JWT claims.
+
+    Workspace tier takes precedence when available so all workspace-scoped
+    limits/features resolve consistently across services that rely on token tier.
+    """
+    from domains.billing.flutterwave import normalize_tier
+
+    if workspace_id:
+        try:
+            from domains.teams.service import Workspace
+            ws = await db.get(Workspace, workspace_id)
+            if ws and ws.billing_tier:
+                return normalize_tier(ws.billing_tier)
+        except Exception:
+            pass
+    return normalize_tier(user_tier)
+
+
 def decode_token(token: str) -> dict[str, Any]:
     """
     Decode and validate a JWT.
@@ -434,8 +458,9 @@ async def register(
     from domains.notifications.service import send_welcome_email
     asyncio.create_task(send_welcome_email(user.email, user.full_name or ""))
 
+    token_tier = await resolve_token_tier(db, user.tier, workspace.id)
     access = create_access_token(
-        user.id, user.email, user.tier, workspace.id, user.is_superadmin
+        user.id, user.email, token_tier, workspace.id, user.is_superadmin
     )
     refresh = create_refresh_token(user.id)
     return TokenResponse(access_token=access, refresh_token=refresh)
@@ -481,7 +506,8 @@ async def login(
     )
     workspace_id = result.scalar_one_or_none()
 
-    access  = create_access_token(user.id, user.email, user.tier, workspace_id, user.is_superadmin)
+    token_tier = await resolve_token_tier(db, user.tier, workspace_id)
+    access  = create_access_token(user.id, user.email, token_tier, workspace_id, user.is_superadmin)
     refresh = create_refresh_token(user.id)
 
     # -----------------------------------------------------------------------
@@ -593,8 +619,9 @@ async def refresh_tokens(
         )
         workspace_id = result.scalar_one_or_none()
 
+    token_tier = await resolve_token_tier(db, user.tier, workspace_id)
     access = create_access_token(
-        user.id, user.email, user.tier, workspace_id, user.is_superadmin
+        user.id, user.email, token_tier, workspace_id, user.is_superadmin
     )
     new_refresh = create_refresh_token(user.id)
     return TokenResponse(access_token=access, refresh_token=new_refresh)

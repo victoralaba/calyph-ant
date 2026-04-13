@@ -66,7 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.db import get_db, get_connection_url
-from domains.billing.flutterwave import TIER_LIMITS
+from domains.billing.flutterwave import TIER_LIMITS, normalize_tier
 from domains.query import service
 from domains.query.service import DEFAULT_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT
 from domains.users.service import User
@@ -150,7 +150,8 @@ async def resolve_compute_profile(
     if db_user.is_flagged:
         return ComputeProfile(timeout_seconds=5.0, max_rows=100, is_flagged=True)
 
-    tier_physics = TIER_LIMITS.get(db_user.tier, TIER_LIMITS["free"])
+    tier_key = normalize_tier(db_user.tier)
+    tier_physics = TIER_LIMITS.get(tier_key, TIER_LIMITS["explorer"])
     
     # LEVEL 2: Enterprise Overrides OR LEVEL 3: Tier Defaults
     timeout = float(
