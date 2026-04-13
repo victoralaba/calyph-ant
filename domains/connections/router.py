@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import CurrentUser
 from core.db import get_db, encrypt_secret, decrypt_secret, get_db_context, get_redis
+from domains.billing.flutterwave import normalize_tier
 from domains.connections.models import CloudProvider, Connection, ConnectionStatus
 from domains.connections import service
 from shared.types import (
@@ -194,7 +195,7 @@ async def create_connection(
     Fails if the connection test fails.
     """
     # DEFENSE: Lock 24/7 background cron behind premium tier
-    if body.keep_alive_enabled and user.tier == "free":
+    if body.keep_alive_enabled and normalize_tier(user.tier) == "explorer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Background Keep-Alive (24/7) is a premium feature. Free tier databases are kept awake automatically while the Calyphant tab is open."
@@ -218,14 +219,17 @@ async def create_connection(
 
     # 2. DB WRITE: Open short-lived session to save
     async with get_db_context() as db:
-        conn = await service.create_connection(
-            db=db,
-            workspace_id=workspace_id,
-            user_id=user.id,
-            data=create_data,
-            encrypted_url=encrypted_url,
-            test_result=result,
-        )
+        try:
+            conn = await service.create_connection(
+                db=db,
+                workspace_id=workspace_id,
+                user_id=user.id,
+                data=create_data,
+                encrypted_url=encrypted_url,
+                test_result=result,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
         return ConnectionResponse.from_orm_model(conn)
 
 
@@ -271,7 +275,7 @@ async def update_connection(
     Update connection metadata or keep-alive settings.
     """
     # DEFENSE: Lock 24/7 background cron behind premium tier
-    if body.keep_alive_enabled is True and user.tier == "free":
+    if body.keep_alive_enabled is True and normalize_tier(user.tier) == "explorer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Background Keep-Alive (24/7) is a premium feature. Upgrade to enable."

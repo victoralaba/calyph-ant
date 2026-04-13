@@ -182,7 +182,9 @@ async def _prune_archived_window(
     pro_cutoff = now - timedelta(days=90)
     team_cutoff = now - timedelta(days=365)
 
-    tiers_enterprise = ("team", "enterprise")
+    explorer_tiers = ("explorer", "free")
+    builder_tiers = ("builder", "pro")
+    team_plus_tiers = ("team", "mega_team", "enterprise")
 
     notif_deleted = 0
     audit_deleted = 0
@@ -190,7 +192,7 @@ async def _prune_archived_window(
     notif_free = await db.execute(
         delete(Notification)
         .where(Notification.user_id == User.id)
-        .where(User.tier == "free")
+        .where(User.tier.in_(explorer_tiers))
         .where(Notification.created_at < free_cutoff)
         .where(Notification.created_at <= archive_until)
     )
@@ -199,7 +201,7 @@ async def _prune_archived_window(
     notif_pro = await db.execute(
         delete(Notification)
         .where(Notification.user_id == User.id)
-        .where(User.tier == "pro")
+        .where(User.tier.in_(builder_tiers))
         .where(Notification.created_at < pro_cutoff)
         .where(Notification.created_at <= archive_until)
     )
@@ -208,7 +210,7 @@ async def _prune_archived_window(
     notif_team = await db.execute(
         delete(Notification)
         .where(Notification.user_id == User.id)
-        .where(User.tier.in_(tiers_enterprise))
+        .where(User.tier.in_(team_plus_tiers))
         .where(Notification.created_at < team_cutoff)
         .where(Notification.created_at <= archive_until)
     )
@@ -217,7 +219,7 @@ async def _prune_archived_window(
     audit_free = await db.execute(
         delete(AuditLog)
         .where(AuditLog.user_id == User.id)
-        .where(User.tier == "free")
+        .where(User.tier.in_(explorer_tiers))
         .where(AuditLog.created_at < free_cutoff)
         .where(AuditLog.created_at <= archive_until)
     )
@@ -226,7 +228,7 @@ async def _prune_archived_window(
     audit_pro = await db.execute(
         delete(AuditLog)
         .where(AuditLog.user_id == User.id)
-        .where(User.tier == "pro")
+        .where(User.tier.in_(builder_tiers))
         .where(AuditLog.created_at < pro_cutoff)
         .where(AuditLog.created_at <= archive_until)
     )
@@ -235,7 +237,7 @@ async def _prune_archived_window(
     audit_team = await db.execute(
         delete(AuditLog)
         .where(AuditLog.user_id == User.id)
-        .where(User.tier.in_(tiers_enterprise))
+        .where(User.tier.in_(team_plus_tiers))
         .where(AuditLog.created_at < team_cutoff)
         .where(AuditLog.created_at <= archive_until)
     )

@@ -625,11 +625,35 @@ async def create_connection(
     Persist a new connection after a successful test.
     The caller is responsible for encrypting the URL before passing it.
     """
+    slug = _slugify(data.name)
+
+    # Workspace-level identity guard:
+    # 1) names/slugs must be unique among active connections in the same workspace
+    # 2) physical endpoint tuple (host, port, database) must be unique in the same workspace
+    existing = await db.execute(
+        select(Connection).where(
+            Connection.workspace_id == workspace_id,
+            Connection.is_active == True,  # noqa: E712
+            (
+                (Connection.slug == slug)
+                | (
+                    (Connection.host == test_result.host)
+                    & (Connection.port == test_result.port)
+                    & (Connection.database == test_result.database)
+                )
+            ),
+        ).limit(1)
+    )
+    if existing.scalar_one_or_none():
+        raise ValueError(
+            "A connection with the same name or database endpoint already exists in this workspace."
+        )
+
     conn = Connection(
         workspace_id=workspace_id,
         created_by=user_id,
         name=data.name,
-        slug=_slugify(data.name),
+        slug=slug,
         encrypted_url=encrypted_url,
         host=test_result.host,
         port=test_result.port,

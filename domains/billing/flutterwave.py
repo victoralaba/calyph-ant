@@ -214,8 +214,6 @@ def has_feature(tier: str, feature: str) -> bool:
 def check_limit(tier: str, resource: str, current_count: int) -> bool:
     limits = get_limits(tier)
     limit = limits.get(resource, 0)
-    if limit == -1:
-        return True
     return current_count < limit
 
 
@@ -566,6 +564,12 @@ async def handle_webhook_event(db: AsyncSession, event: dict[str, Any]) -> None:
                 user = await db.get(User, user_id)
                 if user:
                     user.tier = Tier.explorer
+                if sub.workspace_id:
+                    from domains.teams.service import Workspace
+
+                    ws = await db.get(Workspace, sub.workspace_id)
+                    if ws:
+                        ws.billing_tier = Tier.explorer
 
                 await db.commit()
                 logger.info(f"Subscription cancelled: user={user_id}")
@@ -692,6 +696,21 @@ async def checkout(
     workspace_id = body.workspace_id or user.workspace_id
     if body.tier in (Tier.team, Tier.mega_team) and not workspace_id:
         raise HTTPException(status_code=400, detail="Workspace ID is required for team plans.")
+    if body.tier in (Tier.team, Tier.mega_team):
+        from domains.teams.service import WorkspaceMember, WorkspaceRole
+
+        membership = await db.execute(
+            select(WorkspaceMember.role).where(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == user.id,
+            ).limit(1)
+        )
+        actor_role = membership.scalar_one_or_none()
+        if actor_role not in (WorkspaceRole.owner, WorkspaceRole.admin):
+            raise HTTPException(
+                status_code=403,
+                detail="Only workspace owners/admins can upgrade a workspace to team plans.",
+            )
     try:
         return await initiate_payment(
             user_id=user.id,
