@@ -283,9 +283,12 @@ async def update_connection(
 
     update_data = ConnectionUpdateRequest(**body.model_dump(exclude_unset=True))
     
-    conn = await service.update_connection(
-        db, connection_id, workspace_id, update_data
-    )
+    try:
+        conn = await service.update_connection(
+            db, connection_id, workspace_id, update_data
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")

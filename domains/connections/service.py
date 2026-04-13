@@ -635,7 +635,8 @@ async def create_connection(
             Connection.workspace_id == workspace_id,
             Connection.is_active == True,  # noqa: E712
             (
-                (Connection.slug == slug)
+                (Connection.name == data.name)
+                | (Connection.slug == slug)
                 | (
                     (Connection.host == test_result.host)
                     & (Connection.port == test_result.port)
@@ -721,6 +722,21 @@ async def update_connection(
     conn = await get_connection(db, connection_id, workspace_id)
     if not conn:
         return None
+
+    # Check for name conflicts if name is being updated
+    if data.name is not None and data.name != conn.name:
+        existing = await db.execute(
+            select(Connection).where(
+                Connection.workspace_id == workspace_id,
+                Connection.is_active == True,  # noqa: E712
+                Connection.id != connection_id,  # Exclude self
+                Connection.name == data.name,
+            ).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            raise ValueError(
+                "A connection with the same name already exists in this workspace."
+            )
 
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(conn, field, value)
