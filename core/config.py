@@ -24,6 +24,7 @@ Load order:
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -253,6 +254,10 @@ class Settings(BaseSettings):
         and must not be transmitted in plaintext over the network.
         """
         if self.APP_ENV != "production":
+            return self
+
+        # CORE FIX: Explicitly intercept the OS environment variable
+        if os.getenv("SKIP_REDIS_TLS_CHECK", "false").lower() == "true":
             return self
 
         for attr, label in [
