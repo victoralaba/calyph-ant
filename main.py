@@ -119,8 +119,6 @@ def create_app() -> FastAPI:
     # ---------------------------------------------------------------------------
 
     from core.auth import auth_router
-    app.include_router(auth_router)
-
     from domains.connections.router import router as connections_router
     from domains.schema.router.editor import router as schema_editor_router
     from domains.schema.router.intelligence import router as schema_intel_router
@@ -139,6 +137,8 @@ def create_app() -> FastAPI:
 
     prefix = "/api/v1"
 
+    # Apply the prefix consistently to all core domain routes
+    app.include_router(auth_router, prefix=prefix)
     app.include_router(connections_router, prefix=prefix)
     app.include_router(schema_editor_router, prefix=prefix)
     app.include_router(schema_intel_router, prefix=prefix)
