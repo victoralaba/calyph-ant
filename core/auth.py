@@ -448,6 +448,25 @@ async def register(
 
     existing = await get_user_by_email(db, body.email)
     if existing:
+        if not existing.is_verified:
+            # --- THE FINAL FIX: Squatter Neutralization ---
+            # Overwrite the squatter's password and profile with the data 
+            # from the legitimate user who is currently attempting to register.
+            existing.password_hash = hash_password(body.password)
+            existing.full_name = body.full_name
+            await db.commit()
+            
+            # Generate a fresh token for the stranded user
+            redis = await get_redis()
+            token = secrets.token_urlsafe(32)
+            await redis.setex(f"email_verify:{token}", 86400, str(existing.id))
+            
+            import asyncio
+            from domains.notifications.service import send_verification_email
+            asyncio.create_task(send_verification_email(
+                existing.email, existing.full_name or "", token
+            ))
+
         # UI BEHAVIOR: 
         # Do not leak whether the email exists for security reasons.
         # Just return a generic success message so the UI tells them to check their email.
@@ -499,7 +518,7 @@ async def verify_email(
 ):
     """
     Confirms email ownership, marks user as verified, creates their workspace, 
-    and returns JWT access and refresh tokens.
+    dispatches the welcome email, and returns JWT access and refresh tokens.
     """
     from domains.teams.service import create_workspace
     from domains.users.service import get_user
@@ -536,6 +555,12 @@ async def verify_email(
 
     # 3. Burn the token so it cannot be reused
     await redis.delete(f"email_verify:{body.token}")
+    
+    # --- FIX: The Missing Welcome Email ---
+    # 3.5 Dispatch the welcome email now that they are officially verified
+    import asyncio
+    from domains.notifications.service import send_welcome_email
+    asyncio.create_task(send_welcome_email(user.email, user.full_name or ""))
 
     # 4. Generate JWTs
     token_tier = await resolve_token_tier(db, user.tier, workspace.id)
@@ -561,7 +586,6 @@ async def resend_verification(
 ):
     """Resend a new verification email if the previous one expired."""
     from domains.users.service import get_user_by_email
-    from datetime import datetime, timezone
 
     client_ip = (
         request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -569,10 +593,11 @@ async def resend_verification(
         or (request.client.host if request.client else "unknown")
     )
     
-    # Strictly limit this to prevent email bombing
+    # --- FIX: Replaced Hardcoded Limits ---
+    # Strictly limit this to prevent email bombing, referencing core.config
     resend_limit = await enforce_redis_limit(
         key=f"notifications:rl:resend_verify:hour:{client_ip}:{body.email.lower()}",
-        limit=3, # Max 3 resends per hour per email
+        limit=settings.NOTIFICATIONS_RESEND_VERIFY_LIMIT_PER_HOUR,
         window_seconds=3600,
         fail_closed=True,
         action="resend_verification",
@@ -589,15 +614,9 @@ async def resend_verification(
     
     if not user or user.is_verified:
         # UI BEHAVIOR: Do not leak state. 
-        # The UI should show a standard success toast regardless of actual DB state.
+        # The UI should show "If the email is unverified, a new link has been sent"
+        # and start a ~60 second countdown timer before allowing another click.
         return {"message": "If the email is unverified, a new link has been sent."}
-
-    # --- THE FIX: Reset the squatter clock ---
-    # We update the timestamp so the Celery Watchdog gives them another 24 hours
-    # from the moment they request a new token.
-    user.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-    # -----------------------------------------
 
     redis = await get_redis()
     token = secrets.token_urlsafe(32)

@@ -236,6 +236,7 @@ class Settings(BaseSettings):
     # High-risk action limits (fail-closed when Redis is unavailable)
     NOTIFICATIONS_REGISTER_LIMIT_PER_HOUR: int = 10
     NOTIFICATIONS_PASSWORD_RESET_LIMIT_PER_HOUR: int = 8
+    NOTIFICATIONS_RESEND_VERIFY_LIMIT_PER_HOUR: int = 3
     NOTIFICATIONS_WORKSPACE_INVITE_LIMIT_PER_HOUR: int = 50
 
     # ------------------------------------------------------------------
