@@ -152,7 +152,7 @@ celery_app.conf.beat_schedule = {
     },
     "purge-unverified-squatters-hourly": {
         "task": "worker.celery.purge_unverified_squatters",
-        "schedule": crontab(hour="24", minute=0), # runs once a day
+        "schedule": crontab(hour="0", minute=0), # runs once a day
     },
 }
 
