@@ -1047,11 +1047,40 @@ async def accept_workspace_invite(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
+    # 1. Validate the token and execute the invite acceptance.
+    # If this succeeds, the system mathematically guarantees the token is valid 
+    # and belongs to user.email.
     try:
         member = await accept_invite(db, token, user.id, user.email)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # --- THE FIX: The Ownership Verification Override ---
+    from domains.users.service import get_user
+    
+    # We must fetch the fresh DB state since the JWT (CurrentUser) does not track is_verified dynamically.
+    db_user = await get_user(db, user.id)
+    
+    if db_user and not db_user.is_verified:
+        # The user successfully claimed a secure invite sent to their email.
+        # This is cryptographic proof of email ownership. We bypass the email-verification flow.
+        db_user.is_verified = True
+        db_user.updated_at = datetime.now(timezone.utc)
+        
+        # We explicitly commit this state change. 
+        # (accept_invite likely committed the member insertion, but we must commit the user update).
+        await db.commit()
+        
+        """
+        [UI CONSIDERATION]
+        If the frontend detects a successful invite acceptance for a previously unverified account, 
+        it MUST NOT force the user back to a "Check your email" screen. 
+        The UI should automatically proceed to the workspace dashboard, potentially 
+        requesting a fresh JWT via `/auth/refresh` so the token claims reflect the new workspace_id.
+        """
+    # ----------------------------------------------------
+
+    # 2. Fire-and-forget background tasks (WebSocket & Audit/Email)
     asyncio.create_task(ws_manager.broadcast(
         member.workspace_id,
         SignalEvent(

@@ -1311,10 +1311,11 @@ def purge_unverified_squatters(self) -> str:
     engine = create_engine(sync_db_url)
     try:
         with engine.begin() as conn:
+            # --- THE FIX: Target updated_at to respect resend requests ---
             result = conn.execute(text("""
                 DELETE FROM users 
                 WHERE is_verified = false 
-                  AND created_at < NOW() - INTERVAL '24 HOURS';
+                  AND updated_at < NOW() - INTERVAL '24 HOURS';
             """))
             return f"Purged {result.rowcount} squatter accounts."
     except Exception as exc:

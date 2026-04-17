@@ -561,6 +561,7 @@ async def resend_verification(
 ):
     """Resend a new verification email if the previous one expired."""
     from domains.users.service import get_user_by_email
+    from datetime import datetime, timezone
 
     client_ip = (
         request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -588,7 +589,15 @@ async def resend_verification(
     
     if not user or user.is_verified:
         # UI BEHAVIOR: Do not leak state. 
+        # The UI should show a standard success toast regardless of actual DB state.
         return {"message": "If the email is unverified, a new link has been sent."}
+
+    # --- THE FIX: Reset the squatter clock ---
+    # We update the timestamp so the Celery Watchdog gives them another 24 hours
+    # from the moment they request a new token.
+    user.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    # -----------------------------------------
 
     redis = await get_redis()
     token = secrets.token_urlsafe(32)
