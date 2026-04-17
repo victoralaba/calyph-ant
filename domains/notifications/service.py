@@ -63,6 +63,7 @@ from shared.types import Base
 #   priority — "High" | "Medium" | "Low" (used in toast payloads)
 
 EVENT_MATRIX: dict[str, dict[str, Any]] = {
+    "user_verify_email":        {"in_app": False, "email": True,  "toast": False, "sender": "system", "priority": "High"},
     "user_signup":              {"in_app": False, "email": True,  "toast": False, "sender": "ceo",    "priority": "High"},
     "password_reset":           {"in_app": False, "email": True,  "toast": False, "sender": "system", "priority": "High"},
     "security_new_login":       {"in_app": True,  "email": True,  "toast": False, "sender": "system", "priority": "High"},
@@ -260,6 +261,28 @@ async def send_password_reset_email(email: str, token: str) -> None:
         sender_type="system",
         notification_kind="password_reset",
         idempotency_key=f"password_reset:{email}:{token}",
+        fail_closed_on_redis_error=True,
+    )
+
+
+async def send_verification_email(email: str, name: str, token: str) -> None:
+    """
+    Fire-and-forget: send the email verification link.
+    Called from core/auth.py inside asyncio.create_task().
+
+    UI NOTE: The verification link expires in 24 hours. The template states this.
+    """
+    from domains.notifications.templates import build_verification_email
+
+    subject, html = build_verification_email(name, token)
+    await enqueue_email_notification(
+        to_email=email,
+        to_name=name or email,
+        subject=subject,
+        html_content=html,
+        sender_type="system",
+        notification_kind="user_verify_email",
+        idempotency_key=f"user_verify_email:{email}:{token}",
         fail_closed_on_redis_error=True,
     )
 

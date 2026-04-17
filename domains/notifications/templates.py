@@ -115,6 +115,38 @@ def _muted(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Verification email  (sender: "system")
+# ---------------------------------------------------------------------------
+
+def build_verification_email(name: str, token: str) -> tuple[str, str]:
+    """
+    Sent to verify a new user's email address before they can use the app.
+    Returns (subject, html).
+    """
+    display = name or "there"
+    verify_url = f"{settings.APP_BASE_URL}/verify-email?token={token}"
+    subject = "Verify your Calyphant account"
+
+    body = (
+        _h1(f"Welcome, {display}! 👋")
+        + _p(
+            "Please confirm your email address to unlock your account, create your workspace, "
+            "and start using Calyphant."
+        )
+        + _cta_button("Verify Email", verify_url)
+        + _divider()
+        + _p("Or paste this link into your browser:")
+        + _code_block(verify_url)
+        + _divider()
+        + _muted("This link expires in <strong style='color:#94a3b8;'>24 hours</strong>.")
+        + _muted(
+            "If you didn't create a Calyphant account, you can safely ignore this email."
+        )
+    )
+
+    return subject, _base(subject, "Action required: Verify your email to start using Calyphant.", body)
+
+# ---------------------------------------------------------------------------
 # Welcome email  (sender: "ceo")
 # ---------------------------------------------------------------------------
 

@@ -90,6 +90,7 @@ celery_app.conf.update(
         "worker.celery.sync_google_schema_cache": {"queue": "maintenance"},
         "worker.celery.garbage_collect_scratch_schemas": {"queue": "maintenance"},
         "worker.celery.reap_zombie_mutations": {"queue": "maintenance"}, # The Watchdog
+        "worker.celery.purge_unverified_squatters": {"queue": "maintenance"},
         
         "platform.catalogue.enrich_extension_async": {"queue": "maintenance"},
         "platform.catalogue.refresh_stale_entries": {"queue": "maintenance"},
@@ -148,6 +149,10 @@ celery_app.conf.beat_schedule = {
     "reap-zombie-mutations": {
         "task": "worker.celery.reap_zombie_mutations",
         "schedule": crontab(minute=0), 
+    },
+    "purge-unverified-squatters-hourly": {
+        "task": "worker.celery.purge_unverified_squatters",
+        "schedule": crontab(hour="24", minute=0), # runs once a day
     },
 }
 
@@ -560,10 +565,6 @@ def reap_zombie_mutations():
 
     _run(_reap())
 
-
-# ---------------------------------------------------------------------------
-# AI Schema Caching (Google Gemini Context)
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # AI Schema Caching (Google Gemini Context)
@@ -1291,3 +1292,32 @@ async def _async_semantic_diff(scratch_url: str, migrations_from: list[str], mig
             except Exception:
                 pass
             await conn.close()
+
+
+@celery_app.task(bind=True, max_retries=3)
+def purge_unverified_squatters(self) -> str:
+    """
+    Hard-deletes any User row that has been unverified for > 24 hours.
+    This frees up the `users.email` unique constraint if a bot squatted it.
+    Uses a raw synchronous SQL execution because Celery tasks run synchronously.
+    """
+    from sqlalchemy import create_engine, text
+    from core.config import settings
+    
+    # Use the synchronous DB URI since Celery tasks are blocking
+    # E.g., postgresql://user:pass@host/db (not postgresql+asyncpg://...)
+    sync_db_url = settings.DATABASE_URL.replace("+asyncpg", "")
+    
+    engine = create_engine(sync_db_url)
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                DELETE FROM users 
+                WHERE is_verified = false 
+                  AND created_at < NOW() - INTERVAL '24 HOURS';
+            """))
+            return f"Purged {result.rowcount} squatter accounts."
+    except Exception as exc:
+        from loguru import logger
+        logger.error(f"Failed to purge squatters: {exc}")
+        raise self.retry(exc=exc, countdown=60)
