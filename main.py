@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     # Re-evaluate all pending migrations using the new native AST engine
     try:
         import core.db as _core_db
-        from domains.migrations.models import MigrationRecord
+        from domains.migrations.service import MigrationRecord
         from sqlalchemy import select
         from domains.schema.ast_parser import extract_objects_from_sql
         from collections import defaultdict
