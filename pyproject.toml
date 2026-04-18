@@ -17,7 +17,7 @@ dependencies = [
     "migra",
 
     # SQL parsing — structured diff change classification (Gap 9-3)
-    "sqlparse",
+    "pglast",
 
     # Auth
     "python-jose[cryptography]",

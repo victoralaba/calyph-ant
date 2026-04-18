@@ -481,39 +481,137 @@ def _normalise_url(url: str) -> str:
 def _parse_sql_to_changes(sql: str) -> list[SchemaChange]:
     """
     Parse migra-generated SQL into structured SchemaChange objects using
-    sqlparse to tokenise into complete statements.
+    pglast to tokenize into complete statements and classify via AST.
 
     Multi-line statements, inline comments, and parenthesized blocks are
-    all handled correctly.  The old line-by-line approach silently dropped
-    any statement that spanned more than one line.
-
-    Falls back gracefully to an empty list if sqlparse is unavailable.
+    all handled correctly.
     """
     try:
-        import sqlparse
+        from pglast import split, parse_sql
     except ImportError:
         logger.warning(
-            "sqlparse not installed — structured diff changes unavailable. "
-            "Install sqlparse for full change classification."
+            "pglast not installed — structured diff changes unavailable. "
+            "Install pglast for full change classification."
         )
         return _parse_sql_fallback(sql)
 
-    statements = sqlparse.parse(sql)
+    statements = split(sql)
     changes: list[SchemaChange] = []
 
-    for stmt in statements:
-        flat = stmt.value.strip()
+    for flat in statements:
+        flat = flat.strip()
         if not flat or flat.startswith("--"):
             continue
 
-        # Normalise whitespace for keyword matching
-        normalised = " ".join(flat.upper().split())
+        try:
+            # Parse individual statement to get its AST node
+            root = parse_sql(flat)
+            if not root:
+                continue
+                
+            # root is typically a tuple of RawStmt
+            stmt_node = root[0].stmt if hasattr(root[0], 'stmt') else root[0]
+            change = _classify_ast_statement(flat, stmt_node)
+        except Exception as exc:
+            logger.debug(f"AST classification failed, falling back to regex: {exc}")
+            normalised = " ".join(flat.upper().split())
+            change = _classify_statement(flat, normalised)
 
-        change = _classify_statement(flat, normalised)
         if change:
             changes.append(change)
 
     return changes
+
+def _classify_ast_statement(flat_sql: str, stmt_node) -> SchemaChange | None:
+    """Classify a single complete SQL statement using its PostgreSQL AST node type."""
+    from domains.schema.ast_parser import extract_objects_from_sql
+    
+    # Handle dict (older pglast) vs object (newer pglast)
+    if isinstance(stmt_node, dict):
+        node_type = list(stmt_node.keys())[0]
+        node_data = stmt_node[node_type]
+    else:
+        node_type = stmt_node.__class__.__name__
+        node_data = stmt_node
+
+    # Extract primary target object name from the AST
+    targets = list(extract_objects_from_sql(flat_sql))
+    primary_target = targets[0] if targets else "unknown"
+
+    if node_type == 'CreateStmt':
+        return SchemaChange(
+            kind=ChangeKind.table_added, object_type="table",
+            object_name=primary_target, sql=flat_sql, is_destructive=False,
+        )
+    elif node_type == 'DropStmt':
+        remove_type = getattr(node_data, 'removeType', None)
+        if isinstance(node_data, dict):
+            remove_type = node_data.get('removeType', remove_type)
+            
+        rt_str = str(remove_type).upper()
+        
+        if 'TABLE' in rt_str:
+            return SchemaChange(
+                kind=ChangeKind.table_dropped, object_type="table",
+                object_name=primary_target, sql=flat_sql, is_destructive=True,
+            )
+        elif 'INDEX' in rt_str:
+            return SchemaChange(
+                kind=ChangeKind.index_dropped, object_type="index",
+                object_name=primary_target, sql=flat_sql, is_destructive=True,
+            )
+        elif 'EXTENSION' in rt_str:
+            return SchemaChange(
+                kind=ChangeKind.extension_dropped, object_type="extension",
+                object_name=primary_target, sql=flat_sql, is_destructive=True,
+            )
+        elif 'TYPE' in rt_str:
+            return SchemaChange(
+                kind=ChangeKind.enum_dropped, object_type="enum",
+                object_name=primary_target, sql=flat_sql, is_destructive=True,
+            )
+        elif 'SEQUENCE' in rt_str:
+            return SchemaChange(
+                kind=ChangeKind.sequence_dropped, object_type="sequence",
+                object_name=primary_target, sql=flat_sql, is_destructive=True,
+            )
+            
+    elif node_type == 'AlterTableStmt':
+        # Delegate column-level parsing to the precise string matcher for now,
+        # as AlterTableStmt cmds can be very complex to unpack manually.
+        normalised = " ".join(flat_sql.upper().split())
+        return _classify_alter_table(flat_sql, normalised)
+
+    elif node_type == 'IndexStmt':
+        return SchemaChange(
+            kind=ChangeKind.index_added, object_type="index",
+            object_name=primary_target, table_name="unknown",
+            sql=flat_sql, is_destructive=False,
+        )
+    elif node_type == 'CreateExtensionStmt':
+        return SchemaChange(
+            kind=ChangeKind.extension_added, object_type="extension",
+            object_name=primary_target, sql=flat_sql, is_destructive=False,
+        )
+    elif node_type == 'CreateEnumStmt':
+        return SchemaChange(
+            kind=ChangeKind.enum_added, object_type="enum",
+            object_name=primary_target, sql=flat_sql, is_destructive=False,
+        )
+    elif node_type == 'AlterEnumStmt':
+        return SchemaChange(
+            kind=ChangeKind.enum_modified, object_type="enum",
+            object_name=primary_target, sql=flat_sql, is_destructive=False,
+        )
+    elif node_type == 'CreateSeqStmt':
+        return SchemaChange(
+            kind=ChangeKind.sequence_added, object_type="sequence",
+            object_name=primary_target, sql=flat_sql, is_destructive=False,
+        )
+
+    # Fallback to regex for unsupported node types
+    normalised = " ".join(flat_sql.upper().split())
+    return _classify_statement(flat_sql, normalised)
 
 
 def _classify_statement(flat: str, normalised: str) -> SchemaChange | None:

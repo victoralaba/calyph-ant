@@ -220,31 +220,7 @@ def _checksum(sql: str) -> str:
 # SQL object extraction (for conflict detection)
 # ---------------------------------------------------------------------------
 
-def _extract_objects_from_sql(sql: str) -> set[str]:
-    """
-    Extract table and object names from SQL for conflict analysis.
-    Conservative — extracts identifiers after common DDL keywords.
-    Returns a set of lowercased object names.
-    """
-    objects: set[str] = set()
-
-    # Patterns: ALTER TABLE x, DROP TABLE x, CREATE TABLE x,
-    #           CREATE INDEX ON x, DROP INDEX x
-    patterns = [
-        r'(?:ALTER|DROP|CREATE(?:\s+OR\s+REPLACE)?)\s+TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:"?(\w+)"?\.)?"?(\w+)"?',
-        r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:\w+\s+)?ON\s+(?:"?(\w+)"?\.)?"?(\w+)"?',
-        r'DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(?:"?(\w+)"?\.)?"?(\w+)"?',
-        r'(?:ALTER|DROP|CREATE)\s+TYPE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:"?(\w+)"?\.)?"?(\w+)"?',
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, sql, re.IGNORECASE):
-            groups = [g for g in match.groups() if g]
-            if groups:
-                # Use the last group (object name, not schema)
-                objects.add(groups[-1].lower())
-
-    return objects
+from domains.schema.ast_parser import extract_objects_from_sql
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +302,12 @@ async def detect_conflicts(
         # No pending migrations → no conflicts possible
         return ConflictReport(has_conflicts=False, summary="No conflicts detected.")
 
-    incoming_objects = _extract_objects_from_sql(incoming_sql)
+    incoming_objects = extract_objects_from_sql(incoming_sql)
 
     conflicts: list[ConflictDetail] = []
 
     for existing in pending:
-        existing_objects = _extract_objects_from_sql(existing.up_sql)
+        existing_objects = extract_objects_from_sql(existing.up_sql)
         overlap = incoming_objects & existing_objects
 
         if overlap:

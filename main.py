@@ -60,6 +60,57 @@ async def lifespan(app: FastAPI):
     except Exception as _seed_exc:
         logger.warning(f"Extension catalogue seed failed (non-fatal): {_seed_exc}")
 
+    # Phase 5: Absolute Determinism Cutover Routine
+    # Re-evaluate all pending migrations using the new native AST engine
+    try:
+        import core.db as _core_db
+        from domains.migrations.models import MigrationRecord
+        from sqlalchemy import select
+        from domains.schema.ast_parser import extract_objects_from_sql
+        from collections import defaultdict
+        
+        if _core_db._session_factory:
+            async with _core_db._session_factory() as db:
+                result = await db.execute(
+                    select(MigrationRecord).where(MigrationRecord.applied == False)
+                )
+                pending_migrations = result.scalars().all()
+                
+                if pending_migrations:
+                    logger.info(f"Cutover: Re-evaluating {len(pending_migrations)} pending migrations with AST engine.")
+                    
+                    by_conn = defaultdict(list)
+                    for m in pending_migrations:
+                        by_conn[m.connection_id].append(m)
+                    
+                    for conn_id, migrations in by_conn.items():
+                        # Clear old heuristic flags
+                        for m in migrations:
+                            m.has_conflict = False
+                            m.meta.pop("conflict_report", None)
+                        
+                        m_objects = {m.id: extract_objects_from_sql(m.up_sql) for m in migrations}
+                        
+                        for i, m1 in enumerate(migrations):
+                            conflicts = []
+                            for j, m2 in enumerate(migrations):
+                                if i != j:
+                                    overlap = m_objects[m1.id] & m_objects[m2.id]
+                                    if overlap:
+                                        conflicts.append(m2.version)
+                            
+                            if conflicts:
+                                m1.has_conflict = True
+                                m1.meta["conflict_report"] = {
+                                    "has_conflicts": True,
+                                    "summary": f"AST Cutover: Conflicts with {len(conflicts)} pending migrations."
+                                }
+                        
+                        await db.commit()
+                    logger.info("Cutover: AST queue re-evaluation complete.")
+    except Exception as exc:
+        logger.error(f"Cutover routine failed (non-fatal): {exc}")
+
     # Start the Redis pub/sub listener for cross-worker WebSocket broadcast.
     # The task runs for the lifetime of the process. If Redis is unavailable
     # it retries automatically — see shared/pubsub.py for backoff logic.
