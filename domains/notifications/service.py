@@ -282,6 +282,7 @@ async def send_verification_email(email: str, name: str, token: str) -> None:
         html_content=html,
         sender_type="system",
         notification_kind="user_verify_email",
+        # Ensures that if the user double-clicks register, we don't send two emails
         idempotency_key=f"user_verify_email:{email}:{token}",
         fail_closed_on_redis_error=True,
     )

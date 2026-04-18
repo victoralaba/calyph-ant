@@ -47,6 +47,7 @@ Every protected route declares: user: CurrentUser
 
 from __future__ import annotations
 
+import json
 import asyncio
 import hashlib
 import secrets
@@ -62,11 +63,11 @@ from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from core.config import settings
 from core.db import get_db, get_redis
 from domains.notifications.rate_limit import enforce_redis_limit
-
 
 # ---------------------------------------------------------------------------
 # Argon2id password hashing
@@ -333,7 +334,7 @@ async def _authenticate_api_key(raw_key: str) -> AuthenticatedUser:
             detail="Invalid or expired API key.",
         )
         
-    # --- ENFORCEMENT GATE: Side Door ---
+    # --- ENFORCEMENT GATE: The Side Door ---
     if not user.is_verified:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -341,6 +342,7 @@ async def _authenticate_api_key(raw_key: str) -> AuthenticatedUser:
         )
 
     from domains.teams.service import WorkspaceMember
+    from sqlalchemy import select
 
     async with _session_factory() as db:
         result = await db.execute(
@@ -420,12 +422,12 @@ async def register(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Register a new user account.
+    Register a new user account (Redis Waiting Room Pattern).
     
-    Creates the user (unverified) and dispatches a verification email.
-    Does NOT create a workspace or return JWTs.
+    Validates the request, hashes the password, and stores the payload in Redis.
+    Does NOT write to the PostgreSQL database until the email is verified.
     """
-    from domains.users.service import User, get_user_by_email
+    from domains.users.service import get_user_by_email
 
     client_ip = (
         request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -446,61 +448,38 @@ async def register(
             detail="Registration temporarily unavailable. Please try again shortly.",
         )
 
+    # 1. Check if the user already exists in the permanent database
     existing = await get_user_by_email(db, body.email)
     if existing:
-        if not existing.is_verified:
-            # --- THE FINAL FIX: Squatter Neutralization ---
-            # Overwrite the squatter's password and profile with the data 
-            # from the legitimate user who is currently attempting to register.
-            existing.password_hash = hash_password(body.password)
-            existing.full_name = body.full_name
-            await db.commit()
-            
-            # Generate a fresh token for the stranded user
-            redis = await get_redis()
-            token = secrets.token_urlsafe(32)
-            await redis.setex(f"email_verify:{token}", 86400, str(existing.id))
-            
-            import asyncio
-            from domains.notifications.service import send_verification_email
-            asyncio.create_task(send_verification_email(
-                existing.email, existing.full_name or "", token
-            ))
-
-        # UI BEHAVIOR: 
-        # Do not leak whether the email exists for security reasons.
-        # Just return a generic success message so the UI tells them to check their email.
+        # UI BEHAVIOR: Do not leak state. Return success so attackers can't enumerate emails.
         return {
             "message": "If the email is valid, a verification link has been sent.",
             "requires_verification": True
         }
 
-    # 1. Create the user as Unverified
-    user = User(
-        email=body.email.lower(),
-        full_name=body.full_name,
-        password_hash=hash_password(body.password),
-        is_verified=False,
-        is_active=True
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-
-    # 2. Generate a secure, single-use verification token and store in Redis
+    # 2. Generate token and payload
     redis = await get_redis()
     token = secrets.token_urlsafe(32)
-    # Token expires in 24 hours
-    await redis.setex(f"email_verify:{token}", 86400, str(user.id))
+    email_lower = body.email.lower()
+    
+    payload = {
+        "email": email_lower,
+        "full_name": body.full_name,
+        "password_hash": hash_password(body.password)
+    }
 
-    # 3. Dispatch the email task
+    # 3. Store in the Redis Waiting Room (24 hour TTL)
+    # email_verify:{token} -> payload (Used when user clicks the link)
+    # email_token_lookup:{email} -> token (Used for resend-verification and login hints)
+    await redis.setex(f"email_verify:{token}", 86400, json.dumps(payload))
+    await redis.setex(f"email_token_lookup:{email_lower}", 86400, token)
+
+    # 4. Dispatch the email task
     import asyncio
     from domains.notifications.service import send_verification_email
-    asyncio.create_task(send_verification_email(user.email, user.full_name or "", token))
+    asyncio.create_task(send_verification_email(email_lower, body.full_name or "", token))
 
-    # UI BEHAVIOR:
-    # The UI MUST NOT attempt to redirect to the dashboard. 
-    # It MUST show a "Check your inbox" screen.
+    # UI BEHAVIOR: Do NOT redirect to dashboard. Show a "Check your inbox" screen.
     return {
         "message": "Account created. Please check your email to verify your account.",
         "requires_verification": True
@@ -517,61 +496,68 @@ async def verify_email(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Confirms email ownership, marks user as verified, creates their workspace, 
-    dispatches the welcome email, and returns JWT access and refresh tokens.
+    Confirms email ownership, solidifies the user into PostgreSQL, 
+    creates their workspace, and returns JWTs.
     """
     from domains.teams.service import create_workspace
-    from domains.users.service import get_user
+    from domains.users.service import User
 
     redis = await get_redis()
-    user_id_bytes = await redis.get(f"email_verify:{body.token}")
+    payload_bytes = await redis.get(f"email_verify:{body.token}")
     
-    if not user_id_bytes:
-        # UI BEHAVIOR:
-        # If this occurs, the UI MUST show "Link expired or invalid" and 
-        # present a button to "Resend Verification Email" (hitting /resend-verification).
+    if not payload_bytes:
+        # UI BEHAVIOR: Show "Link expired or invalid" and present a 
+        # "Resend Verification Email" button pointing to /resend-verification.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail="Verification token is invalid or has expired."
         )
 
-    user_id = UUID(user_id_bytes.decode())
-    user = await get_user(db, user_id)
+    payload = json.loads(payload_bytes.decode())
+    email = payload["email"]
     
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-        
-    if user.is_verified:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already verified.")
+    # 1. Solidify the user into PostgreSQL
+    user = User(
+        email=email,
+        full_name=payload.get("full_name"),
+        password_hash=payload["password_hash"],
+        is_verified=True,  # They are verified by definition of reaching this line
+        is_active=True
+    )
+    db.add(user)
+    
+    try:
+        await db.flush() # Flush to get the user.id without committing yet
+    except IntegrityError:
+        await db.rollback()
+        # This handles the extreme edge case where someone registered via another flow 
+        # while this token was pending.
+        raise HTTPException(status_code=400, detail="Account already exists and is verified.")
 
-    # 1. Verify the user
-    user.is_verified = True
-    
-    # 2. Create their personal workspace NOW (prevents squatter bloat)
+    # 2. Create their personal workspace
     workspace = await create_workspace(
         db, user.full_name or user.email.split("@")[0], user.id
     )
     await db.commit()
+    await db.refresh(user)
 
-    # 3. Burn the token so it cannot be reused
+    # 3. Clean up the Redis Waiting Room
     await redis.delete(f"email_verify:{body.token}")
+    await redis.delete(f"email_token_lookup:{email}")
     
-    # --- FIX: The Missing Welcome Email ---
-    # 3.5 Dispatch the welcome email now that they are officially verified
+    # 4. Dispatch the welcome email
     import asyncio
     from domains.notifications.service import send_welcome_email
     asyncio.create_task(send_welcome_email(user.email, user.full_name or ""))
 
-    # 4. Generate JWTs
+    # 5. Generate JWTs
     token_tier = await resolve_token_tier(db, user.tier, workspace.id)
     access = create_access_token(
         user.id, user.email, token_tier, workspace.id, user.is_superadmin
     )
     refresh = create_refresh_token(user.id)
     
-    # UI BEHAVIOR:
-    # The UI receives tokens. It should immediately store them and redirect 
-    # the user directly into the app (dashboard).
+    # UI BEHAVIOR: Store tokens and redirect directly into the app (dashboard).
     return TokenResponse(access_token=access, refresh_token=refresh)
 
 
@@ -584,7 +570,7 @@ async def resend_verification(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """Resend a new verification email if the previous one expired."""
+    """Resend a verification email using the existing Redis token."""
     from domains.users.service import get_user_by_email
 
     client_ip = (
@@ -593,8 +579,6 @@ async def resend_verification(
         or (request.client.host if request.client else "unknown")
     )
     
-    # --- FIX: Replaced Hardcoded Limits ---
-    # Strictly limit this to prevent email bombing, referencing core.config
     resend_limit = await enforce_redis_limit(
         key=f"notifications:rl:resend_verify:hour:{client_ip}:{body.email.lower()}",
         limit=settings.NOTIFICATIONS_RESEND_VERIFY_LIMIT_PER_HOUR,
@@ -602,66 +586,76 @@ async def resend_verification(
         fail_closed=True,
         action="resend_verification",
     )
-    
     if not resend_limit.allowed:
         status_code = 503 if resend_limit.reason == "redis_unavailable" else 429
-        raise HTTPException(
-            status_code=status_code,
-            detail="Too many resend requests. Please wait before trying again.",
-        )
+        raise HTTPException(status_code=status_code, detail="Too many resend requests.")
 
+    # If the user is already in PostgreSQL, they are already verified. Silent exit.
     user = await get_user_by_email(db, body.email)
-    
-    if not user or user.is_verified:
-        # UI BEHAVIOR: Do not leak state. 
-        # The UI should show "If the email is unverified, a new link has been sent"
-        # and start a ~60 second countdown timer before allowing another click.
+    if user:
         return {"message": "If the email is unverified, a new link has been sent."}
 
+    # Lookup the pending token in Redis
     redis = await get_redis()
-    token = secrets.token_urlsafe(32)
-    await redis.setex(f"email_verify:{token}", 86400, str(user.id))
+    email_lower = body.email.lower()
+    token_bytes = await redis.get(f"email_token_lookup:{email_lower}")
+    
+    if token_bytes:
+        token = token_bytes.decode()
+        # Fetch payload to get the name for the email template
+        payload_bytes = await redis.get(f"email_verify:{token}")
+        full_name = ""
+        if payload_bytes:
+             full_name = json.loads(payload_bytes.decode()).get("full_name", "")
+             
+        import asyncio
+        from domains.notifications.service import send_verification_email
+        asyncio.create_task(send_verification_email(email_lower, full_name, token))
 
-    import asyncio
-    from domains.notifications.service import send_verification_email
-    asyncio.create_task(send_verification_email(user.email, user.full_name or "", token))
-
+    # UI BEHAVIOR: Start a ~60 second countdown timer before allowing another click.
     return {"message": "If the email is unverified, a new link has been sent."}
 
 
 @auth_router.post("/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
-    request: Request,                       # <-- ADD: needed to extract IP address
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Authenticate with email + password.
-
-    Returns access + refresh tokens. If the stored password hash uses
-    outdated argon2 parameters, it is transparently rehashed on login.
-
-    After successful authentication, fires a fire-and-forget
-    security_new_login notification so the user receives an in-app
-    and email alert about the new sign-in. This never blocks the response.
+    Includes UX routing for users who are stuck in the Redis Waiting Room.
     """
     from domains.teams.service import WorkspaceMember
     from domains.users.service import get_user_by_email
 
     user = await get_user_by_email(db, body.email)
-    if not user or not verify_password(body.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-        )
+    
+    if not user:
+        # Check if they are stuck in the Redis Waiting Room
+        redis = await get_redis()
+        is_pending = await redis.exists(f"email_token_lookup:{body.email.lower()}")
+        if is_pending:
+            # UI BEHAVIOR: Catch the `requires_verification` flag.
+            # Intercept the login error and show: "Please verify your email." 
+            # with a button that triggers a request to `/resend-verification`.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail={
+                    "message": "Account is pending verification. Please check your email.",
+                    "requires_verification": True
+                }
+            )
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+        
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive.")
 
+    # Legacy Guard: In case an old unverified user exists in the DB
     if not user.is_verified:
-        # UI BEHAVIOR:
-        # The UI MUST catch the `requires_verification` flag in the error response.
-        # It should intercept the login error and show the user a specific message:
-        # "Please verify your email." along with a button that triggers a request to `/resend-verification`
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail={
@@ -673,79 +667,6 @@ async def login(
     if password_needs_rehash(user.password_hash):
         user.password_hash = hash_password(body.password)
         await db.commit()
-
-    result = await db.execute(
-        select(WorkspaceMember.workspace_id)
-        .where(WorkspaceMember.user_id == user.id)
-        .order_by(WorkspaceMember.joined_at.asc())
-        .limit(1)
-    )
-    workspace_id = result.scalar_one_or_none()
-
-    token_tier = await resolve_token_tier(db, user.tier, workspace_id)
-    access  = create_access_token(user.id, user.email, token_tier, workspace_id, user.is_superadmin)
-    refresh = create_refresh_token(user.id)
-
-    # -----------------------------------------------------------------------
-    # FIRE-AND-FORGET: security_new_login notification
-    #
-    # Dispatches an in-app notification AND an email alert to the user
-    # informing them of the new sign-in. Uses asyncio.create_task() so
-    # it never adds latency to the login response.
-    #
-    # IP EXTRACTION: We extract the real client IP from X-Forwarded-For
-    # when running behind a reverse proxy (nginx, Cloudflare), falling
-    # back to the direct connection IP. This matches the ip_address field
-    # on AuditLog for correlation.
-    #
-    # UI CONSIDERATION:
-    #   The resulting in-app notification (kind="security_new_login") should
-    #   be displayed with a lock/shield icon. It is High priority — do NOT
-    #   hide it behind a collapsed "Other notifications" group. If the user
-    #   did not initiate this login, the action_url should direct them to
-    #   the password reset page.
-    # -----------------------------------------------------------------------
-    ip_address: str | None = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or request.headers.get("X-Real-IP")
-        or (request.client.host if request.client else None)
-    )
-
-    import asyncio as _asyncio
-    from domains.notifications.service import dispatch_event
-    from domains.notifications.templates import build_new_login_email
-    from core.config import settings as _settings
-
-    async def _fire_login_notification():
-        try:
-            subject, html = build_new_login_email(
-                name=user.full_name or user.email,
-                ip_address=ip_address,
-            )
-            await dispatch_event(
-                db=db,
-                user_id=user.id,
-                kind="security_new_login",
-                title="New sign-in to your Calyphant account",
-                body=f"A new sign-in was detected from IP {ip_address or 'unknown'}.",
-                action_url=f"{_settings.APP_BASE_URL}/auth/forgot-password",
-                workspace_id=workspace_id,
-                meta={"ip_address": ip_address},
-                email_subject=subject,
-                email_html=html,
-                # Pass pre-fetched user data to skip redundant DB queries
-                # inside dispatch_event (avoids a second get_user() call)
-                _user_email=user.email,
-                _user_name=user.full_name or user.email,
-            )
-        except Exception as exc:
-            # Notification failure must NEVER fail the login response
-            from loguru import logger
-            logger.warning(f"security_new_login notification failed (non-fatal): {exc}")
-
-    _asyncio.create_task(_fire_login_notification())
-
-    return TokenResponse(access_token=access, refresh_token=refresh)
 
 
 @auth_router.post("/refresh", response_model=TokenResponse)
@@ -770,12 +691,6 @@ async def refresh_tokens(
     user = await get_user(db, user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive.")
-
-    if not user.is_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Session revoked: Account is not verified."
-        )
     
     workspace_id: UUID | None = None
 
