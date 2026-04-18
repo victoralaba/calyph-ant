@@ -1,14 +1,22 @@
 # domains/schema/ast_parser.py
 
 from loguru import logger
+import typing
 
-try:
-    from pglast import parse_sql
-    from pglast.visitors import Visitor
-except ImportError:
-    parse_sql = None
-    Visitor = object
-    logger.warning("pglast not installed. AST parsing will fail gracefully.")
+if typing.TYPE_CHECKING:
+    class Visitor:
+        def generic_visit(self, node: typing.Any) -> None: ...
+        def __call__(self, node: typing.Any) -> typing.Any: ...
+    parse_sql: typing.Any = None
+else:
+    try:
+        from pglast import parse_sql  # type: ignore
+        from pglast.visitors import Visitor  # type: ignore
+    except ImportError:
+        parse_sql = None
+        class Visitor:  # type: ignore
+            pass
+        logger.warning("pglast not installed. AST parsing will fail gracefully.")
 
 class ASTAnalyzer(Visitor):
     """
