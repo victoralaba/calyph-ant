@@ -668,6 +668,22 @@ async def login(
         user.password_hash = hash_password(body.password)
         await db.commit()
 
+    # Generate JWT tokens and return response
+    # Resolve user's primary workspace
+    result = await db.execute(
+        select(WorkspaceMember.workspace_id)
+        .where(WorkspaceMember.user_id == user.id)
+        .order_by(WorkspaceMember.joined_at.asc())
+        .limit(1)
+    )
+    workspace_id = result.scalar_one_or_none()
+    token_tier = await resolve_token_tier(db, user.tier, workspace_id)
+    access = create_access_token(
+        user.id, user.email, token_tier, workspace_id, user.is_superadmin
+    )
+    refresh = create_refresh_token(user.id)
+    return TokenResponse(access_token=access, refresh_token=refresh)
+
 
 @auth_router.post("/refresh", response_model=TokenResponse)
 async def refresh_tokens(
