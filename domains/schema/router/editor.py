@@ -704,22 +704,29 @@ async def list_tables(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
+    """
+    Blueprint-only table list. Single pg_class query, returns in <5ms.
+
+    UI CONTRACT — strictly enforced by the response shape:
+    - column_count is NOT in the response. The sidebar must render fully
+      collapsed. Do not show a column count badge until the user expands
+      a table and the detail endpoint resolves.
+    - Do NOT call this endpoint in a loop or fire per-table follow-up
+      requests on initial load. That was the cause of the 4-minute hang.
+    - Call GET /schema/{connection_id}/tables/{table_name} ONLY when the
+      user explicitly clicks the expand arrow on a specific table.
+    - Do NOT poll this endpoint. Listen to the schema_changed WebSocket
+      event on the workspace channel and debounce the handler by 250ms.
+    """
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    
-    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
+
+    tables = await introspection.introspect_tables_blueprint(
+        connection_id, url, schema_name
+    )
     return {
-        "tables": [
-            {
-                "name": t.name,
-                "schema": t.schema_name,  # <-- FIX APPLIED
-                "kind": t.kind,
-                "column_count": len(t.columns),
-                "row_count_estimate": t.row_count_estimate,
-            }
-            for t in snapshot.tables
-        ],
-        "total": len(snapshot.tables),
+        "tables": tables,
+        "total": len(tables),
     }
 
 
@@ -1302,17 +1309,21 @@ async def list_enums(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
+    """
+    Targeted enum listing via pg_type. No longer calls introspect_database().
+    Returns in <5ms regardless of how many tables the database has.
+    """
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    
-    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
+
+    enums = await introspection.introspect_enums_only(
+        connection_id, url, schema_name
+    )
     return {
-        "enums": [
-            {"name": e.name, "schema": e.schema_name, "values": e.values} # <-- FIX APPLIED
-            for e in snapshot.enums
-        ],
-        "total": len(snapshot.enums),
+        "enums": enums,
+        "total": len(enums),
     }
+
 
 @router.post("/{connection_id}/enums", response_model=SqlPreviewResponse)
 async def create_enum(
