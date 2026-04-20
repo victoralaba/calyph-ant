@@ -43,6 +43,7 @@ connections.
 from __future__ import annotations
 
 import re
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -55,6 +56,7 @@ import asyncpg
 from loguru import logger
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.engine.cursor import CursorResult
 import asyncio
 from tenacity import (
@@ -199,6 +201,56 @@ async def parse_and_validate_url(url: str) -> dict[str, Any]:
         "provider": detect_provider(host),
     }
 
+
+def sanitize_asyncpg_url(raw_url: str) -> tuple[str, dict[str, Any]]:
+    """
+    Translates a generic PostgreSQL URL into a strict asyncpg-compatible URL,
+    stripping incompatible query parameters and mapping them to native Python constructs.
+    """
+    parsed = make_url(raw_url)
+
+    # 1. Enforce the correct async dialect
+    if parsed.drivername in ("postgresql", "postgres"):
+        parsed = parsed.set(drivername="postgresql+asyncpg")
+
+    # 2. Extract query params as a mutable dict
+    query = dict(parsed.query)
+    
+    # 3. Strip driver-incompatible keys
+    sslmode = query.pop("sslmode", None)
+    
+    # asyncpg is a native Python protocol implementation. It chokes on these libpq-specific flags.
+    # We aggressively purge them to prevent connection crashes across varying cloud providers.
+    libpq_exclusive_flags = [
+        "channel_binding", 
+        "options", 
+        "gssencmode", 
+        "target_session_attrs",
+        "sslsni"
+    ]
+    for flag in libpq_exclusive_flags:
+        query.pop(flag, None)
+    
+    connect_args: dict[str, Any] = {}
+
+    # 4. Translate sslmode to Python's native ssl.SSLContext
+    if sslmode in ("require", "verify-ca", "verify-full"):
+        ctx = ssl.create_default_context()
+        
+        # 'require' means use SSL, but don't strictly verify the cert chain against a CA.
+        # This is standard for managed DBs like Neon/Supabase unless custom CAs are provided.
+        if sslmode == "require":
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+        connect_args["ssl"] = ctx
+
+    # 5. Rebuild the clean URL
+    clean_url = parsed.set(query=query)
+    
+    # Render string with passwords hidden for logging, but return the actual string for connection
+    return clean_url.render_as_string(hide_password=False), connect_args
+
 @retry(
     retry=retry_if_exception_type((OSError, asyncpg.PostgresConnectionError)),
     stop=stop_after_attempt(3),
@@ -215,8 +267,8 @@ async def _connect_raw(url: str, timeout: int = 10, resolved_ip: str | None = No
     argument directly to asyncpg, forcing it to ignore the potentially poisoned 
     DNS record in the URL string while preserving SNI for SSL via the DSN.
     """
-    safe_url = _patch_neon_dsn(url)
-    kwargs = {"dsn": safe_url, "timeout": timeout}
+    clean_url, custom_kwargs = sanitize_asyncpg_url(url)
+    kwargs = {"dsn": clean_url, "timeout": timeout, **custom_kwargs}
     
     # Inject the verified physical IP address to prevent DNS rebinding
     if resolved_ip:
@@ -535,17 +587,18 @@ async def acquire_workspace_connection(
     
     # We resolve the IP directly here to maintain the TOCTOU shield
     components = await parse_and_validate_url(url)
-    safe_url = _patch_neon_dsn(url)
+    clean_url, custom_kwargs = sanitize_asyncpg_url(url)
 
     try:
         # UI CONSIDERATION: If this fails, the UI must gracefully handle 
         # HTTP 503. Do not blindly retry immediately; implement exponential backoff 
         # on the Svelte client to prevent DDOSing the Calyphant worker.
         return await asyncpg.connect(
-            dsn=safe_url,
+            dsn=clean_url,
             host=components["resolved_ip"],
             timeout=timeout,
-            server_settings={"application_name": "calyphant-workspace-exec"}
+            server_settings={"application_name": "calyphant-workspace-exec"},
+            **custom_kwargs
         )
     except Exception as exc:
         raise HTTPException(
@@ -553,10 +606,6 @@ async def acquire_workspace_connection(
             detail=f"Could not connect to database: {exc}",
         )
 
-
-# ---------------------------------------------------------------------------
-# Keep-alive ping (called by Celery task)
-# ---------------------------------------------------------------------------
 
 async def ping_connection(url: str) -> bool:
     """
@@ -567,12 +616,13 @@ async def ping_connection(url: str) -> bool:
     try:
         # Resolve to bypass DNS poisoning on background tasks
         components = await parse_and_validate_url(url)
-        safe_url = _patch_neon_dsn(url)
+        clean_url, custom_kwargs = sanitize_asyncpg_url(url)
         
         conn = await asyncpg.connect(
-            dsn=safe_url, 
+            dsn=clean_url, 
             host=components["resolved_ip"],
-            timeout=15
+            timeout=15,
+            **custom_kwargs
         )
         await conn.fetchval("SELECT 1")
         return True
@@ -593,15 +643,16 @@ async def execute_presence_heartbeat(url: str) -> None:
     try:
         # Resolve to bypass DNS poisoning
         components = await parse_and_validate_url(url)
-        safe_url = _patch_neon_dsn(url)
+        clean_url, custom_kwargs = sanitize_asyncpg_url(url)
         
         # 3-second timeout: If it takes longer than 3 seconds to connect, 
         # it is either already asleep or unreachable. Don't block the worker.
         conn = await asyncpg.connect(
-            dsn=safe_url, 
+            dsn=clean_url, 
             host=components["resolved_ip"],
             timeout=3,
-            server_settings={"application_name": "calyphant-ui-heartbeat"}
+            server_settings={"application_name": "calyphant-ui-heartbeat"},
+            **custom_kwargs
         )
         await conn.fetchval("SELECT 1")
     except Exception as exc:
@@ -610,7 +661,6 @@ async def execute_presence_heartbeat(url: str) -> None:
     finally:
         if conn:
             await conn.close()
-
 
 # ---------------------------------------------------------------------------
 # Privilege helpers — used by other domains

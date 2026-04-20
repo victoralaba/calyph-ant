@@ -53,8 +53,9 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, Boolean
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.pool import AsyncAdaptedQueuePool, QueuePool
 
 from core.db import get_redis
 from domains.tables.editor import stream_query_result
@@ -182,8 +183,11 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
     Creates a strictly isolated, temporary connection pool for user queries.
     Enforces protocol-level timeouts to prevent runaway queries from locking up the worker.
     """
+    from domains.connections.service import sanitize_asyncpg_url
+    clean_url, custom_kwargs = sanitize_asyncpg_url(url)
+    
     return await asyncpg.create_pool(
-        dsn=url,
+        dsn=clean_url,
         min_size=1,
         max_size=3, # Keep small to avoid exhausting the target DB's connection limits
         server_settings={
@@ -194,7 +198,8 @@ async def get_workspace_pool(url: str, application_name: str = "calyphant-engine
             "lock_timeout": "5000",
             # Ensure deterministic time logic
             "TimeZone": "UTC"
-        }
+        },
+        **custom_kwargs
     )
 
 
@@ -205,8 +210,8 @@ class WorkspacePoolManager:
     SQLAlchemy AsyncEngines (for schema reflection) with unified Garbage Collection.
     """
     def __init__(self, ttl_seconds: int = 600):
-        self._pool_tasks: dict[UUID, asyncio.Task] = {}
-        self._engine_tasks: dict[UUID, asyncio.Task] = {}
+        self._pool_tasks: dict[UUID, asyncio.Task[asyncpg.Pool]] = {}
+        self._engine_tasks: dict[UUID, asyncio.Task[AsyncEngine]] = {}
         self._eviction_timers: dict[UUID, asyncio.TimerHandle] = {}
         self._ttl_seconds = ttl_seconds
 
@@ -237,7 +242,7 @@ class WorkspacePoolManager:
             self._pool_tasks.pop(connection_id, None)
             raise
 
-    async def get_engine(self, connection_id: UUID, url: str):
+    async def get_engine(self, connection_id: UUID, url: str) -> AsyncEngine:
         """Retrieves or builds a SQLAlchemy AsyncEngine for safe schema reflection."""
         self._refresh_heartbeat(connection_id)
 
@@ -255,29 +260,33 @@ class WorkspacePoolManager:
     async def _build_pool(self, connection_id: UUID, url: str) -> asyncpg.Pool:
         return await get_workspace_pool(url)
 
-    async def _build_engine(self, url: str):
-        from sqlalchemy.ext.asyncio import create_async_engine
-        
-        # Native conversion to asyncpg driver protocol for SQLAlchemy
-        clean_url = url.replace("postgresql+psycopg://", "postgresql+asyncpg://")
-        if clean_url.startswith("postgres://"):
-            clean_url = clean_url.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif not clean_url.startswith("postgresql+"):
-            clean_url = clean_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    async def _build_engine(self, url: str) -> AsyncEngine:
+        """
+        Build a dedicated async SQLAlchemy engine for schema introspection.
+        Kept intentionally small because these engines are cached per connection_id.
+        """
+        from domains.connections.service import sanitize_asyncpg_url
+
+        clean_url, custom_kwargs = sanitize_asyncpg_url(url)
+        connect_args = dict(custom_kwargs)
+        connect_args["command_timeout"] = 15
+        connect_args["server_settings"] = {
+            "application_name": "calyphant-introspection",
+            "statement_timeout": "15000",
+            "lock_timeout": "5000",
+            "TimeZone": "UTC",
+        }
 
         return create_async_engine(
             clean_url,
-            pool_size=1, # Introspection is bursty; keep pool micro-sized
-            max_overflow=1,
-            pool_timeout=15,
-            connect_args={
-                "server_settings": {
-                    "application_name": "calyphant-inspector",
-                    "statement_timeout": "15000",
-                }
-            }
+            pool_size=1,
+            max_overflow=0,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            connect_args=connect_args,
         )
 
+    
     def _schedule_eviction(self, connection_id: UUID) -> None:
         self._eviction_timers.pop(connection_id, None)
         asyncio.create_task(self._evict_if_idle(connection_id))
@@ -298,7 +307,8 @@ class WorkspacePoolManager:
 
         if engine_task and engine_task.done():
             engine = engine_task.result()
-            if engine.pool.checkedout() > 0:
+            engine_pool = cast(AsyncAdaptedQueuePool | QueuePool, engine.pool)
+            if engine_pool.checkedout() > 0:
                 is_idle = False
 
         if is_idle:
@@ -491,9 +501,12 @@ async def stream_query(
 # ---------------------------------------------------------------------------
 
 async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
+    from domains.connections.service import sanitize_asyncpg_url
+    clean_url, custom_kwargs = sanitize_asyncpg_url(target_url)
+    
     # Try connecting first so `conn` is strictly typed as `asyncpg.Connection`
     try:
-        conn = await asyncpg.connect(dsn=target_url, timeout=10)
+        conn = await asyncpg.connect(dsn=clean_url, timeout=10, **custom_kwargs)
     except Exception as exc:
         logger.warning(f"cancel_query connection failed for PID {backend_pid}: {exc}")
         return {
@@ -545,7 +558,6 @@ async def cancel_query(target_url: str, backend_pid: int) -> dict[str, Any]:
             await conn.close()
         except Exception:
             pass
-
 
 # ---------------------------------------------------------------------------
 # EXPLAIN
