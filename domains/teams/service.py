@@ -74,7 +74,7 @@ from core.config import settings
 from core.auth import CurrentUser
 from core.db import get_db, get_db_context
 from shared.types import Base
-from shared.pubsub import SignalEvent, ws_ingress_throttle
+from shared.pubsub import SignalEvent, SignalEventPayload, ws_ingress_throttle
 from domains.notifications.rate_limit import enforce_redis_limit
 from domains.notifications.service import dispatch_workspace_event, NotificationKind
 
@@ -754,7 +754,7 @@ class WorkspaceConnectionManager:
             asyncio.create_task(unsubscribe_workspace(workspace_id))
             logger.debug(f"WS disconnected: workspace={workspace_id} (0 remaining. Redis unsubscribed.)")
 
-    async def broadcast(self, workspace_id: UUID, event: SignalEvent) -> None:
+    async def broadcast(self, workspace_id: UUID, event: SignalEventPayload) -> None:
         from shared.pubsub import publish
         await publish(workspace_id, event)
 

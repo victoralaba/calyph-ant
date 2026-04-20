@@ -17,7 +17,7 @@ import json
 import time
 from typing import Any
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from loguru import logger
 
@@ -119,10 +119,25 @@ class SignalEvent(BaseModel):
     debounce function of at least 250ms to prevent Postgres pool exhaustion.
     If the UI fails to do this, the backend will return HTTP 429 Too Many Requests.
     """
+    model_config = ConfigDict(extra="allow")
+
     event: str = Field(..., max_length=64)
     workspace_id: UUID
     entity_id: str | None = Field(default=None, max_length=64)
     role: str | None = Field(default=None, max_length=32)
+
+SignalEventPayload = SignalEvent | dict[str, Any]
+
+
+def _coerce_signal_event(
+    workspace_id: UUID,
+    event: SignalEventPayload,
+) -> SignalEvent:
+    if isinstance(event, SignalEvent):
+        return event
+    return SignalEvent.model_validate(
+        {"workspace_id": workspace_id, **event}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,15 +168,19 @@ async def unsubscribe_workspace(workspace_id: UUID) -> None:
 # Publish (Buffered)
 # ---------------------------------------------------------------------------
 
-async def publish(workspace_id: UUID, event: SignalEvent) -> None:
+async def publish(workspace_id: UUID, event: SignalEventPayload) -> None:
     """
     Dumps the event into the local memory buffer instead of hitting the network.
     Rapid identical events overwrite previous ones (deduplication).
     """
+    normalized_event = _coerce_signal_event(workspace_id, event)
+
     # Deduplication key ensures 500 identical updates become exactly 1
-    dedupe_key = f"{workspace_id}:{event.event}:{event.entity_id or 'none'}"
+    dedupe_key = (
+        f"{workspace_id}:{normalized_event.event}:{normalized_event.entity_id or 'none'}"
+    )
     async with _buffer_lock:
-        _publish_buffer[dedupe_key] = event
+        _publish_buffer[dedupe_key] = normalized_event
 
 
 async def _flush_buffer_loop() -> None:

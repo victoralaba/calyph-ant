@@ -664,6 +664,8 @@ async def list_column_types():
     return {"column_types": get_column_type_catalogue()}
 
 
+# ... [Code above remains unchanged]
+
 @router.get("/index-methods")
 async def list_index_methods():
     return {"index_methods": get_index_method_catalogue()}
@@ -680,9 +682,18 @@ async def get_full_snapshot(
     db: AsyncSession = Depends(get_db),
     schema_name: str = Query("public"),
 ):
+    """
+    UI CONSIDERATION: 
+    Because introspection endpoints now multiplex connections via the pool_manager, 
+    parallel schema refreshes from the UI will NOT trigger 503 errors. However, 
+    ensure the UI does not aggressively poll this endpoint; rely on WebSocket 
+    `schema_changed` events instead to trigger refetches.
+    """
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    snapshot = await introspection.introspect_database(url, schema_name)
+    
+    # FIX: Pass connection_id explicitly to satisfy the pool manager's multiplexing signature
+    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     return snapshot
 
 
@@ -695,7 +706,9 @@ async def list_tables(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    snapshot = await introspection.introspect_database(url, schema_name)
+    
+    # FIX: Pass connection_id explicitly
+    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     return {
         "tables": [
             {
@@ -721,7 +734,9 @@ async def get_table(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    table = await introspection.introspect_table(url, table_name, schema_name)
+    
+    # FIX: Pass connection_id explicitly
+    table = await introspection.introspect_table(connection_id, url, table_name, schema_name)
     return table
 
 
@@ -1290,7 +1305,9 @@ async def list_enums(
 ):
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
-    snapshot = await introspection.introspect_database(url, schema_name)
+    
+    # FIX: Pass connection_id explicitly
+    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     return {
         "enums": [
             {"name": e.name, "schema": e.schema, "values": e.values}

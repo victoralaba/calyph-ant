@@ -308,7 +308,7 @@ async def capture_snapshot(
         raise ValueError("Connection not found or not in this workspace.")
 
     # FIX: Directly await the async introspection function
-    snapshot = await introspect_database(db_url, schema_name)
+    snapshot = await introspect_database(connection_id, db_url, schema_name)
 
     pg_conn: asyncpg.Connection | None = None
     try:
@@ -380,7 +380,7 @@ async def auto_generate_migration(
         raise ValueError("Connection not found or not in this workspace.")
 
     # FIX: Directly await the async introspection function
-    live_snapshot = await introspect_database(db_url, schema_name)
+    live_snapshot = await introspect_database(connection_id, db_url, schema_name)
 
     pg_conn: asyncpg.Connection | None = None
     try:

@@ -324,7 +324,6 @@ async def dispatch_event(
     loop (e.g. dispatch_workspace_event). Do not use these from outside this module.
     """
     from domains.teams.service import ws_manager
-    from shared.pubsub import SignalEvent
 
     # Normalise kind to its string value
     kind_str: str = kind.value if hasattr(kind, "value") else str(kind)
@@ -405,17 +404,17 @@ async def dispatch_event(
     # 2. WebSocket Toast
     if rules.get("toast") and workspace_id:
         import asyncio
-        event_payload = SignalEvent(
-            event="ui_toast",
-            workspace_id=workspace_id,
-            entity_id=str(user_id),
-            meta={  # type: ignore[call-arg]
+        event_payload = {
+            "event": "ui_toast",
+            "workspace_id": workspace_id,
+            "entity_id": str(user_id),
+            "meta": {
                 "title": title,
                 "body": body,
                 "kind": kind_str,
                 "priority": rules.get("priority"),
             },
-        )
+        }
         asyncio.create_task(ws_manager.broadcast(workspace_id, event_payload))
 
     # 3. Celery Email Fan-out

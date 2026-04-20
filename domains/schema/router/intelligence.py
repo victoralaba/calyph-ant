@@ -371,7 +371,7 @@ async def export_schema_sql(
     
     # We still fetch the structural blueprint into memory, but we will NOT hold 
     # the massive generated SQL strings in memory.
-    snapshot = await introspection.introspect_database(url, schema_name)
+    snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     
     base_tables = [t for t in snapshot.tables if t.kind == "table"]
     views = [t for t in snapshot.tables if t.kind == "view"]
@@ -724,7 +724,7 @@ async def capture_pre_edit_snapshot(
     is unavailable — never returns 503 so editors can always continue.
     """
     url = await _get_url(connection_id, workspace_id, db)
-    snapshot_meta = await introspection.introspect_database(url, schema_name)
+    snapshot_meta = await introspection.introspect_database(connection_id, url, schema_name)
     table_count = len([t for t in snapshot_meta.tables if t.kind == "table"])
 
     snapshot_id: str = ""

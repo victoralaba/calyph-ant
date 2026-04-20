@@ -46,7 +46,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from uuid import UUID
 
 import ipaddress
@@ -111,6 +111,42 @@ def detect_provider(host: str) -> CloudProvider:
         if pattern.search(host):
             return provider
     return CloudProvider.unknown
+
+
+def _patch_neon_dsn(dsn: str) -> str:
+    """
+    Intercepts Neon DB connection strings and injects the required 
+    endpoint ID into the connection options to bypass asyncpg SNI limitations.
+    """
+    parsed = urlparse(dsn)
+    
+    # Only mutate if it's a Neon host
+    if parsed.hostname and ".neon.tech" in parsed.hostname:
+        # Hostname format is typically: ep-name-hash-pooler.region.aws.neon.tech
+        endpoint_id = parsed.hostname.split('.')[0]
+        
+        # Neon routing accepts the raw endpoint id without the pooler suffix
+        if endpoint_id.endswith('-pooler'):
+            endpoint_id = endpoint_id.replace('-pooler', '')
+
+        # Parse existing query parameters
+        query = parse_qs(parsed.query)
+        
+        # Inject the endpoint option
+        neon_option = f"endpoint={endpoint_id}"
+        if 'options' in query:
+            # Append if other options already exist (Postgres options are space-separated)
+            query['options'][0] = f"{query['options'][0]} {neon_option}"
+        else:
+            query['options'] = [neon_option]
+
+        # Reconstruct the safe DSN
+        new_query = urlencode(query, doseq=True)
+        parsed = parsed._replace(query=new_query)
+        
+        return urlunparse(parsed)
+
+    return dsn
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +215,8 @@ async def _connect_raw(url: str, timeout: int = 10, resolved_ip: str | None = No
     argument directly to asyncpg, forcing it to ignore the potentially poisoned 
     DNS record in the URL string while preserving SNI for SSL via the DSN.
     """
-    kwargs = {"dsn": url, "timeout": timeout}
+    safe_url = _patch_neon_dsn(url)
+    kwargs = {"dsn": safe_url, "timeout": timeout}
     
     # Inject the verified physical IP address to prevent DNS rebinding
     if resolved_ip:
@@ -498,13 +535,14 @@ async def acquire_workspace_connection(
     
     # We resolve the IP directly here to maintain the TOCTOU shield
     components = await parse_and_validate_url(url)
+    safe_url = _patch_neon_dsn(url)
 
     try:
         # UI CONSIDERATION: If this fails, the UI must gracefully handle 
         # HTTP 503. Do not blindly retry immediately; implement exponential backoff 
         # on the Svelte client to prevent DDOSing the Calyphant worker.
         return await asyncpg.connect(
-            dsn=url,
+            dsn=safe_url,
             host=components["resolved_ip"],
             timeout=timeout,
             server_settings={"application_name": "calyphant-workspace-exec"}
@@ -529,8 +567,10 @@ async def ping_connection(url: str) -> bool:
     try:
         # Resolve to bypass DNS poisoning on background tasks
         components = await parse_and_validate_url(url)
+        safe_url = _patch_neon_dsn(url)
+        
         conn = await asyncpg.connect(
-            dsn=url, 
+            dsn=safe_url, 
             host=components["resolved_ip"],
             timeout=15
         )
@@ -553,11 +593,12 @@ async def execute_presence_heartbeat(url: str) -> None:
     try:
         # Resolve to bypass DNS poisoning
         components = await parse_and_validate_url(url)
+        safe_url = _patch_neon_dsn(url)
         
         # 3-second timeout: If it takes longer than 3 seconds to connect, 
         # it is either already asleep or unreachable. Don't block the worker.
         conn = await asyncpg.connect(
-            dsn=url, 
+            dsn=safe_url, 
             host=components["resolved_ip"],
             timeout=3,
             server_settings={"application_name": "calyphant-ui-heartbeat"}
