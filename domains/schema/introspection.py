@@ -40,11 +40,13 @@ from sqlalchemy.exc import SQLAlchemyError
 
 
 # ---------------------------------------------------------------------------
-# Result dataclasses
+# Result Contracts (Strict Pydantic V2)
 # ---------------------------------------------------------------------------
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Any
 
-@dataclass
-class ColumnInfo:
+class ColumnInfo(BaseModel):
+    model_config = ConfigDict(strict=False)
     name: str
     data_type: str
     nullable: bool
@@ -57,9 +59,8 @@ class ColumnInfo:
     is_array: bool = False
     element_type: str | None = None
 
-
-@dataclass
-class IndexInfo:
+class IndexInfo(BaseModel):
+    model_config = ConfigDict(strict=False)
     name: str
     columns: list[str]
     unique: bool
@@ -69,9 +70,8 @@ class IndexInfo:
     is_expression: bool = False
     expression: str | None = None
 
-
-@dataclass
-class ForeignKeyInfo:
+class ForeignKeyInfo(BaseModel):
+    model_config = ConfigDict(strict=False)
     name: str | None
     columns: list[str]
     referred_schema: str | None
@@ -80,42 +80,36 @@ class ForeignKeyInfo:
     on_delete: str | None = None
     on_update: str | None = None
 
-
-@dataclass
-class CheckConstraintInfo:
+class CheckConstraintInfo(BaseModel):
+    model_config = ConfigDict(strict=False)
     name: str
     sqltext: str
 
-
-@dataclass
-class TableInfo:
+class TableInfo(BaseModel):
+    model_config = ConfigDict(strict=False, populate_by_name=True)
     name: str
-    schema: str
+    schema_name: str = Field(alias="schema") # Aliased to avoid BaseModel.schema() collision in Pylance
     kind: str  # "table" | "view" | "materialized_view"
-    columns: list[ColumnInfo] = field(default_factory=list)
-    primary_key: list[str] = field(default_factory=list)
-    foreign_keys: list[ForeignKeyInfo] = field(default_factory=list)
-    indexes: list[IndexInfo] = field(default_factory=list)
-    unique_constraints: list[Any] = field(default_factory=list)
-    check_constraints: list[CheckConstraintInfo] = field(default_factory=list)
+    columns: list[ColumnInfo] = Field(default_factory=list)
+    primary_key: list[str] = Field(default_factory=list)
+    foreign_keys: list[ForeignKeyInfo] = Field(default_factory=list)
+    indexes: list[IndexInfo] = Field(default_factory=list)
+    unique_constraints: list[Any] = Field(default_factory=list)
+    check_constraints: list[CheckConstraintInfo] = Field(default_factory=list)
     row_count_estimate: int | None = None
     comment: str | None = None
-    # For views and materialized views — the raw SQL definition.
-    # None for base tables.
     view_definition: str | None = None
 
-
-@dataclass
-class EnumInfo:
+class EnumInfo(BaseModel):
+    model_config = ConfigDict(strict=False, populate_by_name=True)
     name: str
-    schema: str
+    schema_name: str = Field(alias="schema")
     values: list[str]
 
-
-@dataclass
-class SequenceInfo:
+class SequenceInfo(BaseModel):
+    model_config = ConfigDict(strict=False, populate_by_name=True)
     name: str
-    schema: str
+    schema_name: str = Field(alias="schema")
     data_type: str
     start: int
     increment: int
@@ -123,10 +117,9 @@ class SequenceInfo:
     max_value: int
     cycle: bool
 
-
-@dataclass
-class SchemaSnapshot:
+class SchemaSnapshot(BaseModel):
     """Full structural snapshot of a database at a point in time."""
+    model_config = ConfigDict(strict=False)
     database: str
     pg_version: str
     schemas: list[str]
@@ -134,7 +127,7 @@ class SchemaSnapshot:
     enums: list[EnumInfo]
     sequences: list[SequenceInfo]
     extensions: list[dict]
-    unreadable_entities: list[dict] = field(default_factory=list)
+    unreadable_entities: list[dict] = Field(default_factory=list)
 
 
 def _validate_safe_target(url_str: str) -> None:
@@ -293,277 +286,209 @@ def _sync_introspect_table_logic(sync_conn: Any, table_name: str, schema: str) -
 
 
 def _introspect_tables(
-    inspector: Inspector,
+    inspector: Any, # Kept for signature compatibility, though unused internally
     conn: Any,
     schema: str,
     only: list[str] | None = None,
 ) -> tuple[list[TableInfo], list[dict]]:
     """
-    Extracts table metadata. 
-    
-    PERFORMANCE & MEMORY CONTRACT:
-    - Phase 1 (Map): If `only` is None, this returns a lightweight blueprint 
-      (Names, Kinds, Row Counts) to prevent memory exhaustion on massive databases.
-    - Phase 2 (Drill-Down): If `only` is provided, it performs deep introspection
-      (Columns, Indexes, Constraints) for those specific tables.
-      
-    Returns:
-        A tuple of (successful_tables, unreadable_entities)
+    O(1) Network Sweep Architecture with Strict Memory Boundaries.
+    Phase 1: Fetches lightweight metadata to prevent RAM exhaustion on massive databases.
+    Phase 2: Executes targeted O(1) queries for columns, constraints, and indexes ONLY if drilling down.
     """
-    import re  # Required for the EXPLAIN fallback telemetry
+    import re
+    from sqlalchemy import text
     
-    tables: list[TableInfo] = []
     unreadable_entities: list[dict] = []
+    tables_map: dict[str, TableInfo] = {}
+    
+    is_full_sweep = only is None
+    params = {"schema": schema, "only_names": only}
 
-    table_names = inspector.get_table_names(schema=schema)
-    view_names = inspector.get_view_names(schema=schema)
+    # -----------------------------------------------------------------------
+    # PHASE 1: The Blueprint Sweep (Always Run)
+    # -----------------------------------------------------------------------
+    blueprint_sql = text("""
+        SELECT
+            c.relname AS table_name,
+            c.relkind AS kind,
+            c.reltuples::bigint AS row_estimate,
+            obj_description(c.oid, 'pg_class') AS table_comment
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = :schema
+          AND c.relkind IN ('r', 'v', 'm', 'p')
+          AND (:only_names IS NULL OR c.relname = ANY(:only_names));
+    """)
 
-    # Materialized views via raw query
-    mat_views = {
-        row[0]
-        for row in conn.execute(
-            text("SELECT matviewname FROM pg_matviews WHERE schemaname = :schema"),
-            {"schema": schema},
-        )
-    }
-
-    # Fetch view definitions safely
-    view_definitions: dict[str, str] = {}
     try:
-        if only:
-            rows = conn.execute(
-                text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema AND viewname = ANY(:only_names)"),
-                {"schema": schema, "only_names": only},
-            )
-        else:
-            rows = conn.execute(
-                text("SELECT viewname, definition FROM pg_views WHERE schemaname = :schema"),
-                {"schema": schema},
-            )
-        for row in rows:
-            view_definitions[row[0]] = (row[1] or "").strip()
-    except SQLAlchemyError as exc:
-        logger.error(f"Failed to fetch view definitions for schema '{schema}': {exc}")
-        unreadable_entities.append({"type": "schema_views", "name": "all", "reason": str(exc)})
+        blueprint_rows = conn.execute(blueprint_sql, params).fetchall()
+        kind_map = {'r': 'table', 'p': 'table', 'v': 'view', 'm': 'materialized_view'}
+        
+        for r in blueprint_rows:
+            t_name = r.table_name
+            reltuples = r.row_estimate
+            
+            # STALE DATA FIX / FALLBACK RADAR
+            if reltuples == -1:
+                row_est = None
+            elif reltuples == 0 and not is_full_sweep:
+                try:
+                    explain_res = conn.execute(text(f'EXPLAIN SELECT 1 FROM "{schema}"."{t_name}"')).fetchone()
+                    match = re.search(r'rows=(\d+)', explain_res[0]) if explain_res else None
+                    row_est = int(match.group(1)) if match else 0
+                except Exception:
+                    row_est = 0
+            else:
+                row_est = reltuples if reltuples >= 0 else 0
 
-    # Fetch materialized view definitions safely
-    matview_definitions: dict[str, str] = {}
-    try:
-        if only:
-            rows = conn.execute(
-                text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema AND matviewname = ANY(:only_names)"),
-                {"schema": schema, "only_names": only},
+            tables_map[t_name] = TableInfo(
+                name=t_name,
+                schema=schema, # Uses the alias for Pydantic/Pylance compatibility
+                kind=kind_map.get(r.kind, 'table'),
+                row_count_estimate=row_est,
+                comment=r.table_comment,
             )
-        else:
-            rows = conn.execute(
-                text("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = :schema"),
-                {"schema": schema},
-            )
-        for row in rows:
-            matview_definitions[row[0]] = (row[1] or "").strip()
-    except SQLAlchemyError as exc:
-        logger.error(f"Failed to fetch matview definitions for schema '{schema}': {exc}")
-        unreadable_entities.append({"type": "schema_matviews", "name": "all", "reason": str(exc)})
-
-    def kind_of(name: str) -> str:
-        if name in mat_views:
-            return "materialized_view"
-        if name in view_names:
-            return "view"
-        return "table"
-
-    all_names = table_names + [v for v in view_names if v not in table_names]
-    if only:
-        all_names = [n for n in all_names if n in only]
-
-    if not all_names:
+            
+    except Exception as exc:
+        logger.error(f"Failed Phase 1 blueprint sweep for schema '{schema}': {exc}")
+        unreadable_entities.append({"type": "schema", "name": schema, "reason": str(exc)})
         return [], unreadable_entities
 
-    # 1. Telemetry Sanitization: Fetch custom row estimates safely
-    if only:
-        est_sql = text("""
-            SELECT c.relname, c.reltuples::bigint 
-            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace 
-            WHERE n.nspname = :schema AND c.relname = ANY(:only_names)
-        """)
-        est_rows = conn.execute(est_sql, {"schema": schema, "only_names": all_names})
-    else:
-        est_sql = text("""
-            SELECT c.relname, c.reltuples::bigint 
-            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace 
-            WHERE n.nspname = :schema
-        """)
-        est_rows = conn.execute(est_sql, {"schema": schema})
-        
-    row_estimates = {}
-    for row in est_rows:
-        t_name = row[0]
-        reltuples = row[1]
-        
-        if reltuples == -1:
-            # STALE DATA FIX: Table has never been analyzed. Value is dead.
-            row_estimates[t_name] = None
-        elif reltuples == 0 and only:
-            # FALLBACK RADAR: If drilling down into a "0 row" table, verify with planner
-            try:
-                # Safely format identifiers since they originate directly from the catalog
-                explain_res = conn.execute(text(f'EXPLAIN SELECT 1 FROM "{schema}"."{t_name}"')).fetchone()
-                match = re.search(r'rows=(\d+)', explain_res[0]) if explain_res else None
-                row_estimates[t_name] = int(match.group(1)) if match else 0
-            except Exception:
-                row_estimates[t_name] = 0
-        else:
-            row_estimates[t_name] = reltuples
+    if not tables_map or is_full_sweep:
+        # MEMORY FIX: If full sweep, HALT HERE. Do not fetch deep constraints to save RAM.
+        return list(tables_map.values()), unreadable_entities
 
-    # 2. Lazy Loading Boundary
-    is_full_sweep = only is None
-    is_bulk_drilldown = only is not None and len(only) > 1
+    # -----------------------------------------------------------------------
+    # PHASE 2: The Deep Sweep (Drill-Down Only)
+    # -----------------------------------------------------------------------
+    
+    # 2a. Columns & Primary Keys
+    cols_sql = text("""
+        SELECT
+            c.relname AS table_name,
+            a.attname AS column_name,
+            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+            NOT a.attnotnull AS nullable,
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_value,
+            COALESCE(i.indisprimary, false) AS is_primary_key,
+            col_description(c.oid, a.attnum) AS column_comment
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+        LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND a.attnum = ANY(i.indkey) AND i.indisprimary
+        WHERE n.nspname = :schema
+          AND c.relname = ANY(:only_names)
+        ORDER BY c.relname, a.attnum;
+    """)
+    try:
+        col_rows = conn.execute(cols_sql, params).fetchall()
+        for r in col_rows:
+            if r.table_name in tables_map:
+                is_array = r.data_type.endswith("[]") or r.data_type.upper().startswith("ARRAY")
+                tables_map[r.table_name].columns.append(ColumnInfo(
+                    name=r.column_name,
+                    data_type=r.data_type,
+                    nullable=r.nullable,
+                    default=r.default_value,
+                    is_primary_key=r.is_primary_key,
+                    comment=r.column_comment,
+                    is_array=is_array,
+                    element_type=r.data_type.rstrip("[]") if is_array else None
+                ))
+                if r.is_primary_key:
+                    tables_map[r.table_name].primary_key.append(r.column_name)
+    except Exception as exc:
+        logger.warning(f"Failed fetching columns: {exc}")
 
-    multi_cols, multi_pks, multi_fks, multi_idxs, multi_checks, multi_uniques = {}, {}, {}, {}, {}, {}
+    # 2b. Foreign Keys
+    fks_sql = text("""
+        SELECT
+            c.relname AS table_name, con.conname AS name,
+            ns.nspname AS referred_schema, cl.relname AS referred_table,
+            (SELECT array_agg(a.attname ORDER BY x.ord) FROM unnest(con.conkey) WITH ORDINALITY x(attnum, ord) JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = x.attnum) AS columns,
+            (SELECT array_agg(a.attname ORDER BY x.ord) FROM unnest(con.confkey) WITH ORDINALITY x(attnum, ord) JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = x.attnum) AS referred_columns,
+            con.confdeltype AS on_delete_char, con.confupdtype AS on_update_char
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_class cl ON cl.oid = con.confrelid
+        JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+        WHERE con.contype = 'f' AND n.nspname = :schema AND c.relname = ANY(:only_names);
+    """)
+    try:
+        fk_rows = conn.execute(fks_sql, params).fetchall()
+        action_map = {'a': 'NO ACTION', 'r': 'RESTRICT', 'c': 'CASCADE', 'n': 'SET NULL', 'd': 'SET DEFAULT'}
+        for r in fk_rows:
+            if r.table_name in tables_map:
+                tables_map[r.table_name].foreign_keys.append(ForeignKeyInfo(
+                    name=r.name, columns=r.columns or [],
+                    referred_schema=r.referred_schema, referred_table=r.referred_table,
+                    referred_columns=r.referred_columns or [],
+                    on_delete=action_map.get(r.on_delete_char, 'NO ACTION'),
+                    on_update=action_map.get(r.on_update_char, 'NO ACTION')
+                ))
+    except Exception as exc:
+        logger.warning(f"Failed fetching foreign keys: {exc}")
 
-    if not is_full_sweep and is_bulk_drilldown:
-        multi_cols = inspector.get_multi_columns(schema=schema)
-        multi_pks = inspector.get_multi_pk_constraint(schema=schema)
-        multi_fks = inspector.get_multi_foreign_keys(schema=schema)
-        multi_idxs = inspector.get_multi_indexes(schema=schema)
-        multi_checks = inspector.get_multi_check_constraints(schema=schema)
-        multi_uniques = inspector.get_multi_unique_constraints(schema=schema)
+    # 2c. Indexes
+    idx_sql = text("""
+        SELECT
+            c.relname AS table_name, i.relname AS index_name, ix.indisunique AS is_unique,
+            pg_get_expr(ix.indpred, ix.indrelid) AS predicate, am.amname AS method,
+            (SELECT array_agg(a.attname ORDER BY x.ord) FROM unnest(ix.indkey) WITH ORDINALITY x(attnum, ord) LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = x.attnum) AS columns
+        FROM pg_index ix
+        JOIN pg_class c ON c.oid = ix.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_am am ON i.relam = am.oid
+        WHERE n.nspname = :schema AND c.relname = ANY(:only_names) AND NOT ix.indisprimary;
+    """)
+    try:
+        idx_rows = conn.execute(idx_sql, params).fetchall()
+        for r in idx_rows:
+            if r.table_name in tables_map:
+                tables_map[r.table_name].indexes.append(IndexInfo(
+                    name=r.index_name, columns=[c for c in (r.columns or []) if c is not None],
+                    unique=r.is_unique, partial=r.predicate is not None, predicate=r.predicate, method=r.method
+                ))
+    except Exception as exc:
+        logger.warning(f"Failed fetching indexes: {exc}")
 
-    for name in all_names:
-        k = kind_of(name)
+    # 2d. Check Constraints
+    chk_sql = text("""
+        SELECT c.relname AS table_name, con.conname AS name, pg_get_constraintdef(con.oid) AS sqltext
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype = 'c' AND n.nspname = :schema AND c.relname = ANY(:only_names);
+    """)
+    try:
+        chk_rows = conn.execute(chk_sql, params).fetchall()
+        for r in chk_rows:
+            if r.table_name in tables_map:
+                tables_map[r.table_name].check_constraints.append(CheckConstraintInfo(name=r.name, sqltext=r.sqltext))
+    except Exception as exc:
+        logger.warning(f"Failed fetching check constraints: {exc}")
+
+    # 2e. Views
+    views_to_fetch = [t for t, obj in tables_map.items() if obj.kind in ('view', 'materialized_view')]
+    if views_to_fetch:
         try:
-            # MEMORY FIX: If full sweep, skip fetching deep constraints entirely to save RAM
-            if is_full_sweep:
-                cols_raw, pk_raw, fks_raw, idxs_raw, checks_raw, uniques_raw = [], {}, [], [], [], []
-            elif is_bulk_drilldown:
-                table_key = (schema, name)
-                cols_raw = multi_cols.get(table_key, [])
-                pk_raw = multi_pks.get(table_key, {})
-                fks_raw = multi_fks.get(table_key, [])
-                idxs_raw = multi_idxs.get(table_key, [])
-                checks_raw = multi_checks.get(table_key, [])
-                uniques_raw = multi_uniques.get(table_key, [])
-            else:
-                cols_raw = inspector.get_columns(name, schema=schema)
-                pk_raw = inspector.get_pk_constraint(name, schema=schema)
-                fks_raw = inspector.get_foreign_keys(name, schema=schema)
-                idxs_raw = inspector.get_indexes(name, schema=schema)
-                checks_raw = inspector.get_check_constraints(name, schema=schema)
-                uniques_raw = inspector.get_unique_constraints(name, schema=schema)
+            v_sql = text("""
+                SELECT viewname as name, definition FROM pg_views WHERE schemaname = :schema AND viewname = ANY(:v_names)
+                UNION ALL
+                SELECT matviewname as name, definition FROM pg_matviews WHERE schemaname = :schema AND matviewname = ANY(:v_names)
+            """)
+            v_rows = conn.execute(v_sql, {"schema": schema, "v_names": views_to_fetch}).fetchall()
+            for r in v_rows:
+                if r.name in tables_map:
+                    tables_map[r.name].view_definition = (r.definition or "").strip()
+        except Exception as exc:
+            logger.warning(f"Failed fetching view definitions: {exc}")
 
-            table_info = _build_table_info(
-                name=name,
-                schema=schema,
-                kind=k,
-                cols_raw=cols_raw,
-                pk_raw=pk_raw,
-                fks_raw=fks_raw,
-                idxs_raw=idxs_raw,
-                checks_raw=checks_raw,
-                uniques_raw=uniques_raw,
-                row_est=row_estimates.get(name)
-            )
-
-            if k == "view":
-                table_info.view_definition = view_definitions.get(name)
-            elif k == "materialized_view":
-                table_info.view_definition = matview_definitions.get(name)
-                
-            tables.append(table_info)
-            
-        except SQLAlchemyError as exc:
-            logger.error(f"Database error introspecting {schema}.{name}: {exc}")
-            unreadable_entities.append({
-                "type": k,
-                "name": name,
-                "reason": str(exc)
-            })
-
-    return tables, unreadable_entities
-
-
-
-def _build_table_info(
-    name: str,
-    schema: str,
-    kind: str,
-    cols_raw: Any,    
-    pk_raw: Any,      
-    fks_raw: Any,     
-    idxs_raw: Any,    
-    checks_raw: Any,  
-    uniques_raw: Any, 
-    row_est: int | None
-) -> TableInfo:
-    # ... keep the rest of your function the exact same!
-    """
-    Pure synchronous mapping function. 
-    ZERO database I/O is performed in this logic.
-    """
-    pk_cols = set(pk_raw.get("constrained_columns", []))
-
-    columns = []
-    for col in cols_raw:
-        col_type = str(col["type"])
-        is_array = col_type.endswith("[]") or col_type.upper().startswith("ARRAY")
-        columns.append(
-            ColumnInfo(
-                name=col["name"],
-                data_type=col_type,
-                nullable=col.get("nullable", True),
-                default=str(col["default"]) if col.get("default") is not None else None,
-                is_primary_key=col["name"] in pk_cols,
-                comment=col.get("comment"),
-                is_array=is_array,
-                element_type=col_type.rstrip("[]") if is_array else None,
-            )
-        )
-
-    fks = []
-    for fk in fks_raw:
-        fks.append(
-            ForeignKeyInfo(
-                name=fk.get("name"),
-                columns=fk["constrained_columns"],
-                referred_schema=fk.get("referred_schema"),
-                referred_table=fk["referred_table"],
-                referred_columns=fk["referred_columns"],
-            )
-        )
-
-    indexes = []
-    for idx in idxs_raw:
-        raw_cols = idx.get("column_names") or []
-        indexes.append(
-            IndexInfo(
-                name=str(idx.get("name") or ""),
-                columns=[c for c in raw_cols if c is not None],
-                unique=idx.get("unique", False),
-                partial=idx.get("dialect_options", {}).get("postgresql_where") is not None,
-                predicate=idx.get("dialect_options", {}).get("postgresql_where"),
-            )
-        )
-
-    check_constraints = [
-        CheckConstraintInfo(
-            name=str(c.get("name") or ""), 
-            sqltext=str(c.get("sqltext") or "")
-        )
-        for c in checks_raw
-    ]
-
-    return TableInfo(
-        name=name,
-        schema=schema,
-        kind=kind,
-        columns=columns,
-        primary_key=list(pk_cols),
-        foreign_keys=fks,
-        indexes=indexes,
-        unique_constraints=uniques_raw,
-        check_constraints=check_constraints,
-        row_count_estimate=row_est,
-    )
+    return list(tables_map.values()), unreadable_entities
 
 
 def _introspect_enums(conn: Any, schema: str) -> list[EnumInfo]:

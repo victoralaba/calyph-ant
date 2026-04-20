@@ -707,13 +707,12 @@ async def list_tables(
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
     
-    # FIX: Pass connection_id explicitly
     snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     return {
         "tables": [
             {
                 "name": t.name,
-                "schema": t.schema,
+                "schema": t.schema_name,  # <-- FIX APPLIED
                 "kind": t.kind,
                 "column_count": len(t.columns),
                 "row_count_estimate": t.row_count_estimate,
@@ -1306,16 +1305,14 @@ async def list_enums(
     wid = _require_workspace(user.workspace_id)
     url = await get_validated_workspace_url(db, connection_id, wid)
     
-    # FIX: Pass connection_id explicitly
     snapshot = await introspection.introspect_database(connection_id, url, schema_name)
     return {
         "enums": [
-            {"name": e.name, "schema": e.schema, "values": e.values}
+            {"name": e.name, "schema": e.schema_name, "values": e.values} # <-- FIX APPLIED
             for e in snapshot.enums
         ],
         "total": len(snapshot.enums),
     }
-
 
 @router.post("/{connection_id}/enums", response_model=SqlPreviewResponse)
 async def create_enum(
