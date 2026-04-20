@@ -318,7 +318,7 @@ def _introspect_tables(
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = :schema
           AND c.relkind IN ('r', 'v', 'm', 'p')
-          AND (:only_names IS NULL OR c.relname = ANY(:only_names));
+          AND (CAST(:only_names AS text[]) IS NULL OR c.relname = ANY(CAST(:only_names AS text[])));
     """)
 
     try:
